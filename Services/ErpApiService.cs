@@ -156,6 +156,44 @@ public class ErpApiService
     }
 
     // ─────────────────────────────────────────────────────────
+    // VEHICLE SALES REPORT (VSR) — per dealer, date range
+    // ─────────────────────────────────────────────────────────
+
+    public async Task<List<VsrValue>> FetchVsrAsync(
+        string dealerCode, DateTime startDate, DateTime endDate, string token)
+    {
+        await Task.Delay(_delayMs);
+        var url = $"{_baseUrl}/V1/erpreport/vsr?ver=1.0";
+        var vendorId = _config.GetValue<int>("AutoGeniusERP:VendorId", 14);
+
+        var req = new VsrRequest
+        {
+            DealerCode   = dealerCode,
+            VendorId     = vendorId,
+            StartDate    = startDate.ToString("dd-MM-yyyy"),
+            EndDate      = endDate.ToString("dd-MM-yyyy"),
+            SubVendorCode = "",
+            DealerStatus  = "1",
+            AadharPanReq  = "0",
+            FameReq       = "2"
+        };
+
+        _http.DefaultRequestHeaders.Remove("Authorization");
+        _http.DefaultRequestHeaders.Add("Authorization", $"Token {token}");
+
+        var content = new StringContent(
+            JsonConvert.SerializeObject(req),
+            System.Text.Encoding.UTF8,
+            "application/json");
+
+        var resp = await _http.PostAsync(url, content);
+        var body = await resp.Content.ReadAsStringAsync();
+
+        var result = JsonConvert.DeserializeObject<ErpApiResponse<VsrValue>>(body);
+        return result?.Valid == true ? result.Value ?? new() : new();
+    }
+
+    // ─────────────────────────────────────────────────────────
     // DAILY JOB REPORT TOKENIZE (DJRN) - by Chassis
     // ─────────────────────────────────────────────────────────
 

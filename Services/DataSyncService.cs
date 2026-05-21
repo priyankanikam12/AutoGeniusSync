@@ -235,6 +235,146 @@ public class DataSyncService
     }
 
     // ─────────────────────────────────────────────────────────
+    // SYNC VEHICLE SALES (VSR) for a date range, all dealers
+    // Loops every dealer from DMS_Dealers table
+    // ─────────────────────────────────────────────────────────
+
+    public async Task<SyncResult> SyncVehicleSalesForDateAsync(DateTime date)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var log = new DmsSyncLog
+        {
+            SyncType  = "VehicleSales",
+            SyncDate  = DateOnly.FromDateTime(date),
+            StartedAt = DateTime.UtcNow,
+            Status    = "Running"
+        };
+        db.DmsSyncLogs.Add(log);
+        await db.SaveChangesAsync();
+
+        var result = new SyncResult { SyncType = "VehicleSales", Date = date };
+
+        try
+        {
+            var token = await _erpApi.GetValidTokenAsync();
+
+            // Get all dealer codes from DMS_Dealers table
+            var dealerCodes = await db.DmsDealers
+                .Where(d => d.DealerCode != null)
+                .Select(d => d.DealerCode!)
+                .Distinct()
+                .ToListAsync();
+
+            _logger.LogInformation("VSR sync for {date}: {n} dealers to process",
+                date.ToString("dd-MM-yyyy"), dealerCodes.Count);
+
+            foreach (var dealerCode in dealerCodes)
+            {
+                try
+                {
+                    var sales = await _erpApi.FetchVsrAsync(dealerCode, date, date, token);
+                    result.RecordsFetched += sales.Count;
+
+                    foreach (var sale in sales)
+                    {
+                        if (string.IsNullOrEmpty(sale.InvoiceNo)) continue;
+
+                        var parsed = ParseVehicleSale(sale);
+
+                        // Upsert by (DealerCode, InvoiceNo)
+                        var existing = await db.DmsVehicleSales
+                            .FirstOrDefaultAsync(x =>
+                                x.DealerCode == parsed.DealerCode &&
+                                x.InvoiceNo  == parsed.InvoiceNo);
+
+                        if (existing == null)
+                        {
+                            db.DmsVehicleSales.Add(parsed);
+                            result.RecordsInserted++;
+                        }
+                        else
+                        {
+                            UpdateVehicleSale(existing, parsed);
+                            result.RecordsUpdated++;
+                        }
+                    }
+                    await db.SaveChangesAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("VSR fetch failed for dealer {dc}: {msg}", dealerCode, ex.Message);
+                }
+            }
+
+            log.Status = "Success";
+        }
+        catch (Exception ex)
+        {
+            log.Status = "Failed";
+            log.ErrorMessage = ex.Message;
+            result.Error = ex.Message;
+            _logger.LogError(ex, "Vehicle sales sync failed for {date}", date.ToShortDateString());
+        }
+
+        log.CompletedAt     = DateTime.UtcNow;
+        log.RecordsFetched  = result.RecordsFetched;
+        log.RecordsInserted = result.RecordsInserted;
+        log.RecordsUpdated  = result.RecordsUpdated;
+        await db.SaveChangesAsync();
+
+        return result;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // HISTORICAL BACKFILL for Vehicle Sales
+    // ─────────────────────────────────────────────────────────
+
+    public async Task<SyncResult> BackfillVehicleSalesAsync(
+        DateTime? fromDate = null, DateTime? toDate = null,
+        CancellationToken ct = default)
+    {
+        var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2022-01-01";
+        var start = fromDate ?? DateTime.Parse(startDateStr);
+        var end   = toDate   ?? DateTime.UtcNow.Date;
+
+        var totalResult = new SyncResult { SyncType = "BackfillVehicleSales" };
+        _logger.LogInformation("VSR Backfill: {start} → {end}",
+            start.ToShortDateString(), end.ToShortDateString());
+
+        var current = start;
+        while (current <= end && !ct.IsCancellationRequested)
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+            bool alreadySynced = await db.DmsSyncLogs.AnyAsync(l =>
+                l.SyncType == "VehicleSales" &&
+                l.SyncDate == DateOnly.FromDateTime(current) &&
+                l.Status   == "Success");
+
+            if (!alreadySynced)
+            {
+                var r = await SyncVehicleSalesForDateAsync(current);
+                totalResult.RecordsFetched  += r.RecordsFetched;
+                totalResult.RecordsInserted += r.RecordsInserted;
+                totalResult.RecordsUpdated  += r.RecordsUpdated;
+                _logger.LogInformation("VSR Backfill {date}: +{ins} inserted, +{upd} updated",
+                    current.ToShortDateString(), r.RecordsInserted, r.RecordsUpdated);
+            }
+            else
+            {
+                _logger.LogDebug("VSR Backfill {date}: already done, skipping", current.ToShortDateString());
+            }
+
+            current = current.AddDays(1);
+        }
+
+        return totalResult;
+    }
+
+    // ─────────────────────────────────────────────────────────
     // MAPPING HELPERS
     // ─────────────────────────────────────────────────────────
 
@@ -354,6 +494,105 @@ public class DataSyncService
         e.OutsideWork = n.OutsideWork; e.TotalWotax = n.TotalWotax;
         e.Gstamount = n.Gstamount; e.Igstamount = n.Igstamount;
         e.NetTotal = n.NetTotal; e.UpdatedAt = DateTime.UtcNow;
+    }
+
+    private static DmsVehicleSale ParseVehicleSale(VsrValue v) => new()
+    {
+        DealerName        = v.DealerName,
+        DealerCode        = v.DealerCode,
+        InvoiceNo         = v.InvoiceNo,
+        InvoiceDate       = ParseDate(v.InvoiceDate),
+        Location          = v.Location,
+        LocCode           = v.LocCode,
+        LocationCity      = v.LocationCity,
+        CustDob           = ParseDate(v.CustDOB),
+        Gender            = v.Gender,
+        SoldTo            = v.SoldTo,
+        AccountType       = v.AccountType,
+        PartyEmail        = v.PartyEmail,
+        CusMob            = v.CusMob,
+        Address1          = v.Address1,
+        Address2          = v.Address2,
+        City              = v.City,
+        State             = v.State,
+        ExecutiveName     = v.ExecutiveName,
+        Pin               = v.Pin,
+        ChassisNo         = v.ChassisNo,
+        MotorNo           = v.MotorNo,
+        Remarks           = v.Remarks,
+        ItemModel         = v.ItemModel,
+        Oemmodel          = v.OEMModel,
+        ColorCode         = v.ColorCode,
+        VehicleType       = v.VehicleType,
+        VehicleGroup      = v.VehicleGroup,
+        Hsnsaccode        = v.HSNSACCode,
+        SaleType          = v.SaleType,
+        FinancedBy        = v.FinancedBy,
+        FinAmount         = ParseDecimal(v.FinAmount),
+        ItemRate          = ParseDecimal(v.ItemRate),
+        InsuAmount        = ParseDecimal(v.InsuAmount),
+        RegnAmount        = ParseDecimal(v.RegnAmount),
+        AcsryAmount       = ParseDecimal(v.AcsryAmount),
+        PreGstdiscAmount  = ParseDecimal(v.PreGSTDiscAmount),
+        DiscTypeName      = v.DiscTypeName,
+        PostGstdisc       = ParseDecimal(v.PostGSTDisc),
+        FameIi            = ParseDecimal(v.FameII),
+        StateFameIi       = ParseDecimal(v.StateFameII),
+        Sgstper           = ParseDecimal(v.SGSTPer),
+        Sgstamount        = ParseDecimal(v.SGSTAmount),
+        Cgstper           = ParseDecimal(v.CGSTPer),
+        Cgstamount        = ParseDecimal(v.CGSTAmount),
+        Igstper           = ParseDecimal(v.IGSTPer),
+        Igstamount        = ParseDecimal(v.IGSTAmount),
+        NetAmount         = ParseDecimal(v.NetAmount),
+        ReferenceNo       = v.ReferenceNo,
+        BookingDate       = ParseDate(v.BookingDate),
+        TotalCount        = v.TotalCount,
+        Battery           = v.Battery,
+        BatteryChemical   = v.BatteryChemical,
+        BatteryCapacity   = v.BatteryCapacity,
+        BatteryMake       = v.BatteryMake,
+        ChargerNo         = v.ChargerNo,
+        ChargerNo2        = v.ChargerNo2,
+        Converter         = v.Converter,
+        Vcu               = v.VCU,
+        ControllerNo      = v.ControllerNo,
+        FameIirequired    = v.FameIIRequired,
+        SegmentName       = v.SegmentName,
+        InstitutionalName = v.InstitutionalName,
+        SchemeName        = v.SchemeName,
+        CreatedAt         = DateTime.UtcNow,
+        UpdatedAt         = DateTime.UtcNow
+    };
+
+    private static void UpdateVehicleSale(DmsVehicleSale e, DmsVehicleSale n)
+    {
+        e.DealerName = n.DealerName; e.InvoiceDate = n.InvoiceDate;
+        e.Location = n.Location; e.LocCode = n.LocCode; e.LocationCity = n.LocationCity;
+        e.CustDob = n.CustDob; e.Gender = n.Gender; e.SoldTo = n.SoldTo;
+        e.AccountType = n.AccountType; e.PartyEmail = n.PartyEmail; e.CusMob = n.CusMob;
+        e.Address1 = n.Address1; e.Address2 = n.Address2; e.City = n.City;
+        e.State = n.State; e.ExecutiveName = n.ExecutiveName; e.Pin = n.Pin;
+        e.ChassisNo = n.ChassisNo; e.MotorNo = n.MotorNo; e.Remarks = n.Remarks;
+        e.ItemModel = n.ItemModel; e.Oemmodel = n.Oemmodel; e.ColorCode = n.ColorCode;
+        e.VehicleType = n.VehicleType; e.VehicleGroup = n.VehicleGroup;
+        e.Hsnsaccode = n.Hsnsaccode; e.SaleType = n.SaleType; e.FinancedBy = n.FinancedBy;
+        e.FinAmount = n.FinAmount; e.ItemRate = n.ItemRate; e.InsuAmount = n.InsuAmount;
+        e.RegnAmount = n.RegnAmount; e.AcsryAmount = n.AcsryAmount;
+        e.PreGstdiscAmount = n.PreGstdiscAmount; e.DiscTypeName = n.DiscTypeName;
+        e.PostGstdisc = n.PostGstdisc; e.FameIi = n.FameIi; e.StateFameIi = n.StateFameIi;
+        e.Sgstper = n.Sgstper; e.Sgstamount = n.Sgstamount;
+        e.Cgstper = n.Cgstper; e.Cgstamount = n.Cgstamount;
+        e.Igstper = n.Igstper; e.Igstamount = n.Igstamount; e.NetAmount = n.NetAmount;
+        e.ReferenceNo = n.ReferenceNo; e.BookingDate = n.BookingDate;
+        e.TotalCount = n.TotalCount; e.Battery = n.Battery;
+        e.BatteryChemical = n.BatteryChemical; e.BatteryCapacity = n.BatteryCapacity;
+        e.BatteryMake = n.BatteryMake; e.ChargerNo = n.ChargerNo;
+        e.ChargerNo2 = n.ChargerNo2; e.Converter = n.Converter;
+        e.Vcu = n.Vcu; e.ControllerNo = n.ControllerNo;
+        e.FameIirequired = n.FameIirequired; e.SegmentName = n.SegmentName;
+        e.InstitutionalName = n.InstitutionalName; e.SchemeName = n.SchemeName;
+        e.UpdatedAt = DateTime.UtcNow;
     }
 
     private static DateOnly? ParseDate(string? val)

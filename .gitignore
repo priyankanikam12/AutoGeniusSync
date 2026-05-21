@@ -1,0 +1,76 @@
+## =========================
+## Build output
+## =========================
+bin/
+obj/
+out/
+publish/
+Publish/
+release/
+Release/
+
+## =========================
+## User secrets / configs
+## =========================
+appsettings.Development.json
+appsettings.Local.json
+secrets.json
+*.pfx
+*.p12
+
+## =========================
+## Logs
+## =========================
+*.log
+logs/
+
+## =========================
+## Visual Studio / VS Code
+## =========================
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## =========================
+## Rider / JetBrains
+## =========================
+.idea/
+
+## =========================
+## EF Core
+## =========================
+Migrations/*.Designer.cs
+Migrations/*Snapshot.cs
+# (optional: ignore migrations if generated on server only)
+
+## =========================
+## OS files
+## =========================
+.DS_Store
+Thumbs.db
+
+## =========================
+## Deployment artifacts
+## =========================
+*.zip
+*.rar
+*.7z
+*.tar.gz
+
+## IIS / publish leftovers
+*.Publish.xml
+*.pubxml
+*.pubxml.user
+
+## =========================
+## Node (if Swagger UI or frontend added later)
+## =========================
+node_modules/
+
+## =========================
+## Docker (if used)
+## =========================
+docker-compose.override.yml
