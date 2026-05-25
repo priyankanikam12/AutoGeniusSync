@@ -74,3 +74,9 @@ node_modules/
 ## Docker (if used)
 ## =========================
 docker-compose.override.yml
+## =========================
+## DLLs / Executables
+## =========================
+*.dll
+*.exe
+*.pdb

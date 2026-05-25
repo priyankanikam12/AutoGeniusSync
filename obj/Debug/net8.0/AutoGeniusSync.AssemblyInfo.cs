@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("AutoGeniusSync")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+1ad82079c6334428a28d72fcb6e0336c17d7cabf")]
 [assembly: System.Reflection.AssemblyProductAttribute("AutoGeniusSync")]
 [assembly: System.Reflection.AssemblyTitleAttribute("AutoGeniusSync")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

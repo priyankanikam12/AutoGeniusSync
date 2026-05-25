@@ -33,7 +33,6 @@ public class ErpApiService
     // TOKEN MANAGEMENT
     // ─────────────────────────────────────────────────────────
 
-    /// <summary>Returns a valid token, refreshing if expired.</summary>
     public async Task<string> GetValidTokenAsync()
     {
         using var scope = _scopeFactory.CreateScope();
@@ -78,20 +77,19 @@ public class ErpApiService
         var val = result.Value.First();
         var refreshHours = _config.GetValue<int>("AutoGeniusERP:TokenRefreshHours", 23);
 
-        // Mark old tokens inactive
         await db.DmsAuthTokens.Where(t => t.IsActive)
             .ExecuteUpdateAsync(x => x.SetProperty(t => t.IsActive, false));
 
         var token = new DmsAuthToken
         {
             AccessToken = val.AccessToken!,
-            LoginEmail   = val.LoginEmail,
-            VendorName   = val.VendorName,
-            VendorCode   = val.VendorCode,
-            VendorId     = val.VendorId,
-            CreatedAt    = DateTime.UtcNow,
-            ExpiresAt    = DateTime.UtcNow.AddHours(refreshHours),
-            IsActive     = true
+            LoginEmail  = val.LoginEmail,
+            VendorName  = val.VendorName,
+            VendorCode  = val.VendorCode,
+            VendorId    = val.VendorId,
+            CreatedAt   = DateTime.UtcNow,
+            ExpiresAt   = DateTime.UtcNow.AddHours(refreshHours),
+            IsActive    = true
         };
         db.DmsAuthTokens.Add(token);
         await db.SaveChangesAsync();
@@ -110,9 +108,7 @@ public class ErpApiService
         var vendorId = _config.GetValue<int>("AutoGeniusERP:VendorId", 14);
         var url = $"{_baseUrl}/V1/booking/pin?code={pinCode}&Ver=1.0&vendorid={vendorId}";
 
-        _http.DefaultRequestHeaders.Remove("Authorization");
-        _http.DefaultRequestHeaders.Add("Authorization", $"Token {token}");
-
+        SetAuthHeader(token);
         var resp = await _http.GetAsync(url);
         var body = await resp.Content.ReadAsStringAsync();
 
@@ -121,7 +117,7 @@ public class ErpApiService
     }
 
     // ─────────────────────────────────────────────────────────
-    // DAILY JOB REPORT (DJR)
+    // DAILY JOB REPORT (DJR) — with retry on timeout
     // ─────────────────────────────────────────────────────────
 
     public async Task<List<DjrValue>> FetchDjrAsync(
@@ -140,23 +136,11 @@ public class ErpApiService
             DealerCode = dealerCode
         };
 
-        _http.DefaultRequestHeaders.Remove("Authorization");
-        _http.DefaultRequestHeaders.Add("Authorization", $"Token {token}");
-
-        var content = new StringContent(
-            JsonConvert.SerializeObject(req),
-            System.Text.Encoding.UTF8,
-            "application/json");
-
-        var resp = await _http.PostAsync(url, content);
-        var body = await resp.Content.ReadAsStringAsync();
-
-        var result = JsonConvert.DeserializeObject<ErpApiResponse<DjrValue>>(body);
-        return result?.Valid == true ? result.Value ?? new() : new();
+        return await PostWithRetryAsync<DjrValue>(url, req, token, maxRetries: 3);
     }
 
     // ─────────────────────────────────────────────────────────
-    // VEHICLE SALES REPORT (VSR) — per dealer, date range
+    // VEHICLE SALES REPORT (VSR) — with retry on timeout
     // ─────────────────────────────────────────────────────────
 
     public async Task<List<VsrValue>> FetchVsrAsync(
@@ -168,33 +152,21 @@ public class ErpApiService
 
         var req = new VsrRequest
         {
-            DealerCode   = dealerCode,
-            VendorId     = vendorId,
-            StartDate    = startDate.ToString("dd-MM-yyyy"),
-            EndDate      = endDate.ToString("dd-MM-yyyy"),
+            DealerCode    = dealerCode,
+            VendorId      = vendorId,
+            StartDate     = startDate.ToString("dd-MM-yyyy"),
+            EndDate       = endDate.ToString("dd-MM-yyyy"),
             SubVendorCode = "",
             DealerStatus  = "1",
             AadharPanReq  = "0",
             FameReq       = "2"
         };
 
-        _http.DefaultRequestHeaders.Remove("Authorization");
-        _http.DefaultRequestHeaders.Add("Authorization", $"Token {token}");
-
-        var content = new StringContent(
-            JsonConvert.SerializeObject(req),
-            System.Text.Encoding.UTF8,
-            "application/json");
-
-        var resp = await _http.PostAsync(url, content);
-        var body = await resp.Content.ReadAsStringAsync();
-
-        var result = JsonConvert.DeserializeObject<ErpApiResponse<VsrValue>>(body);
-        return result?.Valid == true ? result.Value ?? new() : new();
+        return await PostWithRetryAsync<VsrValue>(url, req, token, maxRetries: 3);
     }
 
     // ─────────────────────────────────────────────────────────
-    // DAILY JOB REPORT TOKENIZE (DJRN) - by Chassis
+    // DJRN — with retry
     // ─────────────────────────────────────────────────────────
 
     public async Task<List<DjrValue>> FetchDjrnAsync(
@@ -214,18 +186,58 @@ public class ErpApiService
             chassisno  = chassisNo
         };
 
+        return await PostWithRetryAsync<DjrValue>(url, bodyObj, token, maxRetries: 3);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // SHARED: POST with retry on timeout
+    // ─────────────────────────────────────────────────────────
+
+    private async Task<List<T>> PostWithRetryAsync<T>(
+        string url, object requestBody, string token, int maxRetries = 3)
+    {
+        var timeoutSeconds = _config.GetValue<int>("AutoGeniusERP:HttpTimeoutSeconds", 120);
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++)
+        {
+            try
+            {
+                SetAuthHeader(token);
+
+                var content = new StringContent(
+                    JsonConvert.SerializeObject(requestBody),
+                    System.Text.Encoding.UTF8,
+                    "application/json");
+
+                // Use a per-request CancellationToken with the configured timeout
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+                var resp = await _http.PostAsync(url, content, cts.Token);
+                var body = await resp.Content.ReadAsStringAsync();
+
+                var result = JsonConvert.DeserializeObject<ErpApiResponse<T>>(body);
+                return result?.Valid == true ? result.Value ?? new() : new();
+            }
+            catch (OperationCanceledException) when (attempt < maxRetries)
+            {
+                _logger.LogWarning("Attempt {attempt}/{max} timed out for {url}. Retrying after delay...",
+                    attempt, maxRetries, url);
+                await Task.Delay(TimeSpan.FromSeconds(attempt * 5)); // 5s, 10s backoff
+            }
+            catch (Exception ex) when (attempt < maxRetries)
+            {
+                _logger.LogWarning("Attempt {attempt}/{max} failed for {url}: {msg}. Retrying...",
+                    attempt, maxRetries, url, ex.Message);
+                await Task.Delay(TimeSpan.FromSeconds(attempt * 5));
+            }
+        }
+
+        _logger.LogWarning("All {max} attempts failed for {url}. Returning empty.", maxRetries, url);
+        return new();
+    }
+
+    private void SetAuthHeader(string token)
+    {
         _http.DefaultRequestHeaders.Remove("Authorization");
         _http.DefaultRequestHeaders.Add("Authorization", $"Token {token}");
-
-        var content = new StringContent(
-            JsonConvert.SerializeObject(bodyObj),
-            System.Text.Encoding.UTF8,
-            "application/json");
-
-        var resp = await _http.PostAsync(url, content);
-        var body = await resp.Content.ReadAsStringAsync();
-
-        var result = JsonConvert.DeserializeObject<ErpApiResponse<DjrValue>>(body);
-        return result?.Valid == true ? result.Value ?? new() : new();
     }
 }

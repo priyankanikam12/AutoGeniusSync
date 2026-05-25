@@ -458,6 +458,7 @@ C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\obj\Release\net8.0\win-x64\AutoGe
 C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\obj\Release\net8.0\win-x64\AutoGeniusSync.csproj.CoreCompileInputs.cache
 C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\obj\Release\net8.0\win-x64\AutoGeniusSync.MvcApplicationPartsAssemblyInfo.cs
 C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\obj\Release\net8.0\win-x64\AutoGeniusSync.MvcApplicationPartsAssemblyInfo.cache
+C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\obj\Release\net8.0\win-x64\AutoGeniusSync.sourcelink.json
 C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\obj\Release\net8.0\win-x64\rjimswa.dswa.cache.json
 C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\obj\Release\net8.0\win-x64\rjsmrazor.dswa.cache.json
 C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\obj\Release\net8.0\win-x64\rjsmcshtml.dswa.cache.json

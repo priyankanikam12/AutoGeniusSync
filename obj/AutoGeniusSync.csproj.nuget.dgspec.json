@@ -1,23 +1,23 @@
 {
   "format": 1,
   "restore": {
-    "C:\\Users\\priyanka.nikam\\Desktop\\AutoGeniusSync\\AutoGeniusSync.csproj": {}
+    "c:\\Users\\priyanka.nikam\\Desktop\\AutoGeniusSync\\AutoGeniusSync.csproj": {}
   },
   "projects": {
-    "C:\\Users\\priyanka.nikam\\Desktop\\AutoGeniusSync\\AutoGeniusSync.csproj": {
+    "c:\\Users\\priyanka.nikam\\Desktop\\AutoGeniusSync\\AutoGeniusSync.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "C:\\Users\\priyanka.nikam\\Desktop\\AutoGeniusSync\\AutoGeniusSync.csproj",
+        "projectUniqueName": "c:\\Users\\priyanka.nikam\\Desktop\\AutoGeniusSync\\AutoGeniusSync.csproj",
         "projectName": "AutoGeniusSync",
-        "projectPath": "C:\\Users\\priyanka.nikam\\Desktop\\AutoGeniusSync\\AutoGeniusSync.csproj",
-        "packagesPath": "C:\\Users\\bg-adm\\.nuget\\packages\\",
-        "outputPath": "C:\\Users\\priyanka.nikam\\Desktop\\AutoGeniusSync\\obj\\",
+        "projectPath": "c:\\Users\\priyanka.nikam\\Desktop\\AutoGeniusSync\\AutoGeniusSync.csproj",
+        "packagesPath": "C:\\Users\\priyanka.nikam\\.nuget\\packages\\",
+        "outputPath": "c:\\Users\\priyanka.nikam\\Desktop\\AutoGeniusSync\\obj\\",
         "projectStyle": "PackageReference",
         "fallbackFolders": [
           "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"
         ],
         "configFilePaths": [
-          "C:\\Users\\bg-adm\\AppData\\Roaming\\NuGet\\NuGet.Config",
+          "C:\\Users\\priyanka.nikam\\AppData\\Roaming\\NuGet\\NuGet.Config",
           "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.FallbackLocation.config",
           "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.Offline.config"
         ],
@@ -113,20 +113,6 @@
           ],
           "assetTargetFallback": true,
           "warn": true,
-          "downloadDependencies": [
-            {
-              "name": "Microsoft.AspNetCore.App.Runtime.win-x64",
-              "version": "[8.0.27, 8.0.27]"
-            },
-            {
-              "name": "Microsoft.NETCore.App.Runtime.win-x64",
-              "version": "[8.0.27, 8.0.27]"
-            },
-            {
-              "name": "Microsoft.WindowsDesktop.App.Runtime.win-x64",
-              "version": "[8.0.27, 8.0.27]"
-            }
-          ],
           "frameworkReferences": {
             "Microsoft.AspNetCore.App": {
               "privateAssets": "none"
@@ -136,11 +122,6 @@
             }
           },
           "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.300/PortableRuntimeIdentifierGraph.json"
-        }
-      },
-      "runtimes": {
-        "win-x64": {
-          "#import": []
         }
       }
     }

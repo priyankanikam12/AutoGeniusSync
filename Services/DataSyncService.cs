@@ -43,7 +43,6 @@ public class DataSyncService
         {
             var token = await _erpApi.GetValidTokenAsync();
 
-            // Get pincodes: first from DB, then from appsettings
             var dbPincodes = await db.DmsPincodeMasters
                 .Where(p => p.IsActive)
                 .Select(p => p.PinCode)
@@ -133,37 +132,51 @@ public class DataSyncService
         try
         {
             var token = await _erpApi.GetValidTokenAsync();
-
-            // Fetch all jobs for this date (dealercode="" = all dealers)
             var jobs = await _erpApi.FetchDjrAsync(date, token, "");
             result.RecordsFetched = jobs.Count;
 
             _logger.LogInformation("Date {date}: fetched {n} records", date.ToString("dd-MM-yyyy"), jobs.Count);
 
-            foreach (var job in jobs)
+            // ── DEDUP WITHIN THE RESPONSE ITSELF ──────────────
+            // The API sometimes returns the same job twice in one response.
+            // Keep only the last occurrence of each (DealerCode, JobNo, JobDate) key.
+            var dedupedJobs = jobs
+                .Where(j => j.JobNo != "Total")
+                .Where(j => !string.IsNullOrEmpty(j.DealerCode) || !string.IsNullOrEmpty(j.JobNo))
+                .GroupBy(j => $"{j.DealerCode}|{j.JobNo}|{j.JobDate}")
+                .Select(g => g.Last())
+                .ToList();
+
+            _logger.LogInformation("Date {date}: {raw} raw → {dedup} after dedup",
+                date.ToString("dd-MM-yyyy"), jobs.Count, dedupedJobs.Count);
+
+            foreach (var job in dedupedJobs)
             {
-                // Skip summary/total rows
-                if (job.JobNo == "Total") continue;
-                if (string.IsNullOrEmpty(job.DealerCode) && string.IsNullOrEmpty(job.JobNo)) continue;
-
-                var parsed = ParseServiceHistory(job);
-
-                // Upsert by (DealerCode, JobNo, JobDate)
-                var existing = await db.DmsServiceHistories
-                    .FirstOrDefaultAsync(x =>
-                        x.DealerCode == parsed.DealerCode &&
-                        x.JobNo == parsed.JobNo &&
-                        x.JobDate == parsed.JobDate);
-
-                if (existing == null)
+                try
                 {
-                    db.DmsServiceHistories.Add(parsed);
-                    result.RecordsInserted++;
+                    var parsed = ParseServiceHistory(job);
+
+                    var existing = await db.DmsServiceHistories
+                        .FirstOrDefaultAsync(x =>
+                            x.DealerCode == parsed.DealerCode &&
+                            x.JobNo      == parsed.JobNo &&
+                            x.JobDate    == parsed.JobDate);
+
+                    if (existing == null)
+                    {
+                        db.DmsServiceHistories.Add(parsed);
+                        result.RecordsInserted++;
+                    }
+                    else
+                    {
+                        UpdateServiceHistory(existing, parsed);
+                        result.RecordsUpdated++;
+                    }
                 }
-                else
+                catch (Exception ex)
                 {
-                    UpdateServiceHistory(existing, parsed);
-                    result.RecordsUpdated++;
+                    _logger.LogWarning("Skipping job {no} for {dc}: {msg}",
+                        job.JobNo, job.DealerCode, ex.Message);
                 }
             }
 
@@ -178,17 +191,17 @@ public class DataSyncService
             _logger.LogError(ex, "Service history sync failed for {date}", date.ToShortDateString());
         }
 
-        log.CompletedAt = DateTime.UtcNow;
-        log.RecordsFetched = result.RecordsFetched;
+        log.CompletedAt     = DateTime.UtcNow;
+        log.RecordsFetched  = result.RecordsFetched;
         log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated = result.RecordsUpdated;
+        log.RecordsUpdated  = result.RecordsUpdated;
         await db.SaveChangesAsync();
 
         return result;
     }
 
     // ─────────────────────────────────────────────────────────
-    // HISTORICAL BACKFILL: from configured start date to today
+    // HISTORICAL BACKFILL
     // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> BackfillHistoricalDataAsync(
@@ -197,7 +210,7 @@ public class DataSyncService
     {
         var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2022-01-01";
         var start = fromDate ?? DateTime.Parse(startDateStr);
-        var end = toDate ?? DateTime.UtcNow.Date;
+        var end   = toDate   ?? DateTime.UtcNow.Date;
 
         var totalResult = new SyncResult { SyncType = "BackfillHistorical" };
         _logger.LogInformation("Backfill: {start} → {end}", start.ToShortDateString(), end.ToShortDateString());
@@ -205,21 +218,20 @@ public class DataSyncService
         var current = start;
         while (current <= end && !ct.IsCancellationRequested)
         {
-            // Skip if already synced for this date
             using var scope = _scopeFactory.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
             bool alreadySynced = await db.DmsSyncLogs.AnyAsync(l =>
                 l.SyncType == "ServiceHistory" &&
                 l.SyncDate == DateOnly.FromDateTime(current) &&
-                l.Status == "Success");
+                l.Status   == "Success");
 
             if (!alreadySynced)
             {
                 var r = await SyncServiceHistoryForDateAsync(current);
-                totalResult.RecordsFetched += r.RecordsFetched;
+                totalResult.RecordsFetched  += r.RecordsFetched;
                 totalResult.RecordsInserted += r.RecordsInserted;
-                totalResult.RecordsUpdated += r.RecordsUpdated;
+                totalResult.RecordsUpdated  += r.RecordsUpdated;
                 _logger.LogInformation("Backfill {date}: +{ins} inserted, +{upd} updated",
                     current.ToShortDateString(), r.RecordsInserted, r.RecordsUpdated);
             }
@@ -235,8 +247,7 @@ public class DataSyncService
     }
 
     // ─────────────────────────────────────────────────────────
-    // SYNC VEHICLE SALES (VSR) for a date range, all dealers
-    // Loops every dealer from DMS_Dealers table
+    // SYNC VEHICLE SALES (VSR) for a single date
     // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> SyncVehicleSalesForDateAsync(DateTime date)
@@ -260,14 +271,13 @@ public class DataSyncService
         {
             var token = await _erpApi.GetValidTokenAsync();
 
-            // Get all dealer codes from DMS_Dealers table
             var dealerCodes = await db.DmsDealers
                 .Where(d => d.DealerCode != null)
                 .Select(d => d.DealerCode!)
                 .Distinct()
                 .ToListAsync();
 
-            _logger.LogInformation("VSR sync for {date}: {n} dealers to process",
+            _logger.LogInformation("VSR sync for {date}: {n} dealers",
                 date.ToString("dd-MM-yyyy"), dealerCodes.Count);
 
             foreach (var dealerCode in dealerCodes)
@@ -277,27 +287,39 @@ public class DataSyncService
                     var sales = await _erpApi.FetchVsrAsync(dealerCode, date, date, token);
                     result.RecordsFetched += sales.Count;
 
-                    foreach (var sale in sales)
+                    // Dedup within response by (DealerCode, InvoiceNo)
+                    var dedupedSales = sales
+                        .Where(s => !string.IsNullOrEmpty(s.InvoiceNo))
+                        .GroupBy(s => $"{s.DealerCode}|{s.InvoiceNo}")
+                        .Select(g => g.Last())
+                        .ToList();
+
+                    foreach (var sale in dedupedSales)
                     {
-                        if (string.IsNullOrEmpty(sale.InvoiceNo)) continue;
-
-                        var parsed = ParseVehicleSale(sale);
-
-                        // Upsert by (DealerCode, InvoiceNo)
-                        var existing = await db.DmsVehicleSales
-                            .FirstOrDefaultAsync(x =>
-                                x.DealerCode == parsed.DealerCode &&
-                                x.InvoiceNo  == parsed.InvoiceNo);
-
-                        if (existing == null)
+                        try
                         {
-                            db.DmsVehicleSales.Add(parsed);
-                            result.RecordsInserted++;
+                            var parsed = ParseVehicleSale(sale);
+
+                            var existing = await db.DmsVehicleSales
+                                .FirstOrDefaultAsync(x =>
+                                    x.DealerCode == parsed.DealerCode &&
+                                    x.InvoiceNo  == parsed.InvoiceNo);
+
+                            if (existing == null)
+                            {
+                                db.DmsVehicleSales.Add(parsed);
+                                result.RecordsInserted++;
+                            }
+                            else
+                            {
+                                UpdateVehicleSale(existing, parsed);
+                                result.RecordsUpdated++;
+                            }
                         }
-                        else
+                        catch (Exception ex)
                         {
-                            UpdateVehicleSale(existing, parsed);
-                            result.RecordsUpdated++;
+                            _logger.LogWarning("Skipping invoice {no} for {dc}: {msg}",
+                                sale.InvoiceNo, dealerCode, ex.Message);
                         }
                     }
                     await db.SaveChangesAsync();
@@ -380,17 +402,17 @@ public class DataSyncService
 
     private static DmsDealer MapDealer(DealerValue d) => new()
     {
-        DealerCode          = d.DealerCode,
-        DealerCompany       = d.DealerCompany,
-        ContactNo           = d.ContactNo,
-        AlternateContactNo  = d.AlternateContactNo,
-        DealerStateName     = d.DealerStateName,
-        DealerCityName      = d.DealerCityName,
-        PinCode             = d.PinCode,
-        ActiveStatus        = d.ActiveStatus,
-        LastFetchedAt       = DateTime.UtcNow,
-        CreatedAt           = DateTime.UtcNow,
-        UpdatedAt           = DateTime.UtcNow
+        DealerCode         = d.DealerCode,
+        DealerCompany      = d.DealerCompany,
+        ContactNo          = d.ContactNo,
+        AlternateContactNo = d.AlternateContactNo,
+        DealerStateName    = d.DealerStateName,
+        DealerCityName     = d.DealerCityName,
+        PinCode            = d.PinCode,
+        ActiveStatus       = d.ActiveStatus,
+        LastFetchedAt      = DateTime.UtcNow,
+        CreatedAt          = DateTime.UtcNow,
+        UpdatedAt          = DateTime.UtcNow
     };
 
     private static void UpdateDealer(DmsDealer existing, DealerValue d)
@@ -410,62 +432,62 @@ public class DataSyncService
     {
         return new DmsServiceHistory
         {
-            DealerCode              = j.DealerCode,
-            JobNo                   = j.JobNo,
-            JobDate                 = ParseDate(j.JobDate),
-            CompName                = j.CompName,
-            Location                = j.Location,
-            InTime                  = j.InTime,
-            CloseTime               = j.CloseTime,
-            JobCategory             = j.JobCategory,
-            Ffrpercentage           = j.FFRPercentage,
-            DocNo                   = j.DocNo,
-            DocType                 = j.DocType,
-            DocDate                 = ParseDate(j.DocDate),
-            Model                   = j.Model,
-            BrandName               = j.BrandName,
-            RegNo                   = j.RegNo,
-            VehicleType             = j.VehicleType,
-            EngineNo                = j.EngineNo,
-            ChassisNo               = j.ChassisNo,
-            Kms                     = j.KMS,
-            BatterySerialNo1        = j.BatterySerialNo1,
-            BatterySerialNo2        = j.BatterySerialNo2,
-            BatterySerialNo3        = j.BatterySerialNo3,
-            BatterySerialNo4        = j.BatterySerialNo4,
-            BatterySerialNo5        = j.BatterySerialNo5,
-            BatterySerialNo6        = j.BatterySerialNo6,
-            IndividualAhbattery1    = j.IndividualAHBattery1,
-            IndividualAhbattery2    = j.IndividualAHBattery2,
-            IndividualAhbattery3    = j.IndividualAHBattery3,
-            IndividualAhbattery4    = j.IndividualAHBattery4,
-            IndividualAhbattery5    = j.IndividualAHBattery5,
-            IndividualAhbattery6    = j.IndividualAHBattery6,
-            PartyName               = j.PartyName,
-            MobileNumber            = j.MobileNumber,
-            Supervisor              = j.Supervisor,
-            Technician              = j.Technician,
-            ServiceHead             = j.ServiceHead,
-            JobType                 = j.JobType,
-            SaleDate                = ParseDate(j.SaleDate),
-            CouponNo                = j.CouponNo,
-            ExpectedDeliveryDate    = ParseDate(j.ExpectedDeliveryDate),
-            ProformaDate            = ParseDate(j.ProformaDate),
-            InvoiceDate             = ParseDate(j.InvoiceDate),
-            EstimatedJobExpenses    = ParseDecimal(j.EstimatedJobExpenses),
-            LabourHours             = ParseDecimal(j.LabourHours),
-            Parts                   = ParseDecimal(j.Parts),
-            Accessory               = ParseDecimal(j.Accessory),
-            Oil                     = ParseDecimal(j.Oil),
-            Labour                  = ParseDecimal(j.Labour),
-            OutsideWork             = ParseDecimal(j.OutsideWork),
-            TotalWotax              = ParseDecimal(j.TotalWOTax),
-            Gstamount               = ParseDecimal(j.GSTAmount),
-            Igstamount              = ParseDecimal(j.IGSTAmount),
-            NetTotal                = ParseDecimal(j.NetTotal),
-            IsRowTotal              = j.JobNo == "Total",
-            CreatedAt               = DateTime.UtcNow,
-            UpdatedAt               = DateTime.UtcNow
+            DealerCode           = j.DealerCode,
+            JobNo                = j.JobNo,
+            JobDate              = ParseDate(j.JobDate),
+            CompName             = j.CompName,
+            Location             = j.Location,
+            InTime               = j.InTime,
+            CloseTime            = j.CloseTime,
+            JobCategory          = j.JobCategory,
+            Ffrpercentage        = j.FFRPercentage,
+            DocNo                = j.DocNo,
+            DocType              = j.DocType,
+            DocDate              = ParseDate(j.DocDate),
+            Model                = j.Model,
+            BrandName            = j.BrandName,
+            RegNo                = j.RegNo,
+            VehicleType          = j.VehicleType,
+            EngineNo             = j.EngineNo,
+            ChassisNo            = j.ChassisNo,
+            Kms                  = j.KMS,
+            BatterySerialNo1     = j.BatterySerialNo1,
+            BatterySerialNo2     = j.BatterySerialNo2,
+            BatterySerialNo3     = j.BatterySerialNo3,
+            BatterySerialNo4     = j.BatterySerialNo4,
+            BatterySerialNo5     = j.BatterySerialNo5,
+            BatterySerialNo6     = j.BatterySerialNo6,
+            IndividualAhbattery1 = j.IndividualAHBattery1,
+            IndividualAhbattery2 = j.IndividualAHBattery2,
+            IndividualAhbattery3 = j.IndividualAHBattery3,
+            IndividualAhbattery4 = j.IndividualAHBattery4,
+            IndividualAhbattery5 = j.IndividualAHBattery5,
+            IndividualAhbattery6 = j.IndividualAHBattery6,
+            PartyName            = j.PartyName,
+            MobileNumber         = j.MobileNumber,
+            Supervisor           = j.Supervisor,
+            Technician           = j.Technician,
+            ServiceHead          = j.ServiceHead,
+            JobType              = j.JobType,
+            SaleDate             = ParseDate(j.SaleDate),
+            CouponNo             = j.CouponNo,
+            ExpectedDeliveryDate = ParseDate(j.ExpectedDeliveryDate),
+            ProformaDate         = ParseDate(j.ProformaDate),
+            InvoiceDate          = ParseDate(j.InvoiceDate),
+            EstimatedJobExpenses = ParseDecimal(j.EstimatedJobExpenses),
+            LabourHours          = ParseDecimal(j.LabourHours),
+            Parts                = ParseDecimal(j.Parts),
+            Accessory            = ParseDecimal(j.Accessory),
+            Oil                  = ParseDecimal(j.Oil),
+            Labour               = ParseDecimal(j.Labour),
+            OutsideWork          = ParseDecimal(j.OutsideWork),
+            TotalWotax           = ParseDecimal(j.TotalWOTax),
+            Gstamount            = ParseDecimal(j.GSTAmount),
+            Igstamount           = ParseDecimal(j.IGSTAmount),
+            NetTotal             = ParseDecimal(j.NetTotal),
+            IsRowTotal           = j.JobNo == "Total",
+            CreatedAt            = DateTime.UtcNow,
+            UpdatedAt            = DateTime.UtcNow
         };
     }
 
@@ -598,10 +620,10 @@ public class DataSyncService
     private static DateOnly? ParseDate(string? val)
     {
         if (string.IsNullOrWhiteSpace(val)) return null;
-        // Try dd-MM-yyyy first, then other formats
         if (DateTime.TryParseExact(val, "dd-MM-yyyy",
             System.Globalization.CultureInfo.InvariantCulture,
-            System.Globalization.DateTimeStyles.None, out var d)) return DateOnly.FromDateTime(d);
+            System.Globalization.DateTimeStyles.None, out var d))
+            return DateOnly.FromDateTime(d);
         if (DateTime.TryParse(val, out var d2)) return DateOnly.FromDateTime(d2);
         return null;
     }

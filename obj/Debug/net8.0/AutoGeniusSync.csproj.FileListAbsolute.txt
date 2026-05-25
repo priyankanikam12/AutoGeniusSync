@@ -1,11 +1,5 @@
-C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\bin\Debug\net8.0\publish\web.config
 C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\bin\Debug\net8.0\appsettings.Development.json
 C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\bin\Debug\net8.0\appsettings.json
-C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\bin\Debug\net8.0\publish\appsettings.Development.json
-C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\bin\Debug\net8.0\publish\appsettings.json
-C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\bin\Debug\net8.0\publish\AutoGeniusSync.deps.json
-C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\bin\Debug\net8.0\publish\AutoGeniusSync.runtimeconfig.json
-C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\bin\Debug\net8.0\publish\AutoGeniusSync.staticwebassets.endpoints.json
 C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\bin\Debug\net8.0\AutoGeniusSync.staticwebassets.endpoints.json
 C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\bin\Debug\net8.0\AutoGeniusSync.exe
 C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\bin\Debug\net8.0\AutoGeniusSync.deps.json
@@ -148,6 +142,7 @@ C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\obj\Debug\net8.0\AutoGeniusSync.A
 C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\obj\Debug\net8.0\AutoGeniusSync.csproj.CoreCompileInputs.cache
 C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\obj\Debug\net8.0\AutoGeniusSync.MvcApplicationPartsAssemblyInfo.cs
 C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\obj\Debug\net8.0\AutoGeniusSync.MvcApplicationPartsAssemblyInfo.cache
+C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\obj\Debug\net8.0\AutoGeniusSync.sourcelink.json
 C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\obj\Debug\net8.0\rjimswa.dswa.cache.json
 C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\obj\Debug\net8.0\rjsmrazor.dswa.cache.json
 C:\Users\priyanka.nikam\Desktop\AutoGeniusSync\obj\Debug\net8.0\rjsmcshtml.dswa.cache.json

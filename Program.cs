@@ -5,12 +5,17 @@ using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// PORT — Always use 7005, never fall back to default 5000
+// This prevents "port in use" errors with Windows system process
+// ─────────────────────────────────────────────────────────────
+builder.WebHost.UseUrls("http://0.0.0.0:7005");
+
+// ─────────────────────────────────────────────────────────────
 // WINDOWS SERVICE
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 builder.Host.UseWindowsService();
 
-builder.WebHost.UseUrls("http://0.0.0.0:7005");
 // ─────────────────────────────────────────────────────────────
 // DATABASE
 // ─────────────────────────────────────────────────────────────
@@ -21,7 +26,7 @@ builder.Services.AddDbContext<AppDbContext>(options =>
     ));
 
 // ─────────────────────────────────────────────────────────────
-// HTTP CLIENT (shared, no per-request base address so it's flexible)
+// HTTP CLIENT
 // ─────────────────────────────────────────────────────────────
 builder.Services.AddHttpClient<ErpApiService>(client =>
 {
@@ -33,12 +38,8 @@ builder.Services.AddHttpClient<ErpApiService>(client =>
 // ─────────────────────────────────────────────────────────────
 builder.Services.AddScoped<DataSyncService>();
 
-// ErpApiService is AddHttpClient-registered above (scoped)
-// but DataSyncService also needs it — register as scoped service too
-//builder.Services.AddScoped<ErpApiService>();
-
 // ─────────────────────────────────────────────────────────────
-// BACKGROUND SERVICE (scheduled sync)
+// BACKGROUND SERVICE
 // ─────────────────────────────────────────────────────────────
 builder.Services.AddHostedService<SyncHostedService>();
 
@@ -55,7 +56,7 @@ builder.Services.AddSwaggerGen(c =>
 });
 
 // ─────────────────────────────────────────────────────────────
-// CORS (allow all for internal/dev use)
+// CORS
 // ─────────────────────────────────────────────────────────────
 builder.Services.AddCors(options =>
     options.AddDefaultPolicy(p => p.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader()));
@@ -63,14 +64,13 @@ builder.Services.AddCors(options =>
 var app = builder.Build();
 
 // ─────────────────────────────────────────────────────────────
-// ENSURE DB TABLES EXIST (runs SQL_Schema.sql via EF migrations)
+// ENSURE DB TABLES EXIST
 // ─────────────────────────────────────────────────────────────
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
     try
     {
-        // EnsureCreated creates tables from EF model if they don't exist
         await db.Database.EnsureCreatedAsync();
         app.Logger.LogInformation("Database connection verified.");
     }
@@ -83,11 +83,8 @@ using (var scope = app.Services.CreateScope())
 // ─────────────────────────────────────────────────────────────
 // MIDDLEWARE
 // ─────────────────────────────────────────────────────────────
-if (app.Environment.IsDevelopment() || app.Environment.IsProduction())
-{
-    app.UseSwagger();
-    app.UseSwaggerUI(c => c.SwaggerEndpoint("/swagger/v1/swagger.json", "AutoGenius DMS v1"));
-}
+app.UseSwagger();
+app.UseSwaggerUI(c => c.SwaggerEndpoint("/swagger/v1/swagger.json", "AutoGenius DMS v1"));
 
 app.UseCors();
 app.MapControllers();
