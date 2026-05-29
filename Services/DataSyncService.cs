@@ -211,6 +211,7 @@ public class DataSyncService
         var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2022-01-01";
         var start = fromDate ?? DateTime.Parse(startDateStr);
         var end   = toDate   ?? DateTime.UtcNow.Date;
+        var today = DateTime.UtcNow.Date;   // ← track today
 
         var totalResult = new SyncResult { SyncType = "BackfillHistorical" };
         _logger.LogInformation("Backfill: {start} → {end}", start.ToShortDateString(), end.ToShortDateString());
@@ -221,7 +222,8 @@ public class DataSyncService
             using var scope = _scopeFactory.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
-            bool alreadySynced = await db.DmsSyncLogs.AnyAsync(l =>
+            // Always re-sync today — data arrives throughout the day
+            bool alreadySynced = current != today && await db.DmsSyncLogs.AnyAsync(l =>
                 l.SyncType == "ServiceHistory" &&
                 l.SyncDate == DateOnly.FromDateTime(current) &&
                 l.Status   == "Success");
@@ -360,10 +362,9 @@ public class DataSyncService
         var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2022-01-01";
         var start = fromDate ?? DateTime.Parse(startDateStr);
         var end   = toDate   ?? DateTime.UtcNow.Date;
+        var today = DateTime.UtcNow.Date;   // ← track today
 
         var totalResult = new SyncResult { SyncType = "BackfillVehicleSales" };
-        _logger.LogInformation("VSR Backfill: {start} → {end}",
-            start.ToShortDateString(), end.ToShortDateString());
 
         var current = start;
         while (current <= end && !ct.IsCancellationRequested)
@@ -371,7 +372,7 @@ public class DataSyncService
             using var scope = _scopeFactory.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
-            bool alreadySynced = await db.DmsSyncLogs.AnyAsync(l =>
+            bool alreadySynced = current != today && await db.DmsSyncLogs.AnyAsync(l =>
                 l.SyncType == "VehicleSales" &&
                 l.SyncDate == DateOnly.FromDateTime(current) &&
                 l.Status   == "Success");
@@ -380,16 +381,9 @@ public class DataSyncService
             {
                 var r = await SyncVehicleSalesForDateAsync(current);
                 totalResult.RecordsFetched  += r.RecordsFetched;
-                totalResult.RecordsInserted += r.RecordsInserted;
+                totalResult.RecordsInserted += r.RecordsUpdated;
                 totalResult.RecordsUpdated  += r.RecordsUpdated;
-                _logger.LogInformation("VSR Backfill {date}: +{ins} inserted, +{upd} updated",
-                    current.ToShortDateString(), r.RecordsInserted, r.RecordsUpdated);
             }
-            else
-            {
-                _logger.LogDebug("VSR Backfill {date}: already done, skipping", current.ToShortDateString());
-            }
-
             current = current.AddDays(1);
         }
 

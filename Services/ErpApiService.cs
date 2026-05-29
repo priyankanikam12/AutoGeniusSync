@@ -198,6 +198,8 @@ public class ErpApiService
     {
         var timeoutSeconds = _config.GetValue<int>("AutoGeniusERP:HttpTimeoutSeconds", 120);
 
+        Exception? lastException = null;
+
         for (int attempt = 1; attempt <= maxRetries; attempt++)
         {
             try
@@ -209,29 +211,59 @@ public class ErpApiService
                     System.Text.Encoding.UTF8,
                     "application/json");
 
-                // Use a per-request CancellationToken with the configured timeout
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+
+                _logger.LogInformation("Attempt {attempt}/{max} → POST {url} (timeout: {t}s)",
+                    attempt, maxRetries, url, timeoutSeconds);
+
                 var resp = await _http.PostAsync(url, content, cts.Token);
                 var body = await resp.Content.ReadAsStringAsync();
+
+                if (!resp.IsSuccessStatusCode)
+                {
+                    _logger.LogWarning("Attempt {attempt}/{max} got HTTP {code} from {url}",
+                        attempt, maxRetries, (int)resp.StatusCode, url);
+                    lastException = new Exception($"HTTP {(int)resp.StatusCode}: {body[..Math.Min(200, body.Length)]}");
+
+                    if (attempt < maxRetries)
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(attempt * 10)); // 10s, 20s backoff
+                        continue;
+                    }
+                    break;
+                }
 
                 var result = JsonConvert.DeserializeObject<ErpApiResponse<T>>(body);
                 return result?.Valid == true ? result.Value ?? new() : new();
             }
-            catch (OperationCanceledException) when (attempt < maxRetries)
+            catch (OperationCanceledException)
             {
-                _logger.LogWarning("Attempt {attempt}/{max} timed out for {url}. Retrying after delay...",
-                    attempt, maxRetries, url);
-                await Task.Delay(TimeSpan.FromSeconds(attempt * 5)); // 5s, 10s backoff
+                lastException = new Exception($"Request timed out after {timeoutSeconds}s");
+                _logger.LogWarning("Attempt {attempt}/{max} timed out for {url}. {remaining} attempt(s) left.",
+                    attempt, maxRetries, url, maxRetries - attempt);
+
+                if (attempt < maxRetries)
+                    await Task.Delay(TimeSpan.FromSeconds(attempt * 10)); // 10s, 20s backoff
             }
-            catch (Exception ex) when (attempt < maxRetries)
+            catch (HttpRequestException ex)
             {
-                _logger.LogWarning("Attempt {attempt}/{max} failed for {url}: {msg}. Retrying...",
+                lastException = ex;
+                _logger.LogWarning("Attempt {attempt}/{max} network error for {url}: {msg}",
                     attempt, maxRetries, url, ex.Message);
-                await Task.Delay(TimeSpan.FromSeconds(attempt * 5));
+
+                if (attempt < maxRetries)
+                    await Task.Delay(TimeSpan.FromSeconds(attempt * 10));
+            }
+            catch (Exception ex)
+            {
+                // Non-retryable — bail immediately
+                _logger.LogError(ex, "Attempt {attempt}/{max} unexpected error for {url}", attempt, maxRetries, url);
+                throw;
             }
         }
 
-        _logger.LogWarning("All {max} attempts failed for {url}. Returning empty.", maxRetries, url);
+        _logger.LogWarning("All {max} attempts failed for {url}. Last error: {err}. Returning empty.",
+            maxRetries, url, lastException?.Message);
         return new();
     }
 

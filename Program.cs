@@ -9,12 +9,15 @@ var builder = WebApplication.CreateBuilder(args);
 // PORT — Always use 7005, never fall back to default 5000
 // This prevents "port in use" errors with Windows system process
 // ─────────────────────────────────────────────────────────────
-builder.WebHost.UseUrls("http://0.0.0.0:7005");
-
-// ─────────────────────────────────────────────────────────────
-// WINDOWS SERVICE
-// ─────────────────────────────────────────────────────────────
-builder.Host.UseWindowsService();
+if (!builder.Environment.IsDevelopment())
+{
+    builder.Host.UseWindowsService();
+    builder.WebHost.UseUrls("http://0.0.0.0:7005");
+}
+else
+{
+    builder.WebHost.UseUrls("http://localhost:7005");
+}
 
 // ─────────────────────────────────────────────────────────────
 // DATABASE
@@ -22,21 +25,28 @@ builder.Host.UseWindowsService();
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseSqlServer(
         builder.Configuration.GetConnectionString("DefaultConnection"),
-        sql => sql.CommandTimeout(120)
+        sql =>
+        {
+            sql.CommandTimeout(120);
+            sql.EnableRetryOnFailure(
+                maxRetryCount: 5,
+                maxRetryDelay: TimeSpan.FromSeconds(10),
+                errorNumbersToAdd: null   // uses EF Core's default transient list
+            );
+        }
     ));
 
-// ─────────────────────────────────────────────────────────────
-// HTTP CLIENT
-// ─────────────────────────────────────────────────────────────
+// In Program.cs — set HttpClient timeout to "infinite", control it per-request instead
 builder.Services.AddHttpClient<ErpApiService>(client =>
 {
-    client.Timeout = TimeSpan.FromSeconds(60);
+    client.Timeout = Timeout.InfiniteTimeSpan; // ← per-request CTS controls this now
 });
 
 // ─────────────────────────────────────────────────────────────
 // APPLICATION SERVICES
 // ─────────────────────────────────────────────────────────────
-builder.Services.AddScoped<DataSyncService>();
+//builder.Services.AddScoped<DataSyncService>();
+builder.Services.AddSingleton<DataSyncService>();
 
 // ─────────────────────────────────────────────────────────────
 // BACKGROUND SERVICE

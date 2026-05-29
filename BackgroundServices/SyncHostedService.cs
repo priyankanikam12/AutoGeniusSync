@@ -1,8 +1,3 @@
-// ─────────────────────────────────────────────────────────────
-// REPLACE your existing SyncHostedService.cs with this full file
-// Changes: added RunVehicleSalesSyncAsync + backfill for VSR
-// ─────────────────────────────────────────────────────────────
-
 using AutoGeniusSync.Services;
 
 namespace AutoGeniusSync.BackgroundServices;
@@ -25,164 +20,176 @@ public class SyncHostedService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
-        _logger.LogInformation("SyncHostedService starting...");
+        _logger.LogInformation("SyncHostedService started.");
 
-        // One-time backfill on startup (runs in background, won't block)
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(TimeSpan.FromSeconds(15), ct);
-            await RunBackfillAsync(ct);           // Service history backfill
-            await RunVehicleSalesBackfillAsync(ct); // Vehicle sales backfill
-        }, ct);
+        // ── On startup: immediately sync today + yesterday ──
+        await RunStartupSyncAsync(ct);
+
+        // ── Then loop every N minutes for real-time today sync ──
+        var intervalMinutes = _config.GetValue<int>("SyncSettings:RealtimeSyncIntervalMinutes", 30);
+
+        // ── Also schedule nightly backfill at 01:00 UTC ──
+        _ = Task.Run(() => RunNightlyBackfillLoopAsync(ct), ct);
 
         while (!ct.IsCancellationRequested)
         {
-            var now = DateTime.UtcNow;
+            try
+            {
+                await Task.Delay(TimeSpan.FromMinutes(intervalMinutes), ct);
+                if (ct.IsCancellationRequested) break;
 
-            // 01:00 UTC — dealer sync
-            var dealerHour = _config.GetValue<int>("SyncSettings:DealerSyncHour", 1);
-            var dealerMin  = _config.GetValue<int>("SyncSettings:DealerSyncMinute", 0);
-            var nextDealer = GetNextRun(now, dealerHour, dealerMin);
+                await RunRealtimeSyncAsync(ct);
+            }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Realtime sync loop error. Will retry next interval.");
+            }
+        }
 
-            // 02:00 UTC — service history sync
-            var jobHour = _config.GetValue<int>("SyncSettings:DailyJobSyncHour", 2);
-            var jobMin  = _config.GetValue<int>("SyncSettings:DailyJobSyncMinute", 0);
-            var nextJob = GetNextRun(now, jobHour, jobMin);
+        _logger.LogInformation("SyncHostedService stopped.");
+    }
 
-            // 03:00 UTC — vehicle sales sync
-            var vsrHour = _config.GetValue<int>("SyncSettings:VehicleSalesSyncHour", 3);
-            var vsrMin  = _config.GetValue<int>("SyncSettings:VehicleSalesSyncMinute", 0);
-            var nextVsr = GetNextRun(now, vsrHour, vsrMin);
+    // ─────────────────────────────────────────────────────────
+    // STARTUP: runs immediately when app starts
+    // ─────────────────────────────────────────────────────────
+    private async Task RunStartupSyncAsync(CancellationToken ct)
+    {
+        _logger.LogInformation("=== Startup sync begin ===");
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
 
-            // Sleep until the earliest of the three
-            var nextRun = new[] { nextDealer, nextJob, nextVsr }.Min();
-            var delay = nextRun - now;
-            if (delay < TimeSpan.Zero) delay = TimeSpan.FromSeconds(60);
+            var today     = DateTime.UtcNow.Date;
+            var yesterday = today.AddDays(-1);
 
-            _logger.LogInformation("Next sync at {next} UTC (in {delay:hh\\:mm\\:ss})",
-                nextRun.ToString("yyyy-MM-dd HH:mm"), delay);
+            _logger.LogInformation("Startup: syncing {y} and {t}",
+                yesterday.ToString("dd-MM-yyyy"), today.ToString("dd-MM-yyyy"));
 
-            await Task.Delay(delay, ct);
-            if (ct.IsCancellationRequested) break;
+            // Service history — yesterday then today
+            var r1 = await svc.SyncServiceHistoryForDateAsync(yesterday);
+            var r2 = await svc.SyncServiceHistoryForDateAsync(today);
+            _logger.LogInformation("Startup ServiceHistory: yesterday={yi}ins/{yu}upd  today={ti}ins/{tu}upd",
+                r1.RecordsInserted, r1.RecordsUpdated, r2.RecordsInserted, r2.RecordsUpdated);
 
-            var runNow = DateTime.UtcNow;
+            // Vehicle sales — yesterday then today
+            var r3 = await svc.SyncVehicleSalesForDateAsync(yesterday);
+            var r4 = await svc.SyncVehicleSalesForDateAsync(today);
+            _logger.LogInformation("Startup VehicleSales: yesterday={yi}ins/{yu}upd  today={ti}ins/{tu}upd",
+                r3.RecordsInserted, r3.RecordsUpdated, r4.RecordsInserted, r4.RecordsUpdated);
 
-            if (Math.Abs((runNow - GetNextRun(runNow.AddSeconds(-70), dealerHour, dealerMin)).TotalMinutes) < 2)
-                await RunDealerSyncAsync(ct);
+            // Dealers in background — slow pincode loop, don't block realtime sync
+            _ = Task.Run(() => RunDealerSyncAsync(ct), ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Startup sync failed");
+        }
+        _logger.LogInformation("=== Startup sync complete ===");
+    }
 
-            if (Math.Abs((runNow - GetNextRun(runNow.AddSeconds(-70), jobHour, jobMin)).TotalMinutes) < 2)
-                await RunDailyJobSyncAsync(ct);
+    // ─────────────────────────────────────────────────────────
+    // REALTIME: runs every 30 min (configurable), syncs today
+    // ─────────────────────────────────────────────────────────
+    private async Task RunRealtimeSyncAsync(CancellationToken ct)
+    {
+        _logger.LogInformation("=== Realtime sync begin {time} UTC ===", DateTime.UtcNow.ToString("HH:mm"));
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
 
-            if (Math.Abs((runNow - GetNextRun(runNow.AddSeconds(-70), vsrHour, vsrMin)).TotalMinutes) < 2)
-                await RunVehicleSalesSyncAsync(ct);
+            var today = DateTime.UtcNow.Date;
+
+            // In the first 3 hours of the day, also re-sync yesterday
+            // because ERP data for yesterday often arrives late
+            if (DateTime.UtcNow.Hour < 3)
+            {
+                var yesterday = today.AddDays(-1);
+                _logger.LogInformation("Early hour — also re-syncing yesterday: {d}",
+                    yesterday.ToString("dd-MM-yyyy"));
+                await svc.SyncServiceHistoryForDateAsync(yesterday);
+                await svc.SyncVehicleSalesForDateAsync(yesterday);
+            }
+
+            var r1 = await svc.SyncServiceHistoryForDateAsync(today);
+            var r2 = await svc.SyncVehicleSalesForDateAsync(today);
+
+            _logger.LogInformation(
+                "=== Realtime sync done: SH={si}ins/{su}upd  VSR={vi}ins/{vu}upd ===",
+                r1.RecordsInserted, r1.RecordsUpdated,
+                r2.RecordsInserted, r2.RecordsUpdated);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Realtime sync error");
         }
     }
 
-    // ── Dealer sync ─────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────
+    // NIGHTLY BACKFILL LOOP: runs once a day at 01:00 UTC
+    // fills any historical gaps without blocking realtime sync
+    // ─────────────────────────────────────────────────────────
+    private async Task RunNightlyBackfillLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                var now  = DateTime.UtcNow;
+                var next = now.Date.AddHours(1); // 01:00 UTC today
+                if (next <= now) next = next.AddDays(1);  // already past → tomorrow
+
+                var delay = next - now;
+                _logger.LogInformation("Nightly backfill scheduled at {next} UTC (in {h}h {m}m)",
+                    next.ToString("yyyy-MM-dd HH:mm"),
+                    (int)delay.TotalHours, delay.Minutes);
+
+                await Task.Delay(delay, ct);
+                if (ct.IsCancellationRequested) break;
+
+                _logger.LogInformation("=== Nightly backfill begin ===");
+                using var scope = _scopeFactory.CreateScope();
+                var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
+
+                // Dealer sync at nightly run
+                await RunDealerSyncAsync(ct);
+
+                // Backfill any missing historical dates
+                var shResult  = await svc.BackfillHistoricalDataAsync(ct: ct);
+                var vsrResult = await svc.BackfillVehicleSalesAsync(ct: ct);
+
+                _logger.LogInformation(
+                    "=== Nightly backfill done: SH={si}ins  VSR={vi}ins ===",
+                    shResult.RecordsInserted, vsrResult.RecordsInserted);
+            }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Nightly backfill error. Will retry tomorrow.");
+                await Task.Delay(TimeSpan.FromHours(1), ct); // wait before retrying
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // DEALER SYNC: slow (loops all pincodes), always background
+    // ─────────────────────────────────────────────────────────
     private async Task RunDealerSyncAsync(CancellationToken ct)
     {
         try
         {
-            _logger.LogInformation("[Scheduled] Starting dealer sync...");
+            _logger.LogInformation("Dealer sync starting...");
             using var scope = _scopeFactory.CreateScope();
             var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
             var r = await svc.SyncAllDealersAsync();
-            _logger.LogInformation("[Scheduled] Dealer sync done: {ins} inserted, {upd} updated",
+            _logger.LogInformation("Dealer sync done: {i} inserted, {u} updated",
                 r.RecordsInserted, r.RecordsUpdated);
         }
-        catch (Exception ex) when (!ct.IsCancellationRequested)
+        catch (Exception ex)
         {
-            _logger.LogError(ex, "[Scheduled] Dealer sync error");
+            _logger.LogError(ex, "Dealer sync error");
         }
-    }
-
-    // ── Service history sync ─────────────────────────────────
-    private async Task RunDailyJobSyncAsync(CancellationToken ct)
-    {
-        try
-        {
-            var today = DateTime.UtcNow.Date;
-            var yesterday = today.AddDays(-1);
-
-            _logger.LogInformation("[Scheduled] Starting service history sync for {y} and {t}",
-                yesterday.ToShortDateString(), today.ToShortDateString());
-
-            using var scope = _scopeFactory.CreateScope();
-            var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
-
-            var r1 = await svc.SyncServiceHistoryForDateAsync(yesterday);
-            var r2 = await svc.SyncServiceHistoryForDateAsync(today);
-
-            _logger.LogInformation(
-                "[Scheduled] Service sync done: yesterday={y_ins}ins/{y_upd}upd, today={t_ins}ins/{t_upd}upd",
-                r1.RecordsInserted, r1.RecordsUpdated, r2.RecordsInserted, r2.RecordsUpdated);
-        }
-        catch (Exception ex) when (!ct.IsCancellationRequested)
-        {
-            _logger.LogError(ex, "[Scheduled] Service history sync error");
-        }
-    }
-
-    // ── Vehicle Sales sync (NEW) ─────────────────────────────
-    private async Task RunVehicleSalesSyncAsync(CancellationToken ct)
-    {
-        try
-        {
-            var today = DateTime.UtcNow.Date;
-            var yesterday = today.AddDays(-1);
-
-            _logger.LogInformation("[Scheduled] Starting vehicle sales sync for {y} and {t}",
-                yesterday.ToShortDateString(), today.ToShortDateString());
-
-            using var scope = _scopeFactory.CreateScope();
-            var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
-
-            var r1 = await svc.SyncVehicleSalesForDateAsync(yesterday);
-            var r2 = await svc.SyncVehicleSalesForDateAsync(today);
-
-            _logger.LogInformation(
-                "[Scheduled] Vehicle sales sync done: yesterday={y_ins}ins/{y_upd}upd, today={t_ins}ins/{t_upd}upd",
-                r1.RecordsInserted, r1.RecordsUpdated, r2.RecordsInserted, r2.RecordsUpdated);
-        }
-        catch (Exception ex) when (!ct.IsCancellationRequested)
-        {
-            _logger.LogError(ex, "[Scheduled] Vehicle sales sync error");
-        }
-    }
-
-    // ── Backfills ────────────────────────────────────────────
-    private async Task RunBackfillAsync(CancellationToken ct)
-    {
-        try
-        {
-            _logger.LogInformation("[Backfill] Service history backfill starting...");
-            using var scope = _scopeFactory.CreateScope();
-            var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
-            var r = await svc.BackfillHistoricalDataAsync(ct: ct);
-            _logger.LogInformation("[Backfill] Service history complete: {ins} inserted", r.RecordsInserted);
-        }
-        catch (OperationCanceledException) { }
-        catch (Exception ex) { _logger.LogError(ex, "[Backfill] Service history error"); }
-    }
-
-    private async Task RunVehicleSalesBackfillAsync(CancellationToken ct)
-    {
-        try
-        {
-            _logger.LogInformation("[Backfill] Vehicle sales backfill starting...");
-            using var scope = _scopeFactory.CreateScope();
-            var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
-            var r = await svc.BackfillVehicleSalesAsync(ct: ct);
-            _logger.LogInformation("[Backfill] Vehicle sales complete: {ins} inserted", r.RecordsInserted);
-        }
-        catch (OperationCanceledException) { }
-        catch (Exception ex) { _logger.LogError(ex, "[Backfill] Vehicle sales error"); }
-    }
-
-    private static DateTime GetNextRun(DateTime from, int hour, int minute)
-    {
-        var candidate = from.Date.AddHours(hour).AddMinutes(minute);
-        if (candidate <= from) candidate = candidate.AddDays(1);
-        return candidate;
     }
 }

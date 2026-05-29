@@ -65,6 +65,16 @@ public class SyncController : ControllerBase
         return Ok(result);
     }
 
+    // ── POST /api/sync/service-history/force-today ──────────
+    /// <summary>Force re-sync today even if already marked Success</summary>
+    [HttpPost("service-history/force-today")]
+    public async Task<IActionResult> ForceSyncToday()
+    {
+        _logger.LogInformation("Force sync triggered for today: {date}", DateTime.UtcNow.Date);
+        var result = await _sync.SyncServiceHistoryForDateAsync(DateTime.UtcNow.Date);
+        return Ok(result);
+    }
+
     // ── POST /api/sync/service-history/date/{date} ──────────
     /// <summary>date format: yyyy-MM-dd e.g. 2022-07-27</summary>
     [HttpPost("service-history/date/{date}")]
