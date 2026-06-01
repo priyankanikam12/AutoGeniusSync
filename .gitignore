@@ -1,19 +1,13 @@
-## =========================
 ## Build output
-## =========================
 bin/
 obj/
-out/
-publish/
-Publish/
-release/
-Release/
 
-## =========================
-## User secrets / configs
-## =========================
+## Logs
+*.log
+logs/
+
+## User secrets
 appsettings.Development.json
-appsettings.Local.json
 secrets.json
 *.pfx
 *.p12

@@ -391,6 +391,248 @@ public class DataSyncService
     }
 
     // ─────────────────────────────────────────────────────────
+    // SYNC CALL CENTRE DEALERS — all pincodes from config/DB
+    // ─────────────────────────────────────────────────────────
+    public async Task<SyncResult> SyncCallCentreDealersAsync()
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var log = new DmsSyncLog
+        {
+            SyncType  = "CallCentreDealers",
+            StartedAt = DateTime.UtcNow,
+            Status    = "Running"
+        };
+        db.DmsSyncLogs.Add(log);
+        await db.SaveChangesAsync();
+
+        var result = new SyncResult { SyncType = "CallCentreDealers" };
+
+        try
+        {
+            var token = await _erpApi.GetValidTokenAsync();
+
+            // Get pincodes from DB first, then fallback to appsettings
+            var dbPincodes = await db.DmsPincodeMasters
+                .Where(p => p.IsActive)
+                .Select(p => p.PinCode)
+                .ToListAsync();
+
+            var configPincodes = _config.GetSection("SyncSettings:Pincodes")
+                                        .Get<List<string>>() ?? new();
+
+            var pincodes = dbPincodes.Any() ? dbPincodes : configPincodes;
+            pincodes = pincodes.Distinct().ToList();
+
+            _logger.LogInformation("CallCentre sync: {n} pincodes to process", pincodes.Count);
+
+            foreach (var pin in pincodes)
+            {
+                try
+                {
+                    var dealers = await _erpApi.FetchCallCentreDealersByPinAsync(pin, token);
+                    result.RecordsFetched += dealers.Count;
+
+                    foreach (var d in dealers)
+                    {
+                        if (string.IsNullOrEmpty(d.DealerCode)) continue;
+
+                        var existing = await db.DmsCallCentreDealers
+                            .FirstOrDefaultAsync(x => x.DealerCode == d.DealerCode);
+
+                        if (existing == null)
+                        {
+                            db.DmsCallCentreDealers.Add(new DmsCallCentreDealer
+                            {
+                                DealerCode         = d.DealerCode,
+                                DealerCompany      = d.DealerCompany,
+                                ContactNo          = d.ContactNo,
+                                AlternateContactNo = d.AlternateContactNo,
+                                DealerStateName    = d.DealerStateName,
+                                PinCode            = d.PinCode ?? pin,
+                                ActiveStatus       = d.ActiveStatus,
+                                LastFetchedAt      = DateTime.UtcNow,
+                                CreatedAt          = DateTime.UtcNow,
+                                UpdatedAt          = DateTime.UtcNow
+                            });
+                            result.RecordsInserted++;
+                        }
+                        else
+                        {
+                            existing.DealerCompany      = d.DealerCompany;
+                            existing.ContactNo          = d.ContactNo;
+                            existing.AlternateContactNo = d.AlternateContactNo;
+                            existing.DealerStateName    = d.DealerStateName;
+                            existing.PinCode            = d.PinCode ?? pin;
+                            existing.ActiveStatus       = d.ActiveStatus;
+                            existing.LastFetchedAt      = DateTime.UtcNow;
+                            existing.UpdatedAt          = DateTime.UtcNow;
+                            result.RecordsUpdated++;
+                        }
+                    }
+                    await db.SaveChangesAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("CallCentre pin {pin} failed: {msg}", pin, ex.Message);
+                }
+            }
+
+            log.Status = "Success";
+        }
+        catch (Exception ex)
+        {
+            log.Status = "Failed";
+            log.ErrorMessage = ex.Message;
+            result.Error = ex.Message;
+            _logger.LogError(ex, "CallCentre dealer sync failed");
+        }
+
+        log.CompletedAt     = DateTime.UtcNow;
+        log.RecordsFetched  = result.RecordsFetched;
+        log.RecordsInserted = result.RecordsInserted;
+        log.RecordsUpdated  = result.RecordsUpdated;
+        await db.SaveChangesAsync();
+
+        return result;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // SYNC VEHICLE DISPATCHES — date range
+    // ─────────────────────────────────────────────────────────
+    public async Task<SyncResult> SyncVehicleDispatchesForDateAsync(DateTime date)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var log = new DmsSyncLog
+        {
+            SyncType  = "VehicleDispatches",
+            SyncDate  = DateOnly.FromDateTime(date),
+            StartedAt = DateTime.UtcNow,
+            Status    = "Running"
+        };
+        db.DmsSyncLogs.Add(log);
+        await db.SaveChangesAsync();
+
+        var result = new SyncResult { SyncType = "VehicleDispatches", Date = date };
+
+        try
+        {
+            var token = await _erpApi.GetValidTokenAsync();
+
+            // VDR API uses date range — pass same date for single day
+            var dispatches = await _erpApi.FetchVdrAsync(date, date, token);
+            result.RecordsFetched = dispatches.Count;
+
+            _logger.LogInformation("VDR {date}: fetched {n} records",
+                date.ToString("dd-MM-yyyy"), dispatches.Count);
+
+            // Dedup within response by (InvoiceNo, ChassisNo)
+            var deduped = dispatches
+                .Where(d => !string.IsNullOrEmpty(d.InvoiceNo))
+                .GroupBy(d => $"{d.InvoiceNo}|{d.ChassisNo}")
+                .Select(g => g.Last())
+                .ToList();
+
+            foreach (var d in deduped)
+            {
+                try
+                {
+                    var parsed = MapVehicleDispatch(d);
+
+                    var existing = await db.DmsVehicleDispatches
+                        .FirstOrDefaultAsync(x =>
+                            x.InvoiceNo  == parsed.InvoiceNo &&
+                            x.ChassisNo  == parsed.ChassisNo);
+
+                    if (existing == null)
+                    {
+                        db.DmsVehicleDispatches.Add(parsed);
+                        result.RecordsInserted++;
+                    }
+                    else
+                    {
+                        UpdateVehicleDispatch(existing, parsed);
+                        result.RecordsUpdated++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("Skipping dispatch {inv}/{ch}: {msg}",
+                        d.InvoiceNo, d.ChassisNo, ex.Message);
+                }
+            }
+
+            await db.SaveChangesAsync();
+            log.Status = "Success";
+        }
+        catch (Exception ex)
+        {
+            log.Status = "Failed";
+            log.ErrorMessage = ex.Message;
+            result.Error = ex.Message;
+            _logger.LogError(ex, "Vehicle dispatches sync failed for {date}", date.ToShortDateString());
+        }
+
+        log.CompletedAt     = DateTime.UtcNow;
+        log.RecordsFetched  = result.RecordsFetched;
+        log.RecordsInserted = result.RecordsInserted;
+        log.RecordsUpdated  = result.RecordsUpdated;
+        await db.SaveChangesAsync();
+
+        return result;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // BACKFILL VEHICLE DISPATCHES
+    // ─────────────────────────────────────────────────────────
+    public async Task<SyncResult> BackfillVehicleDispatchesAsync(
+        DateTime? fromDate = null, DateTime? toDate = null,
+        CancellationToken ct = default)
+    {
+        var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2022-01-01";
+        var start = fromDate ?? DateTime.Parse(startDateStr);
+        var end   = toDate   ?? DateTime.UtcNow.Date;
+        var today = DateTime.UtcNow.Date;
+
+        var totalResult = new SyncResult { SyncType = "BackfillVehicleDispatches" };
+        _logger.LogInformation("VDR Backfill: {start} → {end}",
+            start.ToShortDateString(), end.ToShortDateString());
+
+        var current = start;
+        while (current <= end && !ct.IsCancellationRequested)
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+            bool alreadySynced = current != today && await db.DmsSyncLogs.AnyAsync(l =>
+                l.SyncType == "VehicleDispatches" &&
+                l.SyncDate == DateOnly.FromDateTime(current) &&
+                l.Status   == "Success");
+
+            if (!alreadySynced)
+            {
+                var r = await SyncVehicleDispatchesForDateAsync(current);
+                totalResult.RecordsFetched  += r.RecordsFetched;
+                totalResult.RecordsInserted += r.RecordsInserted;
+                totalResult.RecordsUpdated  += r.RecordsUpdated;
+                _logger.LogInformation("VDR Backfill {date}: +{ins} inserted, +{upd} updated",
+                    current.ToShortDateString(), r.RecordsInserted, r.RecordsUpdated);
+            }
+            else
+            {
+                _logger.LogDebug("VDR Backfill {date}: already done, skipping", current.ToShortDateString());
+            }
+
+            current = current.AddDays(1);
+        }
+
+        return totalResult;
+    }
+
+    // ─────────────────────────────────────────────────────────
     // MAPPING HELPERS
     // ─────────────────────────────────────────────────────────
 
@@ -608,6 +850,88 @@ public class DataSyncService
         e.Vcu = n.Vcu; e.ControllerNo = n.ControllerNo;
         e.FameIirequired = n.FameIirequired; e.SegmentName = n.SegmentName;
         e.InstitutionalName = n.InstitutionalName; e.SchemeName = n.SchemeName;
+        e.UpdatedAt = DateTime.UtcNow;
+    }
+
+    private static DmsVehicleDispatch MapVehicleDispatch(VdrValue d) => new()
+    {
+        SaleDate        = ParseDate(d.SaleDate),
+        InvoiceNo       = d.InvoiceNo,
+        InvoiceDate     = ParseDate(d.InvoiceDate),
+        Location        = d.Location,
+        LocationCode    = d.LocationCode,
+        LocationCity    = d.LocationCity,
+        LocationStatus  = d.LocationStatus,
+        DealerName      = d.DealerName,
+        Zone            = d.Zone,
+        AreaOffice      = d.AreaOffice,
+        MfgYear         = d.MfgYear,
+        BrandName       = d.BrandName,
+        ModelCode       = d.ModelCode,
+        ColorCode       = d.ColorCode,
+        ChassisNo       = d.ChassisNo,
+        RegNo           = d.RegNo,
+        MotorNo         = d.MotorNo,
+        BatteryId       = d.BatteryId,
+        BatteryNo       = d.BatteryNo,
+        EcuSerialNo     = d.EcuSerialNo,
+        EcuImEi         = d.EcuImEi,
+        EcuBalMac       = d.EcuBalMac,
+        ImmoblizerNo    = d.ImmoblizerNo,
+        BikeSimId       = d.BikeSimId,
+        BikeMobileNo    = d.BikeMobileNo,
+        ChargerNo       = d.ChargerNo,
+        ControllerNo    = d.ControllerNo,
+        SoundbarSerialNo = d.SoundbarSerialNo,
+        SoundbarBalMac  = d.SoundbarBalMac,
+        Voltage         = d.Voltage,
+        RegNumber       = d.RegNumber,
+        StartDate       = ParseDate(d.StartDate),
+        Tyre1           = d.Tyre1,
+        Tyre2           = d.Tyre2,
+        VehicleStatus   = d.VehicleStatus,
+        BookingId       = d.BookingId,
+        BillNo          = d.BillNo,
+        BillDate        = ParseDate(d.BillDate),
+        BillType        = d.BillType,
+        FinancerName    = d.FinancerName,
+        FinAmount       = ParseDecimal(d.FinAmount),
+        NameOfParty     = d.NameOfParty,
+        Address1        = d.Address1,
+        Address2        = d.Address2,
+        State           = d.State,
+        City            = d.City,
+        Pin             = d.Pin,
+        MobileNo        = d.MobileNo,
+        Email           = d.Email,
+        AppPush         = d.AppPush,
+        LeadId          = d.LeadId,
+        Vcu             = d.Vcu,
+        CreatedAt       = DateTime.UtcNow,
+        UpdatedAt       = DateTime.UtcNow
+    };
+
+    private static void UpdateVehicleDispatch(DmsVehicleDispatch e, DmsVehicleDispatch n)
+    {
+        e.SaleDate = n.SaleDate; e.InvoiceDate = n.InvoiceDate;
+        e.Location = n.Location; e.LocationCode = n.LocationCode;
+        e.LocationCity = n.LocationCity; e.LocationStatus = n.LocationStatus;
+        e.DealerName = n.DealerName; e.Zone = n.Zone; e.AreaOffice = n.AreaOffice;
+        e.MfgYear = n.MfgYear; e.BrandName = n.BrandName; e.ModelCode = n.ModelCode;
+        e.ColorCode = n.ColorCode; e.RegNo = n.RegNo; e.MotorNo = n.MotorNo;
+        e.BatteryId = n.BatteryId; e.BatteryNo = n.BatteryNo;
+        e.EcuSerialNo = n.EcuSerialNo; e.EcuImEi = n.EcuImEi; e.EcuBalMac = n.EcuBalMac;
+        e.ImmoblizerNo = n.ImmoblizerNo; e.BikeSimId = n.BikeSimId;
+        e.BikeMobileNo = n.BikeMobileNo; e.ChargerNo = n.ChargerNo;
+        e.ControllerNo = n.ControllerNo; e.SoundbarSerialNo = n.SoundbarSerialNo;
+        e.SoundbarBalMac = n.SoundbarBalMac; e.Voltage = n.Voltage;
+        e.RegNumber = n.RegNumber; e.StartDate = n.StartDate;
+        e.Tyre1 = n.Tyre1; e.Tyre2 = n.Tyre2; e.VehicleStatus = n.VehicleStatus;
+        e.BookingId = n.BookingId; e.BillNo = n.BillNo; e.BillDate = n.BillDate;
+        e.BillType = n.BillType; e.FinancerName = n.FinancerName; e.FinAmount = n.FinAmount;
+        e.NameOfParty = n.NameOfParty; e.Address1 = n.Address1; e.Address2 = n.Address2;
+        e.State = n.State; e.City = n.City; e.Pin = n.Pin; e.MobileNo = n.MobileNo;
+        e.Email = n.Email; e.AppPush = n.AppPush; e.LeadId = n.LeadId; e.Vcu = n.Vcu;
         e.UpdatedAt = DateTime.UtcNow;
     }
 

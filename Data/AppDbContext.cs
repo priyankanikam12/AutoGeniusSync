@@ -31,6 +31,8 @@ public partial class AppDbContext : DbContext
     public virtual DbSet<OpsPodVehicleLiveDatum> OpsPodVehicleLiveData { get; set; }
 
     public virtual DbSet<SixSenseVehicleTelemetry> SixSenseVehicleTelemetries { get; set; }
+    public DbSet<DmsVehicleDispatch>  DmsVehicleDispatches  { get; set; }
+    public DbSet<DmsCallCentreDealer> DmsCallCentreDealers  { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -383,6 +385,27 @@ public partial class AppDbContext : DbContext
             entity.Property(e => e.RegNo).HasMaxLength(50);
             entity.Property(e => e.VehicleCondition).HasMaxLength(100);
             entity.Property(e => e.VehicleId).HasMaxLength(100);
+        });
+
+        modelBuilder.Entity<DmsVehicleDispatch>(entity =>
+        {
+            entity.HasIndex(v => new { v.InvoiceNo, v.ChassisNo })
+                .IsUnique();
+
+            entity.HasIndex(v => v.SaleDate);
+
+            entity.HasIndex(v => v.ChassisNo);
+
+            entity.HasIndex(v => v.LocationCode);
+        });
+
+
+        modelBuilder.Entity<DmsCallCentreDealer>(entity =>
+        {
+            entity.HasIndex(d => d.DealerCode)
+                .IsUnique();
+
+            entity.HasIndex(d => d.PinCode);
         });
 
         OnModelCreatingPartial(modelBuilder);

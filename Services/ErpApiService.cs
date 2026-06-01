@@ -190,6 +190,51 @@ public class ErpApiService
     }
 
     // ─────────────────────────────────────────────────────────
+    // VEHICLE DISPATCH REPORT (VDR) — date range, all dealers
+    // ─────────────────────────────────────────────────────────
+    public async Task<List<VdrValue>> FetchVdrAsync(
+        DateTime fromDate, DateTime toDate, string token,
+        string dealerCode = "", string vhclStatus = "ALL")
+    {
+        await Task.Delay(_delayMs);
+        var url = $"{_baseUrl}/V1/erpreport/vdr?Ver=1.0";
+        var vendorId = _config.GetValue<int>("AutoGeniusERP:VendorId", 14);
+
+        var req = new VdrRequest
+        {
+            VendorId     = vendorId,
+            FromDate     = fromDate.ToString("dd-MM-yyyy"),
+            ToDate       = toDate.ToString("dd-MM-yyyy"),
+            DealerCode   = dealerCode,
+            LocationCode = "",
+            ChassisNo    = "",
+            MobileNo     = "",
+            VhclStatus   = vhclStatus,
+            SubVendorCode = ""
+        };
+
+        return await PostWithRetryAsync<VdrValue>(url, req, token, maxRetries: 3);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // CALL CENTRE DEALER BY PINCODE
+    // ─────────────────────────────────────────────────────────
+    public async Task<List<CallCentreDealerValue>> FetchCallCentreDealersByPinAsync(
+        string pinCode, string token)
+    {
+        await Task.Delay(_delayMs);
+        var vendorId = _config.GetValue<int>("AutoGeniusERP:VendorId", 14);
+        var url = $"{_baseUrl}/V1/callcenter/pin?code={pinCode}&Ver=1.0&vendorid={vendorId}";
+
+        SetAuthHeader(token);
+        var resp = await _http.GetAsync(url);
+        var body = await resp.Content.ReadAsStringAsync();
+
+        var result = JsonConvert.DeserializeObject<ErpApiResponse<CallCentreDealerValue>>(body);
+        return result?.Valid == true ? result.Value ?? new() : new();
+    }
+
+    // ─────────────────────────────────────────────────────────
     // SHARED: POST with retry on timeout
     // ─────────────────────────────────────────────────────────
 
