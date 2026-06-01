@@ -3,6 +3,7 @@ using AutoGeniusSync.DTOs;
 using AutoGeniusSync.Models;
 using Microsoft.EntityFrameworkCore;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 namespace AutoGeniusSync.Services;
 
@@ -108,8 +109,8 @@ public class ErpApiService
         var vendorId = _config.GetValue<int>("AutoGeniusERP:VendorId", 14);
         var url = $"{_baseUrl}/V1/booking/pin?code={pinCode}&Ver=1.0&vendorid={vendorId}";
 
-        SetAuthHeader(token);
-        var resp = await _http.GetAsync(url);
+        using var request = BuildGetRequest(url, token);
+        var resp = await _http.SendAsync(request);
         var body = await resp.Content.ReadAsStringAsync();
 
         var result = JsonConvert.DeserializeObject<ErpApiResponse<DealerValue>>(body);
@@ -117,7 +118,7 @@ public class ErpApiService
     }
 
     // ─────────────────────────────────────────────────────────
-    // DAILY JOB REPORT (DJR) — with retry on timeout
+    // DAILY JOB REPORT (DJR)
     // ─────────────────────────────────────────────────────────
 
     public async Task<List<DjrValue>> FetchDjrAsync(
@@ -140,7 +141,7 @@ public class ErpApiService
     }
 
     // ─────────────────────────────────────────────────────────
-    // VEHICLE SALES REPORT (VSR) — with retry on timeout
+    // VEHICLE SALES REPORT (VSR)
     // ─────────────────────────────────────────────────────────
 
     public async Task<List<VsrValue>> FetchVsrAsync(
@@ -166,7 +167,7 @@ public class ErpApiService
     }
 
     // ─────────────────────────────────────────────────────────
-    // DJRN — with retry
+    // DJRN
     // ─────────────────────────────────────────────────────────
 
     public async Task<List<DjrValue>> FetchDjrnAsync(
@@ -190,8 +191,9 @@ public class ErpApiService
     }
 
     // ─────────────────────────────────────────────────────────
-    // VEHICLE DISPATCH REPORT (VDR) — date range, all dealers
+    // VEHICLE DISPATCH REPORT (VDR)
     // ─────────────────────────────────────────────────────────
+
     public async Task<List<VdrValue>> FetchVdrAsync(
         DateTime fromDate, DateTime toDate, string token,
         string dealerCode = "", string vhclStatus = "ALL")
@@ -202,14 +204,14 @@ public class ErpApiService
 
         var req = new VdrRequest
         {
-            VendorId     = vendorId,
-            FromDate     = fromDate.ToString("dd-MM-yyyy"),
-            ToDate       = toDate.ToString("dd-MM-yyyy"),
-            DealerCode   = dealerCode,
-            LocationCode = "",
-            ChassisNo    = "",
-            MobileNo     = "",
-            VhclStatus   = vhclStatus,
+            VendorId      = vendorId,
+            FromDate      = fromDate.ToString("dd-MM-yyyy"),
+            ToDate        = toDate.ToString("dd-MM-yyyy"),
+            DealerCode    = dealerCode,
+            LocationCode  = "",
+            ChassisNo     = "",
+            MobileNo      = "",
+            VhclStatus    = vhclStatus,
             SubVendorCode = ""
         };
 
@@ -226,8 +228,8 @@ public class ErpApiService
         var vendorId = _config.GetValue<int>("AutoGeniusERP:VendorId", 14);
         var url = $"{_baseUrl}/V1/callcenter/pin?code={pinCode}&Ver=1.0&vendorid={vendorId}";
 
-        SetAuthHeader(token);
-        var resp = await _http.GetAsync(url);
+        using var request = BuildGetRequest(url, token);
+        var resp = await _http.SendAsync(request);
         var body = await resp.Content.ReadAsStringAsync();
 
         var result = JsonConvert.DeserializeObject<ErpApiResponse<CallCentreDealerValue>>(body);
@@ -235,7 +237,7 @@ public class ErpApiService
     }
 
     // ─────────────────────────────────────────────────────────
-    // SHARED: POST with retry on timeout
+    // SHARED: POST with retry — auth header set per-request
     // ─────────────────────────────────────────────────────────
 
     private async Task<List<T>> PostWithRetryAsync<T>(
@@ -249,46 +251,50 @@ public class ErpApiService
         {
             try
             {
-                SetAuthHeader(token);
-
-                var content = new StringContent(
-                    JsonConvert.SerializeObject(requestBody),
-                    System.Text.Encoding.UTF8,
-                    "application/json");
-
+                // ── Build a fresh HttpRequestMessage each attempt ──
+                // This is the key fix: each request gets its own headers,
+                // so concurrent calls can never collide on Authorization.
+                using var request = BuildPostRequest(url, requestBody, token);
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
 
                 _logger.LogInformation("Attempt {attempt}/{max} → POST {url} (timeout: {t}s)",
                     attempt, maxRetries, url, timeoutSeconds);
 
-                var resp = await _http.PostAsync(url, content, cts.Token);
+                var resp = await _http.SendAsync(request, cts.Token);
                 var body = await resp.Content.ReadAsStringAsync();
 
                 if (!resp.IsSuccessStatusCode)
                 {
                     _logger.LogWarning("Attempt {attempt}/{max} got HTTP {code} from {url}",
                         attempt, maxRetries, (int)resp.StatusCode, url);
-                    lastException = new Exception($"HTTP {(int)resp.StatusCode}: {body[..Math.Min(200, body.Length)]}");
+                    lastException = new Exception(
+                        $"HTTP {(int)resp.StatusCode}: {body[..Math.Min(200, body.Length)]}");
 
                     if (attempt < maxRetries)
                     {
-                        await Task.Delay(TimeSpan.FromSeconds(attempt * 10)); // 10s, 20s backoff
+                        await Task.Delay(TimeSpan.FromSeconds(attempt * 10));
                         continue;
                     }
                     break;
                 }
 
-                var result = JsonConvert.DeserializeObject<ErpApiResponse<T>>(body);
-                return result?.Valid == true ? result.Value ?? new() : new();
+                // ── Tolerant deserialization ──────────────────────
+                // The API occasionally returns malformed JSON for certain
+                // fields (e.g. 'IndividualAH Battery1' with a space, or
+                // numeric strings where a number is expected).
+                // We parse via JObject first so a single bad field does
+                // not kill the entire response.
+                return DeserializeTolerant<T>(body, url, attempt, maxRetries);
             }
             catch (OperationCanceledException)
             {
                 lastException = new Exception($"Request timed out after {timeoutSeconds}s");
-                _logger.LogWarning("Attempt {attempt}/{max} timed out for {url}. {remaining} attempt(s) left.",
+                _logger.LogWarning(
+                    "Attempt {attempt}/{max} timed out for {url}. {remaining} attempt(s) left.",
                     attempt, maxRetries, url, maxRetries - attempt);
 
                 if (attempt < maxRetries)
-                    await Task.Delay(TimeSpan.FromSeconds(attempt * 10)); // 10s, 20s backoff
+                    await Task.Delay(TimeSpan.FromSeconds(attempt * 10));
             }
             catch (HttpRequestException ex)
             {
@@ -301,20 +307,113 @@ public class ErpApiService
             }
             catch (Exception ex)
             {
-                // Non-retryable — bail immediately
-                _logger.LogError(ex, "Attempt {attempt}/{max} unexpected error for {url}", attempt, maxRetries, url);
+                // Non-retryable (e.g. programming error) — surface immediately
+                _logger.LogError(ex,
+                    "Attempt {attempt}/{max} unexpected error for {url}", attempt, maxRetries, url);
                 throw;
             }
         }
 
-        _logger.LogWarning("All {max} attempts failed for {url}. Last error: {err}. Returning empty.",
+        _logger.LogWarning(
+            "All {max} attempts failed for {url}. Last error: {err}. Returning empty.",
             maxRetries, url, lastException?.Message);
         return new();
     }
 
-    private void SetAuthHeader(string token)
+    // ─────────────────────────────────────────────────────────
+    // TOLERANT JSON DESERIALIZER
+    // Parses via JObject so one malformed field does not abort
+    // the entire response. Bad fields are logged and skipped.
+    // ─────────────────────────────────────────────────────────
+
+    private List<T> DeserializeTolerant<T>(
+        string body, string url, int attempt, int maxRetries)
     {
-        _http.DefaultRequestHeaders.Remove("Authorization");
-        _http.DefaultRequestHeaders.Add("Authorization", $"Token {token}");
+        try
+        {
+            // Fast path: standard deserialization
+            var result = JsonConvert.DeserializeObject<ErpApiResponse<T>>(body);
+            return result?.Valid == true ? result.Value ?? new() : new();
+        }
+        catch (JsonException firstEx)
+        {
+            _logger.LogWarning(
+                "Attempt {attempt}/{max} standard parse failed for {url}: {msg}. Trying tolerant parse.",
+                attempt, maxRetries, url, firstEx.Message);
+        }
+
+        // Slow path: parse outer envelope, then each Value item individually
+        try
+        {
+            var root = JObject.Parse(body);
+            var valid = root["Valid"]?.Value<bool>() ?? false;
+            if (!valid)
+                return new();
+
+            var valueToken = root["Value"];
+            if (valueToken == null || valueToken.Type == JTokenType.Null)
+                return new();
+
+            var items = new List<T>();
+            var settings = new JsonSerializerSettings
+            {
+                Error = (_, args) =>
+                {
+                    // Log the bad field but keep going
+                    _logger.LogDebug("Tolerant parse skipped field: {path} — {msg}",
+                        args.ErrorContext.Path, args.ErrorContext.Error.Message);
+                    args.ErrorContext.Handled = true;
+                }
+            };
+
+            foreach (var token in valueToken)
+            {
+                try
+                {
+                    var item = token.ToObject<T>(JsonSerializer.Create(settings));
+                    if (item != null)
+                        items.Add(item);
+                }
+                catch (Exception itemEx)
+                {
+                    _logger.LogDebug("Tolerant parse: skipped one item at {url}: {msg}",
+                        url, itemEx.Message);
+                }
+            }
+
+            _logger.LogInformation(
+                "Tolerant parse recovered {n} items from {url}", items.Count, url);
+            return items;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Tolerant parse also failed for {url}. Returning empty.", url);
+            return new();
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // REQUEST BUILDERS — auth header on the message, not the client
+    // ─────────────────────────────────────────────────────────
+
+    private static HttpRequestMessage BuildPostRequest(
+        string url, object body, string token)
+    {
+        var msg = new HttpRequestMessage(HttpMethod.Post, url)
+        {
+            Content = new StringContent(
+                JsonConvert.SerializeObject(body),
+                System.Text.Encoding.UTF8,
+                "application/json")
+        };
+        msg.Headers.TryAddWithoutValidation("Authorization", $"Token {token}");
+        return msg;
+    }
+
+    private static HttpRequestMessage BuildGetRequest(string url, string token)
+    {
+        var msg = new HttpRequestMessage(HttpMethod.Get, url);
+        msg.Headers.TryAddWithoutValidation("Authorization", $"Token {token}");
+        return msg;
     }
 }

@@ -74,42 +74,42 @@ public class DjrValue
     [JsonProperty("Model")]                     public string? Model { get; set; }
     [JsonProperty("Brand Name")]                public string? BrandName { get; set; }
     [JsonProperty("Party Name")]                public string? PartyName { get; set; }
-    [JsonProperty("Mobile Number")]             public string? MobileNumber { get; set; }
+    [JsonProperty("MobileNumber")]             public string? MobileNumber { get; set; }
     [JsonProperty("Supervisor")]                public string? Supervisor { get; set; }
     [JsonProperty("Technician")]                public string? Technician { get; set; }
     [JsonProperty("KMS")]                       public string? KMS { get; set; }
-    [JsonProperty("Service Head")]              public string? ServiceHead { get; set; }
-    [JsonProperty("Job Type")]                  public string? JobType { get; set; }
-    [JsonProperty("Reg No")]                    public string? RegNo { get; set; }
-    [JsonProperty("Vehicle Type")]              public string? VehicleType { get; set; }
-    [JsonProperty("Engine No")]                 public string? EngineNo { get; set; }
-    [JsonProperty("Chassis No")]                public string? ChassisNo { get; set; }
-    [JsonProperty("Battery SerialNo1")]         public string? BatterySerialNo1 { get; set; }
-    [JsonProperty("Battery SerialNo2")]         public string? BatterySerialNo2 { get; set; }
-    [JsonProperty("Battery SerialNo3")]         public string? BatterySerialNo3 { get; set; }
-    [JsonProperty("Battery SerialNo4")]         public string? BatterySerialNo4 { get; set; }
-    [JsonProperty("Battery SerialNo5")]         public string? BatterySerialNo5 { get; set; }
-    [JsonProperty("Battery SerialNo6")]         public string? BatterySerialNo6 { get; set; }
-    [JsonProperty("IndividualAH Battery1")]     public string? IndividualAHBattery1 { get; set; }
-    [JsonProperty("IndividualAH Battery2")]     public string? IndividualAHBattery2 { get; set; }
-    [JsonProperty("IndividualAH Battery3")]     public string? IndividualAHBattery3 { get; set; }
-    [JsonProperty("IndividualAH Battery4")]     public string? IndividualAHBattery4 { get; set; }
-    [JsonProperty("IndividualAH Battery5")]     public string? IndividualAHBattery5 { get; set; }
-    [JsonProperty("IndividualAH Battery6")]     public string? IndividualAHBattery6 { get; set; }
-    [JsonProperty("Sale Date")]                 public string? SaleDate { get; set; }
-    [JsonProperty("Coupon No")]                 public string? CouponNo { get; set; }
-    [JsonProperty("Expected delivery date")]    public string? ExpectedDeliveryDate { get; set; }
-    [JsonProperty("Proforma Date")]             public string? ProformaDate { get; set; }
-    [JsonProperty("Invoice Date")]              public string? InvoiceDate { get; set; }
-    [JsonProperty("Estimated Job expenses")]    public string? EstimatedJobExpenses { get; set; }
-    [JsonProperty("Labour hours")]              public string? LabourHours { get; set; }
+    [JsonProperty("ServiceHead")]              public string? ServiceHead { get; set; }
+    [JsonProperty("JobType")]                  public string? JobType { get; set; }
+    [JsonProperty("RegNo")]                    public string? RegNo { get; set; }
+    [JsonProperty("VehicleType")]              public string? VehicleType { get; set; }
+    [JsonProperty("EngineNo")]                 public string? EngineNo { get; set; }
+    [JsonProperty("ChassisNo")]                public string? ChassisNo { get; set; }
+    [JsonProperty("BatterySerialNo1")]         public string? BatterySerialNo1 { get; set; }
+    [JsonProperty("BatterySerialNo2")]         public string? BatterySerialNo2 { get; set; }
+    [JsonProperty("BatterySerialNo3")]         public string? BatterySerialNo3 { get; set; }
+    [JsonProperty("BatterySerialNo4")]         public string? BatterySerialNo4 { get; set; }
+    [JsonProperty("BatterySerialNo5")]         public string? BatterySerialNo5 { get; set; }
+    [JsonProperty("BatterySerialNo6")]         public string? BatterySerialNo6 { get; set; }
+    [JsonProperty("IndividualAHBattery1")]     public string? IndividualAHBattery1 { get; set; }
+    [JsonProperty("IndividualAHBattery2")]     public string? IndividualAHBattery2 { get; set; }
+    [JsonProperty("IndividualAHBattery3")]     public string? IndividualAHBattery3 { get; set; }
+    [JsonProperty("IndividualAHBattery4")]     public string? IndividualAHBattery4 { get; set; }
+    [JsonProperty("IndividualAHBattery5")]     public string? IndividualAHBattery5 { get; set; }
+    [JsonProperty("IndividualAHBattery6")]     public string? IndividualAHBattery6 { get; set; }
+    [JsonProperty("SaleDate")]                 public string? SaleDate { get; set; }
+    [JsonProperty("CouponNo")]                 public string? CouponNo { get; set; }
+    [JsonProperty("ExpectedDeliveryDate")]    public string? ExpectedDeliveryDate { get; set; }
+    [JsonProperty("ProformaDate")]             public string? ProformaDate { get; set; }
+    [JsonProperty("InvoiceDate")]              public string? InvoiceDate { get; set; }
+    [JsonProperty("EstimatedJobExpenses")]    public string? EstimatedJobExpenses { get; set; }
+    [JsonProperty("LabourHours")]              public string? LabourHours { get; set; }
     [JsonProperty("Parts")]                     public string? Parts { get; set; }
     [JsonProperty("Accessory")]                 public string? Accessory { get; set; }
     [JsonProperty("Oil")]                       public string? Oil { get; set; }
     [JsonProperty("Labour")]                    public string? Labour { get; set; }
-    [JsonProperty("Outside Work")]              public string? OutsideWork { get; set; }
-    [JsonProperty("Total W/O Tax")]             public string? TotalWOTax { get; set; }
-    [JsonProperty("GST_Amnt")]                  public string? GSTAmount { get; set; }
-    [JsonProperty("IGST_Amnt")]                 public string? IGSTAmount { get; set; }
-    [JsonProperty("Net Total")]                 public string? NetTotal { get; set; }
+    [JsonProperty("OutsideWork")]              public string? OutsideWork { get; set; }
+    [JsonProperty("TotalWOTax")]             public string? TotalWOTax { get; set; }
+    [JsonProperty("GSTAmount")]                  public string? GSTAmount { get; set; }
+    [JsonProperty("IGSTAmount")]                 public string? IGSTAmount { get; set; }
+    [JsonProperty("NetTotal")]                 public string? NetTotal { get; set; }
 }

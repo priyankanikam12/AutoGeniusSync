@@ -27,26 +27,31 @@ builder.Services.AddDbContext<AppDbContext>(options =>
         builder.Configuration.GetConnectionString("DefaultConnection"),
         sql =>
         {
-            sql.CommandTimeout(120);
+            sql.CommandTimeout(180);
             sql.EnableRetryOnFailure(
                 maxRetryCount: 5,
-                maxRetryDelay: TimeSpan.FromSeconds(10),
-                errorNumbersToAdd: null   // uses EF Core's default transient list
-            );
+                maxRetryDelay: TimeSpan.FromSeconds(15),
+                errorNumbersToAdd: null);
         }
-    ));
+    ), ServiceLifetime.Scoped);
 
-// In Program.cs — set HttpClient timeout to "infinite", control it per-request instead
+// ─────────────────────────────────────────────────────────────
+// HTTP CLIENT — timeout controlled per-request via CTS
+// ─────────────────────────────────────────────────────────────
 builder.Services.AddHttpClient<ErpApiService>(client =>
 {
-    client.Timeout = Timeout.InfiniteTimeSpan; // ← per-request CTS controls this now
+    client.Timeout = Timeout.InfiniteTimeSpan;
 });
 
 // ─────────────────────────────────────────────────────────────
 // APPLICATION SERVICES
+// IMPORTANT: DataSyncService must be Scoped (NOT Singleton)
+// because it uses IServiceScopeFactory to create DB contexts.
+// Using Singleton caused multiple concurrent scopes hitting the
+// DB connection pool simultaneously → connection timeout.
 // ─────────────────────────────────────────────────────────────
-//builder.Services.AddScoped<DataSyncService>();
-builder.Services.AddSingleton<DataSyncService>();
+builder.Services.AddScoped<DataSyncService>();
+builder.Services.AddScoped<ErpApiService>();
 
 // ─────────────────────────────────────────────────────────────
 // BACKGROUND SERVICE
@@ -56,14 +61,10 @@ builder.Services.AddHostedService<SyncHostedService>();
 // ─────────────────────────────────────────────────────────────
 // API / SWAGGER
 // ─────────────────────────────────────────────────────────────
-builder.Services.AddControllers()
-    .AddNewtonsoftJson();
-
+builder.Services.AddControllers().AddNewtonsoftJson();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
-{
-    c.SwaggerDoc("v1", new() { Title = "AutoGenius DMS Sync API", Version = "v1" });
-});
+    c.SwaggerDoc("v1", new() { Title = "AutoGenius DMS Sync API", Version = "v1" }));
 
 // ─────────────────────────────────────────────────────────────
 // CORS
@@ -86,7 +87,7 @@ using (var scope = app.Services.CreateScope())
     }
     catch (Exception ex)
     {
-        app.Logger.LogError(ex, "Database connection failed. Check appsettings.json connection string.");
+        app.Logger.LogError(ex, "Database connection failed.");
     }
 }
 
