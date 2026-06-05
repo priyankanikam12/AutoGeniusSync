@@ -36,11 +36,21 @@ builder.Services.AddDbContext<AppDbContext>(options =>
     ), ServiceLifetime.Scoped);
 
 // ─────────────────────────────────────────────────────────────
-// HTTP CLIENT — timeout controlled per-request via CTS
+// HTTP CLIENT (DEFAULT API CLIENTS)
 // ─────────────────────────────────────────────────────────────
-builder.Services.AddHttpClient<ErpApiService>(client =>
+builder.Services.AddHttpClient();
+
+// ─────────────────────────────────────────────────────────────
+// ERP API FIX (IMPORTANT - prevents HttpClient disposed issue)
+// ─────────────────────────────────────────────────────────────
+var erpTimeout = builder.Configuration.GetValue<int>(
+    "AutoGeniusERP:HttpTimeoutSeconds",
+    120
+);
+
+builder.Services.AddHttpClient("ErpApi", client =>
 {
-    client.Timeout = Timeout.InfiniteTimeSpan;
+    client.Timeout = TimeSpan.FromSeconds(erpTimeout + 10);
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -51,7 +61,7 @@ builder.Services.AddHttpClient<ErpApiService>(client =>
 // DB connection pool simultaneously → connection timeout.
 // ─────────────────────────────────────────────────────────────
 builder.Services.AddScoped<DataSyncService>();
-builder.Services.AddScoped<ErpApiService>();
+builder.Services.AddSingleton<ErpApiService>();
 
 // ─────────────────────────────────────────────────────────────
 // BACKGROUND SERVICE
@@ -98,6 +108,7 @@ app.UseSwagger();
 app.UseSwaggerUI(c => c.SwaggerEndpoint("/swagger/v1/swagger.json", "AutoGenius DMS v1"));
 
 app.UseCors();
+app.UseMiddleware<AutoGeniusSync.Middleware.ApiKeyMiddleware>();
 app.MapControllers();
 
 app.MapGet("/", () => Results.Redirect("/swagger"));

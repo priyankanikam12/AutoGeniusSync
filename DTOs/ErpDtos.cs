@@ -7,9 +7,9 @@ namespace AutoGeniusSync.DTOs;
 // ─────────────────────────────────────────────
 public class ErpApiResponse<T>
 {
-    [JsonProperty("Valid")] public bool Valid { get; set; }
+    [JsonProperty("Valid")]       public bool    Valid       { get; set; }
     [JsonProperty("Description")] public string? Description { get; set; }
-    [JsonProperty("Value")] public List<T>? Value { get; set; }
+    [JsonProperty("Value")]       public List<T>? Value      { get; set; }
 }
 
 // ─────────────────────────────────────────────
@@ -23,12 +23,12 @@ public class LoginRequest
 
 public class LoginValue
 {
-    [JsonProperty("accesstoken")]       public string? AccessToken { get; set; }
+    [JsonProperty("accesstoken")]       public string? AccessToken    { get; set; }
     [JsonProperty("LoginEmail_Idno")]   public string? LoginEmailIdno { get; set; }
-    [JsonProperty("loginemail")]        public string? LoginEmail { get; set; }
-    [JsonProperty("vendorname")]        public string? VendorName { get; set; }
-    [JsonProperty("vendorcode")]        public string? VendorCode { get; set; }
-    [JsonProperty("vendorid")]          public string? VendorId { get; set; }
+    [JsonProperty("loginemail")]        public string? LoginEmail     { get; set; }
+    [JsonProperty("vendorname")]        public string? VendorName     { get; set; }
+    [JsonProperty("vendorcode")]        public string? VendorCode     { get; set; }
+    [JsonProperty("vendorid")]          public string? VendorId       { get; set; }
 }
 
 // ─────────────────────────────────────────────
@@ -36,80 +36,99 @@ public class LoginValue
 // ─────────────────────────────────────────────
 public class DealerValue
 {
-    [JsonProperty("DealerCode")]            public string? DealerCode { get; set; }
-    [JsonProperty("DealerCompany")]         public string? DealerCompany { get; set; }
-    [JsonProperty("ContactNo")]             public string? ContactNo { get; set; }
-    [JsonProperty("AlternateContactNo")]    public string? AlternateContactNo { get; set; }
-    [JsonProperty("DealerStateName")]       public string? DealerStateName { get; set; }
-    [JsonProperty("DealerCityName")]        public string? DealerCityName { get; set; }
-    [JsonProperty("PinCode")]               public string? PinCode { get; set; }
-    [JsonProperty("ActiveStatus")]          public string? ActiveStatus { get; set; }
+    [JsonProperty("DealerCode")]         public string? DealerCode         { get; set; }
+    [JsonProperty("DealerCompany")]      public string? DealerCompany      { get; set; }
+    [JsonProperty("ContactNo")]          public string? ContactNo          { get; set; }
+    [JsonProperty("AlternateContactNo")] public string? AlternateContactNo { get; set; }
+    [JsonProperty("DealerStateName")]    public string? DealerStateName    { get; set; }
+    [JsonProperty("DealerCityName")]     public string? DealerCityName     { get; set; }
+    [JsonProperty("PinCode")]            public string? PinCode            { get; set; }
+    [JsonProperty("ActiveStatus")]       public string? ActiveStatus       { get; set; }
 }
 
 // ─────────────────────────────────────────────
-// Daily Job Report
+// Daily Job Report (DJR)
 // ─────────────────────────────────────────────
 public class DjrRequest
 {
-    [JsonProperty("vendorid")]      public int VendorId { get; set; }
-    [JsonProperty("startdate")]     public string StartDate { get; set; } = "";
-    [JsonProperty("enddate")]       public string EndDate { get; set; } = "";
-    [JsonProperty("dealercode")]    public string DealerCode { get; set; } = "";
+    [JsonProperty("vendorid")]   public int    VendorId   { get; set; }
+    [JsonProperty("startdate")]  public string StartDate  { get; set; } = "";
+    [JsonProperty("enddate")]    public string EndDate    { get; set; } = "";
+    [JsonProperty("dealercode")] public string DealerCode { get; set; } = "";
 }
 
 public class DjrValue
 {
-    [JsonProperty("Comp Name")]                 public string? CompName { get; set; }
-    [JsonProperty("Dealer Code")]               public string? DealerCode { get; set; }
-    [JsonProperty("Job Date")]                  public string? JobDate { get; set; }
-    [JsonProperty("Job No")]                    public string? JobNo { get; set; }
-    [JsonProperty("In Time")]                   public string? InTime { get; set; }
-    [JsonProperty("Job Category")]              public string? JobCategory { get; set; }
-    [JsonProperty("FFR Per%")]                  public string? FFRPercentage { get; set; }
-    [JsonProperty("Doc No")]                    public string? DocNo { get; set; }
-    [JsonProperty("Doc Type")]                  public string? DocType { get; set; }
-    [JsonProperty("Doc Date")]                  public string? DocDate { get; set; }
-    [JsonProperty("Close Time")]                public string? CloseTime { get; set; }
-    [JsonProperty("Location")]                  public string? Location { get; set; }
-    [JsonProperty("Model")]                     public string? Model { get; set; }
-    [JsonProperty("Brand Name")]                public string? BrandName { get; set; }
-    [JsonProperty("Party Name")]                public string? PartyName { get; set; }
-    [JsonProperty("MobileNumber")]             public string? MobileNumber { get; set; }
-    [JsonProperty("Supervisor")]                public string? Supervisor { get; set; }
-    [JsonProperty("Technician")]                public string? Technician { get; set; }
-    [JsonProperty("KMS")]                       public string? KMS { get; set; }
-    [JsonProperty("ServiceHead")]              public string? ServiceHead { get; set; }
-    [JsonProperty("JobType")]                  public string? JobType { get; set; }
-    [JsonProperty("RegNo")]                    public string? RegNo { get; set; }
-    [JsonProperty("VehicleType")]              public string? VehicleType { get; set; }
-    [JsonProperty("EngineNo")]                 public string? EngineNo { get; set; }
-    [JsonProperty("ChassisNo")]                public string? ChassisNo { get; set; }
-    [JsonProperty("BatterySerialNo1")]         public string? BatterySerialNo1 { get; set; }
-    [JsonProperty("BatterySerialNo2")]         public string? BatterySerialNo2 { get; set; }
-    [JsonProperty("BatterySerialNo3")]         public string? BatterySerialNo3 { get; set; }
-    [JsonProperty("BatterySerialNo4")]         public string? BatterySerialNo4 { get; set; }
-    [JsonProperty("BatterySerialNo5")]         public string? BatterySerialNo5 { get; set; }
-    [JsonProperty("BatterySerialNo6")]         public string? BatterySerialNo6 { get; set; }
-    [JsonProperty("IndividualAHBattery1")]     public string? IndividualAHBattery1 { get; set; }
-    [JsonProperty("IndividualAHBattery2")]     public string? IndividualAHBattery2 { get; set; }
-    [JsonProperty("IndividualAHBattery3")]     public string? IndividualAHBattery3 { get; set; }
-    [JsonProperty("IndividualAHBattery4")]     public string? IndividualAHBattery4 { get; set; }
-    [JsonProperty("IndividualAHBattery5")]     public string? IndividualAHBattery5 { get; set; }
-    [JsonProperty("IndividualAHBattery6")]     public string? IndividualAHBattery6 { get; set; }
-    [JsonProperty("SaleDate")]                 public string? SaleDate { get; set; }
-    [JsonProperty("CouponNo")]                 public string? CouponNo { get; set; }
-    [JsonProperty("ExpectedDeliveryDate")]    public string? ExpectedDeliveryDate { get; set; }
-    [JsonProperty("ProformaDate")]             public string? ProformaDate { get; set; }
-    [JsonProperty("InvoiceDate")]              public string? InvoiceDate { get; set; }
-    [JsonProperty("EstimatedJobExpenses")]    public string? EstimatedJobExpenses { get; set; }
-    [JsonProperty("LabourHours")]              public string? LabourHours { get; set; }
-    [JsonProperty("Parts")]                     public string? Parts { get; set; }
-    [JsonProperty("Accessory")]                 public string? Accessory { get; set; }
-    [JsonProperty("Oil")]                       public string? Oil { get; set; }
-    [JsonProperty("Labour")]                    public string? Labour { get; set; }
-    [JsonProperty("OutsideWork")]              public string? OutsideWork { get; set; }
-    [JsonProperty("TotalWOTax")]             public string? TotalWOTax { get; set; }
-    [JsonProperty("GSTAmount")]                  public string? GSTAmount { get; set; }
-    [JsonProperty("IGSTAmount")]                 public string? IGSTAmount { get; set; }
-    [JsonProperty("NetTotal")]                 public string? NetTotal { get; set; }
+    // ── Identity ─────────────────────────────────────────────
+    [JsonProperty("Dealer Code")]  public string? DealerCode  { get; set; }
+    [JsonProperty("Job No")]       public string? JobNo       { get; set; }
+    [JsonProperty("Job Date")]     public string? JobDate     { get; set; }
+    [JsonProperty("Comp Name")]    public string? CompName    { get; set; }
+    [JsonProperty("Location")]     public string? Location    { get; set; }
+
+    // ── Time ─────────────────────────────────────────────────
+    [JsonProperty("In Time")]      public string? InTime      { get; set; }
+    [JsonProperty("Close Time")]   public string? CloseTime   { get; set; }
+
+    // ── Classification ───────────────────────────────────────
+    [JsonProperty("Job Category")] public string? JobCategory   { get; set; }
+    [JsonProperty("FFR Per%")]     public string? FFRPercentage { get; set; }
+    [JsonProperty("Doc No")]       public string? DocNo         { get; set; }
+    [JsonProperty("Doc Type")]     public string? DocType       { get; set; }
+    [JsonProperty("Doc Date")]     public string? DocDate       { get; set; }
+
+    // ── Vehicle ──────────────────────────────────────────────
+    [JsonProperty("Model")]        public string? Model       { get; set; }
+    [JsonProperty("Brand Name")]   public string? BrandName   { get; set; }
+    [JsonProperty("Reg No")]       public string? RegNo       { get; set; }
+    [JsonProperty("Vehicle Type")] public string? VehicleType { get; set; }
+    [JsonProperty("Engine No")]    public string? EngineNo    { get; set; }
+    [JsonProperty("Chassis No")]   public string? ChassisNo   { get; set; }
+    [JsonProperty("KMS")]          public string? KMS         { get; set; }
+
+    // ── Battery serials — API sends "Battery SerialNo1" (no space before number) ──
+    [JsonProperty("Battery SerialNo1")] public string? BatterySerialNo1 { get; set; }
+    [JsonProperty("Battery SerialNo2")] public string? BatterySerialNo2 { get; set; }
+    [JsonProperty("Battery SerialNo3")] public string? BatterySerialNo3 { get; set; }
+    [JsonProperty("Battery SerialNo4")] public string? BatterySerialNo4 { get; set; }
+    [JsonProperty("Battery SerialNo5")] public string? BatterySerialNo5 { get; set; }
+    [JsonProperty("Battery SerialNo6")] public string? BatterySerialNo6 { get; set; }
+
+    // ── Individual AH Battery — sanitizer converts "IndividualAH Battery1"
+    //    to "IndividualAHBattery1" before deserialization, so match the
+    //    post-sanitize form here ────────────────────────────────
+    [JsonProperty("IndividualAHBattery1")] public string? IndividualAHBattery1 { get; set; }
+    [JsonProperty("IndividualAHBattery2")] public string? IndividualAHBattery2 { get; set; }
+    [JsonProperty("IndividualAHBattery3")] public string? IndividualAHBattery3 { get; set; }
+    [JsonProperty("IndividualAHBattery4")] public string? IndividualAHBattery4 { get; set; }
+    [JsonProperty("IndividualAHBattery5")] public string? IndividualAHBattery5 { get; set; }
+    [JsonProperty("IndividualAHBattery6")] public string? IndividualAHBattery6 { get; set; }
+
+    // ── Customer / staff ─────────────────────────────────────
+    [JsonProperty("Party Name")]    public string? PartyName    { get; set; }
+    [JsonProperty("Mobile Number")] public string? MobileNumber { get; set; }  // ← had no space
+    [JsonProperty("Supervisor")]    public string? Supervisor   { get; set; }
+    [JsonProperty("Technician")]    public string? Technician   { get; set; }
+    [JsonProperty("Service Head")]  public string? ServiceHead  { get; set; }  // ← had no space
+    [JsonProperty("Job Type")]      public string? JobType      { get; set; }  // ← had no space
+
+    // ── Dates ────────────────────────────────────────────────
+    [JsonProperty("Sale Date")]                public string? SaleDate              { get; set; }
+    [JsonProperty("Coupon No")]                public string? CouponNo              { get; set; }  // ← had no space
+    [JsonProperty("Expected delivery date")]   public string? ExpectedDeliveryDate  { get; set; }  // ← lowercase 'd'
+    [JsonProperty("Proforma Date")]            public string? ProformaDate          { get; set; }
+    [JsonProperty("Invoice Date")]             public string? InvoiceDate           { get; set; }
+
+    // ── Financials ───────────────────────────────────────────
+    [JsonProperty("Estimated Job expenses")]   public string? EstimatedJobExpenses { get; set; }  // ← lowercase 'e'
+    [JsonProperty("Labour hours")]             public string? LabourHours          { get; set; }  // ← lowercase 'h'
+    [JsonProperty("Parts")]                    public string? Parts                { get; set; }
+    [JsonProperty("Accessory")]                public string? Accessory            { get; set; }
+    [JsonProperty("Oil")]                      public string? Oil                  { get; set; }
+    [JsonProperty("Labour")]                   public string? Labour               { get; set; }
+    [JsonProperty("Outside Work")]             public string? OutsideWork          { get; set; }
+    [JsonProperty("Total W/O Tax")]            public string? TotalWOTax           { get; set; }  // ← was "TotalWOTax"
+    [JsonProperty("GST_Amnt")]                 public string? GSTAmount            { get; set; }  // ← was "GSTAmount"
+    [JsonProperty("IGST_Amnt")]                public string? IGSTAmount           { get; set; }  // ← was "IGSTAmount"
+    [JsonProperty("Net Total")]                public string? NetTotal             { get; set; }
 }

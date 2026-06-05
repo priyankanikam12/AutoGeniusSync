@@ -92,11 +92,18 @@ public partial class AppDbContext : DbContext
 
             entity.HasIndex(e => e.ChassisNo, "IX_DMS_Service_ChassisNo");
 
-            entity.HasIndex(e => e.DealerCode, "IX_DMS_Service_DealerCode");
+            entity.HasIndex(e => e.DealerCode, "IX_DMS_Service_DealerCode").IsUnique();;
 
-            entity.HasIndex(e => e.JobDate, "IX_DMS_Service_JobDate");
+            entity.HasIndex(e => e.JobDate, "IX_DMS_Service_JobDate").IsUnique();;
 
-            entity.HasIndex(e => new { e.DealerCode, e.JobNo, e.JobDate }, "UQ_DMS_Service_Job").IsUnique();
+            // ── FIX: Unique constraint is now (DealerCode, JobNo) only.
+            // Previously it included JobDate, which caused duplicate-key errors
+            // when the same job was re-synced after its JobDate was populated
+            // (the row existed with syncDate, new arrival had realDate → DB
+            // rejected it as a new insert violating the old 3-column key).
+            // JobNo alone is stable and sufficient to identify a unique job
+            // per dealer. JobDate is now just a data field that gets updated.
+            entity.HasIndex(e => new { e.DealerCode, e.JobNo }, "UQ_DMS_Service_Job").IsUnique();
 
             entity.Property(e => e.Accessory)
                 .HasDefaultValue(0m)
@@ -398,7 +405,6 @@ public partial class AppDbContext : DbContext
 
             entity.HasIndex(v => v.LocationCode);
         });
-
 
         modelBuilder.Entity<DmsCallCentreDealer>(entity =>
         {

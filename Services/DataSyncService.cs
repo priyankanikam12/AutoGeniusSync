@@ -99,10 +99,10 @@ public class DataSyncService
             _logger.LogError(ex, "Dealer sync failed");
         }
 
-        log.CompletedAt = DateTime.UtcNow;
-        log.RecordsFetched = result.RecordsFetched;
+        log.CompletedAt     = DateTime.UtcNow;
+        log.RecordsFetched  = result.RecordsFetched;
         log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated = result.RecordsUpdated;
+        log.RecordsUpdated  = result.RecordsUpdated;
         await db.SaveChangesAsync();
 
         return result;
@@ -132,18 +132,18 @@ public class DataSyncService
         try
         {
             var token = await _erpApi.GetValidTokenAsync();
-            var jobs = await _erpApi.FetchDjrAsync(date, token, "");
+            var jobs  = await _erpApi.FetchDjrAsync(date, token, "");
             result.RecordsFetched = jobs.Count;
 
-            _logger.LogInformation("Date {date}: fetched {n} records", date.ToString("dd-MM-yyyy"), jobs.Count);
+            _logger.LogInformation("Date {date}: fetched {n} records",
+                date.ToString("dd-MM-yyyy"), jobs.Count);
 
-            // ── DEDUP WITHIN THE RESPONSE ITSELF ──────────────
-            // The API sometimes returns the same job twice in one response.
-            // Keep only the last occurrence of each (DealerCode, JobNo, JobDate) key.
+            // Dedup within the API response — key is DealerCode|JobNo only.
+            // JobDate can arrive blank on first fetch; don't include it in the key.
             var dedupedJobs = jobs
                 .Where(j => j.JobNo != "Total")
-                .Where(j => !string.IsNullOrEmpty(j.DealerCode) || !string.IsNullOrEmpty(j.JobNo))
-                .GroupBy(j => $"{j.DealerCode}|{j.JobNo}|{j.JobDate}")
+                .Where(j => !string.IsNullOrEmpty(j.DealerCode) && !string.IsNullOrEmpty(j.JobNo))
+                .GroupBy(j => $"{j.DealerCode}|{j.JobNo}")
                 .Select(g => g.Last())
                 .ToList();
 
@@ -156,11 +156,17 @@ public class DataSyncService
                 {
                     var parsed = ParseServiceHistory(job);
 
+                    if (parsed.JobDate == null)
+                        parsed.JobDate = DateOnly.FromDateTime(date);
+
+                    // ── Lookup by DealerCode + JobNo only ────────────────────
+                    // JobDate is NOT in the lookup key — it can change between
+                    // syncs (null on first arrival, real date on re-fetch).
+                    // The DB unique index is also (DealerCode, JobNo) only.
                     var existing = await db.DmsServiceHistories
                         .FirstOrDefaultAsync(x =>
                             x.DealerCode == parsed.DealerCode &&
-                            x.JobNo      == parsed.JobNo &&
-                            x.JobDate    == parsed.JobDate);
+                            x.JobNo      == parsed.JobNo);
 
                     if (existing == null)
                     {
@@ -169,6 +175,10 @@ public class DataSyncService
                     }
                     else
                     {
+                        // ── CRITICAL: never call SetValues() or assign .Id ──
+                        // EF Core will throw if you touch a PK column on a
+                        // tracked entity. UpdateServiceHistory only sets
+                        // non-key columns, so it is always safe.
                         UpdateServiceHistory(existing, parsed);
                         result.RecordsUpdated++;
                     }
@@ -185,10 +195,11 @@ public class DataSyncService
         }
         catch (Exception ex)
         {
-            log.Status = "Failed";
+            log.Status       = "Failed";
             log.ErrorMessage = ex.Message;
-            result.Error = ex.Message;
-            _logger.LogError(ex, "Service history sync failed for {date}", date.ToShortDateString());
+            result.Error     = ex.Message;
+            _logger.LogError(ex, "Service history sync failed for {date}",
+                date.ToShortDateString());
         }
 
         log.CompletedAt     = DateTime.UtcNow;
@@ -201,7 +212,7 @@ public class DataSyncService
     }
 
     // ─────────────────────────────────────────────────────────
-    // HISTORICAL BACKFILL
+    // HISTORICAL BACKFILL — service history
     // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> BackfillHistoricalDataAsync(
@@ -211,10 +222,11 @@ public class DataSyncService
         var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2022-01-01";
         var start = fromDate ?? DateTime.Parse(startDateStr);
         var end   = toDate   ?? DateTime.UtcNow.Date;
-        var today = DateTime.UtcNow.Date;   // ← track today
+        var today = DateTime.UtcNow.Date;
 
         var totalResult = new SyncResult { SyncType = "BackfillHistorical" };
-        _logger.LogInformation("Backfill: {start} → {end}", start.ToShortDateString(), end.ToShortDateString());
+        _logger.LogInformation("Backfill: {start} → {end}",
+            start.ToShortDateString(), end.ToShortDateString());
 
         var current = start;
         while (current <= end && !ct.IsCancellationRequested)
@@ -222,7 +234,6 @@ public class DataSyncService
             using var scope = _scopeFactory.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
-            // Always re-sync today — data arrives throughout the day
             bool alreadySynced = current != today && await db.DmsSyncLogs.AnyAsync(l =>
                 l.SyncType == "ServiceHistory" &&
                 l.SyncDate == DateOnly.FromDateTime(current) &&
@@ -239,7 +250,8 @@ public class DataSyncService
             }
             else
             {
-                _logger.LogDebug("Backfill {date}: already synced, skipping", current.ToShortDateString());
+                _logger.LogDebug("Backfill {date}: already synced, skipping",
+                    current.ToShortDateString());
             }
 
             current = current.AddDays(1);
@@ -289,7 +301,6 @@ public class DataSyncService
                     var sales = await _erpApi.FetchVsrAsync(dealerCode, date, date, token);
                     result.RecordsFetched += sales.Count;
 
-                    // Dedup within response by (DealerCode, InvoiceNo)
                     var dedupedSales = sales
                         .Where(s => !string.IsNullOrEmpty(s.InvoiceNo))
                         .GroupBy(s => $"{s.DealerCode}|{s.InvoiceNo}")
@@ -328,7 +339,8 @@ public class DataSyncService
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning("VSR fetch failed for dealer {dc}: {msg}", dealerCode, ex.Message);
+                    _logger.LogWarning("VSR fetch failed for dealer {dc}: {msg}",
+                        dealerCode, ex.Message);
                 }
             }
 
@@ -336,10 +348,11 @@ public class DataSyncService
         }
         catch (Exception ex)
         {
-            log.Status = "Failed";
+            log.Status       = "Failed";
             log.ErrorMessage = ex.Message;
-            result.Error = ex.Message;
-            _logger.LogError(ex, "Vehicle sales sync failed for {date}", date.ToShortDateString());
+            result.Error     = ex.Message;
+            _logger.LogError(ex, "Vehicle sales sync failed for {date}",
+                date.ToShortDateString());
         }
 
         log.CompletedAt     = DateTime.UtcNow;
@@ -352,7 +365,7 @@ public class DataSyncService
     }
 
     // ─────────────────────────────────────────────────────────
-    // HISTORICAL BACKFILL for Vehicle Sales
+    // HISTORICAL BACKFILL — vehicle sales
     // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> BackfillVehicleSalesAsync(
@@ -362,9 +375,11 @@ public class DataSyncService
         var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2022-01-01";
         var start = fromDate ?? DateTime.Parse(startDateStr);
         var end   = toDate   ?? DateTime.UtcNow.Date;
-        var today = DateTime.UtcNow.Date;   // ← track today
+        var today = DateTime.UtcNow.Date;
 
         var totalResult = new SyncResult { SyncType = "BackfillVehicleSales" };
+        _logger.LogInformation("VSR Backfill: {start} → {end}",
+            start.ToShortDateString(), end.ToShortDateString());
 
         var current = start;
         while (current <= end && !ct.IsCancellationRequested)
@@ -381,9 +396,17 @@ public class DataSyncService
             {
                 var r = await SyncVehicleSalesForDateAsync(current);
                 totalResult.RecordsFetched  += r.RecordsFetched;
-                totalResult.RecordsInserted += r.RecordsUpdated;
+                totalResult.RecordsInserted += r.RecordsInserted;
                 totalResult.RecordsUpdated  += r.RecordsUpdated;
+                _logger.LogInformation("VSR Backfill {date}: +{ins} inserted, +{upd} updated",
+                    current.ToShortDateString(), r.RecordsInserted, r.RecordsUpdated);
             }
+            else
+            {
+                _logger.LogDebug("VSR Backfill {date}: already done, skipping",
+                    current.ToShortDateString());
+            }
+
             current = current.AddDays(1);
         }
 
@@ -391,8 +414,9 @@ public class DataSyncService
     }
 
     // ─────────────────────────────────────────────────────────
-    // SYNC CALL CENTRE DEALERS — all pincodes from config/DB
+    // SYNC CALL CENTRE DEALERS
     // ─────────────────────────────────────────────────────────
+
     public async Task<SyncResult> SyncCallCentreDealersAsync()
     {
         using var scope = _scopeFactory.CreateScope();
@@ -413,7 +437,6 @@ public class DataSyncService
         {
             var token = await _erpApi.GetValidTokenAsync();
 
-            // Get pincodes from DB first, then fallback to appsettings
             var dbPincodes = await db.DmsPincodeMasters
                 .Where(p => p.IsActive)
                 .Select(p => p.PinCode)
@@ -425,7 +448,7 @@ public class DataSyncService
             var pincodes = dbPincodes.Any() ? dbPincodes : configPincodes;
             pincodes = pincodes.Distinct().ToList();
 
-            _logger.LogInformation("CallCentre sync: {n} pincodes to process", pincodes.Count);
+            _logger.LogInformation("CallCentre sync: {n} pincodes", pincodes.Count);
 
             foreach (var pin in pincodes)
             {
@@ -483,9 +506,9 @@ public class DataSyncService
         }
         catch (Exception ex)
         {
-            log.Status = "Failed";
+            log.Status       = "Failed";
             log.ErrorMessage = ex.Message;
-            result.Error = ex.Message;
+            result.Error     = ex.Message;
             _logger.LogError(ex, "CallCentre dealer sync failed");
         }
 
@@ -499,8 +522,9 @@ public class DataSyncService
     }
 
     // ─────────────────────────────────────────────────────────
-    // SYNC VEHICLE DISPATCHES — date range
+    // SYNC VEHICLE DISPATCHES for a single date
     // ─────────────────────────────────────────────────────────
+
     public async Task<SyncResult> SyncVehicleDispatchesForDateAsync(DateTime date)
     {
         using var scope = _scopeFactory.CreateScope();
@@ -522,14 +546,12 @@ public class DataSyncService
         {
             var token = await _erpApi.GetValidTokenAsync();
 
-            // VDR API uses date range — pass same date for single day
             var dispatches = await _erpApi.FetchVdrAsync(date, date, token);
             result.RecordsFetched = dispatches.Count;
 
             _logger.LogInformation("VDR {date}: fetched {n} records",
                 date.ToString("dd-MM-yyyy"), dispatches.Count);
 
-            // Dedup within response by (InvoiceNo, ChassisNo)
             var deduped = dispatches
                 .Where(d => !string.IsNullOrEmpty(d.InvoiceNo))
                 .GroupBy(d => $"{d.InvoiceNo}|{d.ChassisNo}")
@@ -544,8 +566,8 @@ public class DataSyncService
 
                     var existing = await db.DmsVehicleDispatches
                         .FirstOrDefaultAsync(x =>
-                            x.InvoiceNo  == parsed.InvoiceNo &&
-                            x.ChassisNo  == parsed.ChassisNo);
+                            x.InvoiceNo == parsed.InvoiceNo &&
+                            x.ChassisNo == parsed.ChassisNo);
 
                     if (existing == null)
                     {
@@ -570,10 +592,11 @@ public class DataSyncService
         }
         catch (Exception ex)
         {
-            log.Status = "Failed";
+            log.Status       = "Failed";
             log.ErrorMessage = ex.Message;
-            result.Error = ex.Message;
-            _logger.LogError(ex, "Vehicle dispatches sync failed for {date}", date.ToShortDateString());
+            result.Error     = ex.Message;
+            _logger.LogError(ex, "Vehicle dispatches sync failed for {date}",
+                date.ToShortDateString());
         }
 
         log.CompletedAt     = DateTime.UtcNow;
@@ -586,8 +609,9 @@ public class DataSyncService
     }
 
     // ─────────────────────────────────────────────────────────
-    // BACKFILL VEHICLE DISPATCHES
+    // HISTORICAL BACKFILL — vehicle dispatches
     // ─────────────────────────────────────────────────────────
+
     public async Task<SyncResult> BackfillVehicleDispatchesAsync(
         DateTime? fromDate = null, DateTime? toDate = null,
         CancellationToken ct = default)
@@ -623,7 +647,8 @@ public class DataSyncService
             }
             else
             {
-                _logger.LogDebug("VDR Backfill {date}: already done, skipping", current.ToShortDateString());
+                _logger.LogDebug("VDR Backfill {date}: already done, skipping",
+                    current.ToShortDateString());
             }
 
             current = current.AddDays(1);
@@ -651,17 +676,17 @@ public class DataSyncService
         UpdatedAt          = DateTime.UtcNow
     };
 
-    private static void UpdateDealer(DmsDealer existing, DealerValue d)
+    private static void UpdateDealer(DmsDealer e, DealerValue d)
     {
-        existing.DealerCompany      = d.DealerCompany;
-        existing.ContactNo          = d.ContactNo;
-        existing.AlternateContactNo = d.AlternateContactNo;
-        existing.DealerStateName    = d.DealerStateName;
-        existing.DealerCityName     = d.DealerCityName;
-        existing.PinCode            = d.PinCode;
-        existing.ActiveStatus       = d.ActiveStatus;
-        existing.LastFetchedAt      = DateTime.UtcNow;
-        existing.UpdatedAt          = DateTime.UtcNow;
+        e.DealerCompany      = d.DealerCompany;
+        e.ContactNo          = d.ContactNo;
+        e.AlternateContactNo = d.AlternateContactNo;
+        e.DealerStateName    = d.DealerStateName;
+        e.DealerCityName     = d.DealerCityName;
+        e.PinCode            = d.PinCode;
+        e.ActiveStatus       = d.ActiveStatus;
+        e.LastFetchedAt      = DateTime.UtcNow;
+        e.UpdatedAt          = DateTime.UtcNow;
     }
 
     private static DmsServiceHistory ParseServiceHistory(DjrValue j)
@@ -727,31 +752,67 @@ public class DataSyncService
         };
     }
 
+    // ─────────────────────────────────────────────────────────
+    // UpdateServiceHistory — NEVER assigns .Id or calls SetValues()
+    // SetValues() copies ALL properties including the PK (Id), which
+    // causes EF Core to throw "Id is part of a key and cannot be modified".
+    // Always use explicit field-by-field assignment here.
+    // ─────────────────────────────────────────────────────────
     private static void UpdateServiceHistory(DmsServiceHistory e, DmsServiceHistory n)
     {
-        e.CompName = n.CompName; e.Location = n.Location; e.InTime = n.InTime;
-        e.CloseTime = n.CloseTime; e.JobCategory = n.JobCategory;
-        e.Ffrpercentage = n.Ffrpercentage; e.DocNo = n.DocNo;
-        e.DocType = n.DocType; e.DocDate = n.DocDate; e.Model = n.Model;
-        e.BrandName = n.BrandName; e.RegNo = n.RegNo; e.VehicleType = n.VehicleType;
-        e.EngineNo = n.EngineNo; e.ChassisNo = n.ChassisNo; e.Kms = n.Kms;
-        e.BatterySerialNo1 = n.BatterySerialNo1; e.BatterySerialNo2 = n.BatterySerialNo2;
-        e.BatterySerialNo3 = n.BatterySerialNo3; e.BatterySerialNo4 = n.BatterySerialNo4;
-        e.BatterySerialNo5 = n.BatterySerialNo5; e.BatterySerialNo6 = n.BatterySerialNo6;
+        // Key fields (DealerCode, JobNo) intentionally omitted — never change a PK.
+        e.JobDate              = n.JobDate;
+        e.CompName             = n.CompName;
+        e.Location             = n.Location;
+        e.InTime               = n.InTime;
+        e.CloseTime            = n.CloseTime;
+        e.JobCategory          = n.JobCategory;
+        e.Ffrpercentage        = n.Ffrpercentage;
+        e.DocNo                = n.DocNo;
+        e.DocType              = n.DocType;
+        e.DocDate              = n.DocDate;
+        e.Model                = n.Model;
+        e.BrandName            = n.BrandName;
+        e.RegNo                = n.RegNo;
+        e.VehicleType          = n.VehicleType;
+        e.EngineNo             = n.EngineNo;
+        e.ChassisNo            = n.ChassisNo;
+        e.Kms                  = n.Kms;
+        e.BatterySerialNo1     = n.BatterySerialNo1;
+        e.BatterySerialNo2     = n.BatterySerialNo2;
+        e.BatterySerialNo3     = n.BatterySerialNo3;
+        e.BatterySerialNo4     = n.BatterySerialNo4;
+        e.BatterySerialNo5     = n.BatterySerialNo5;
+        e.BatterySerialNo6     = n.BatterySerialNo6;
         e.IndividualAhbattery1 = n.IndividualAhbattery1;
         e.IndividualAhbattery2 = n.IndividualAhbattery2;
-        e.PartyName = n.PartyName; e.MobileNumber = n.MobileNumber;
-        e.Supervisor = n.Supervisor; e.Technician = n.Technician;
-        e.ServiceHead = n.ServiceHead; e.JobType = n.JobType;
-        e.SaleDate = n.SaleDate; e.CouponNo = n.CouponNo;
+        e.IndividualAhbattery3 = n.IndividualAhbattery3;
+        e.IndividualAhbattery4 = n.IndividualAhbattery4;
+        e.IndividualAhbattery5 = n.IndividualAhbattery5;
+        e.IndividualAhbattery6 = n.IndividualAhbattery6;
+        e.PartyName            = n.PartyName;
+        e.MobileNumber         = n.MobileNumber;
+        e.Supervisor           = n.Supervisor;
+        e.Technician           = n.Technician;
+        e.ServiceHead          = n.ServiceHead;   // ← was NULL before DTO fix
+        e.JobType              = n.JobType;        // ← was NULL before DTO fix
+        e.SaleDate             = n.SaleDate;
+        e.CouponNo             = n.CouponNo;
         e.ExpectedDeliveryDate = n.ExpectedDeliveryDate;
-        e.InvoiceDate = n.InvoiceDate;
+        e.ProformaDate         = n.ProformaDate;
+        e.InvoiceDate          = n.InvoiceDate;
         e.EstimatedJobExpenses = n.EstimatedJobExpenses;
-        e.LabourHours = n.LabourHours; e.Parts = n.Parts;
-        e.Accessory = n.Accessory; e.Oil = n.Oil; e.Labour = n.Labour;
-        e.OutsideWork = n.OutsideWork; e.TotalWotax = n.TotalWotax;
-        e.Gstamount = n.Gstamount; e.Igstamount = n.Igstamount;
-        e.NetTotal = n.NetTotal; e.UpdatedAt = DateTime.UtcNow;
+        e.LabourHours          = n.LabourHours;
+        e.Parts                = n.Parts;
+        e.Accessory            = n.Accessory;
+        e.Oil                  = n.Oil;
+        e.Labour               = n.Labour;
+        e.OutsideWork          = n.OutsideWork;
+        e.TotalWotax           = n.TotalWotax;
+        e.Gstamount            = n.Gstamount;
+        e.Igstamount           = n.Igstamount;
+        e.NetTotal             = n.NetTotal;
+        e.UpdatedAt            = DateTime.UtcNow;
     }
 
     private static DmsVehicleSale ParseVehicleSale(VsrValue v) => new()
@@ -825,115 +886,186 @@ public class DataSyncService
 
     private static void UpdateVehicleSale(DmsVehicleSale e, DmsVehicleSale n)
     {
-        e.DealerName = n.DealerName; e.InvoiceDate = n.InvoiceDate;
-        e.Location = n.Location; e.LocCode = n.LocCode; e.LocationCity = n.LocationCity;
-        e.CustDob = n.CustDob; e.Gender = n.Gender; e.SoldTo = n.SoldTo;
-        e.AccountType = n.AccountType; e.PartyEmail = n.PartyEmail; e.CusMob = n.CusMob;
-        e.Address1 = n.Address1; e.Address2 = n.Address2; e.City = n.City;
-        e.State = n.State; e.ExecutiveName = n.ExecutiveName; e.Pin = n.Pin;
-        e.ChassisNo = n.ChassisNo; e.MotorNo = n.MotorNo; e.Remarks = n.Remarks;
-        e.ItemModel = n.ItemModel; e.Oemmodel = n.Oemmodel; e.ColorCode = n.ColorCode;
-        e.VehicleType = n.VehicleType; e.VehicleGroup = n.VehicleGroup;
-        e.Hsnsaccode = n.Hsnsaccode; e.SaleType = n.SaleType; e.FinancedBy = n.FinancedBy;
-        e.FinAmount = n.FinAmount; e.ItemRate = n.ItemRate; e.InsuAmount = n.InsuAmount;
-        e.RegnAmount = n.RegnAmount; e.AcsryAmount = n.AcsryAmount;
-        e.PreGstdiscAmount = n.PreGstdiscAmount; e.DiscTypeName = n.DiscTypeName;
-        e.PostGstdisc = n.PostGstdisc; e.FameIi = n.FameIi; e.StateFameIi = n.StateFameIi;
-        e.Sgstper = n.Sgstper; e.Sgstamount = n.Sgstamount;
-        e.Cgstper = n.Cgstper; e.Cgstamount = n.Cgstamount;
-        e.Igstper = n.Igstper; e.Igstamount = n.Igstamount; e.NetAmount = n.NetAmount;
-        e.ReferenceNo = n.ReferenceNo; e.BookingDate = n.BookingDate;
-        e.TotalCount = n.TotalCount; e.Battery = n.Battery;
-        e.BatteryChemical = n.BatteryChemical; e.BatteryCapacity = n.BatteryCapacity;
-        e.BatteryMake = n.BatteryMake; e.ChargerNo = n.ChargerNo;
-        e.ChargerNo2 = n.ChargerNo2; e.Converter = n.Converter;
-        e.Vcu = n.Vcu; e.ControllerNo = n.ControllerNo;
-        e.FameIirequired = n.FameIirequired; e.SegmentName = n.SegmentName;
-        e.InstitutionalName = n.InstitutionalName; e.SchemeName = n.SchemeName;
-        e.UpdatedAt = DateTime.UtcNow;
+        e.DealerName        = n.DealerName;
+        e.InvoiceDate       = n.InvoiceDate;
+        e.Location          = n.Location;
+        e.LocCode           = n.LocCode;
+        e.LocationCity      = n.LocationCity;
+        e.CustDob           = n.CustDob;
+        e.Gender            = n.Gender;
+        e.SoldTo            = n.SoldTo;
+        e.AccountType       = n.AccountType;
+        e.PartyEmail        = n.PartyEmail;
+        e.CusMob            = n.CusMob;
+        e.Address1          = n.Address1;
+        e.Address2          = n.Address2;
+        e.City              = n.City;
+        e.State             = n.State;
+        e.ExecutiveName     = n.ExecutiveName;
+        e.Pin               = n.Pin;
+        e.ChassisNo         = n.ChassisNo;
+        e.MotorNo           = n.MotorNo;
+        e.Remarks           = n.Remarks;
+        e.ItemModel         = n.ItemModel;
+        e.Oemmodel          = n.Oemmodel;
+        e.ColorCode         = n.ColorCode;
+        e.VehicleType       = n.VehicleType;
+        e.VehicleGroup      = n.VehicleGroup;
+        e.Hsnsaccode        = n.Hsnsaccode;
+        e.SaleType          = n.SaleType;
+        e.FinancedBy        = n.FinancedBy;
+        e.FinAmount         = n.FinAmount;
+        e.ItemRate          = n.ItemRate;
+        e.InsuAmount        = n.InsuAmount;
+        e.RegnAmount        = n.RegnAmount;
+        e.AcsryAmount       = n.AcsryAmount;
+        e.PreGstdiscAmount  = n.PreGstdiscAmount;
+        e.DiscTypeName      = n.DiscTypeName;
+        e.PostGstdisc       = n.PostGstdisc;
+        e.FameIi            = n.FameIi;
+        e.StateFameIi       = n.StateFameIi;
+        e.Sgstper           = n.Sgstper;
+        e.Sgstamount        = n.Sgstamount;
+        e.Cgstper           = n.Cgstper;
+        e.Cgstamount        = n.Cgstamount;
+        e.Igstper           = n.Igstper;
+        e.Igstamount        = n.Igstamount;
+        e.NetAmount         = n.NetAmount;
+        e.ReferenceNo       = n.ReferenceNo;
+        e.BookingDate       = n.BookingDate;
+        e.TotalCount        = n.TotalCount;
+        e.Battery           = n.Battery;
+        e.BatteryChemical   = n.BatteryChemical;
+        e.BatteryCapacity   = n.BatteryCapacity;
+        e.BatteryMake       = n.BatteryMake;
+        e.ChargerNo         = n.ChargerNo;
+        e.ChargerNo2        = n.ChargerNo2;
+        e.Converter         = n.Converter;
+        e.Vcu               = n.Vcu;
+        e.ControllerNo      = n.ControllerNo;
+        e.FameIirequired    = n.FameIirequired;
+        e.SegmentName       = n.SegmentName;
+        e.InstitutionalName = n.InstitutionalName;
+        e.SchemeName        = n.SchemeName;
+        e.UpdatedAt         = DateTime.UtcNow;
     }
 
     private static DmsVehicleDispatch MapVehicleDispatch(VdrValue d) => new()
     {
-        SaleDate        = ParseDate(d.SaleDate),
-        InvoiceNo       = d.InvoiceNo,
-        InvoiceDate     = ParseDate(d.InvoiceDate),
-        Location        = d.Location,
-        LocationCode    = d.LocationCode,
-        LocationCity    = d.LocationCity,
-        LocationStatus  = d.LocationStatus,
-        DealerName      = d.DealerName,
-        Zone            = d.Zone,
-        AreaOffice      = d.AreaOffice,
-        MfgYear         = d.MfgYear,
-        BrandName       = d.BrandName,
-        ModelCode       = d.ModelCode,
-        ColorCode       = d.ColorCode,
-        ChassisNo       = d.ChassisNo,
-        RegNo           = d.RegNo,
-        MotorNo         = d.MotorNo,
-        BatteryId       = d.BatteryId,
-        BatteryNo       = d.BatteryNo,
-        EcuSerialNo     = d.EcuSerialNo,
-        EcuImEi         = d.EcuImEi,
-        EcuBalMac       = d.EcuBalMac,
-        ImmoblizerNo    = d.ImmoblizerNo,
-        BikeSimId       = d.BikeSimId,
-        BikeMobileNo    = d.BikeMobileNo,
-        ChargerNo       = d.ChargerNo,
-        ControllerNo    = d.ControllerNo,
+        SaleDate         = ParseDate(d.SaleDate),
+        InvoiceNo        = d.InvoiceNo,
+        InvoiceDate      = ParseDate(d.InvoiceDate),
+        Location         = d.Location,
+        LocationCode     = d.LocationCode,
+        LocationCity     = d.LocationCity,
+        LocationStatus   = d.LocationStatus,
+        DealerName       = d.DealerName,
+        Zone             = d.Zone,
+        AreaOffice       = d.AreaOffice,
+        MfgYear          = d.MfgYear,
+        BrandName        = d.BrandName,
+        ModelCode        = d.ModelCode,
+        ColorCode        = d.ColorCode,
+        ChassisNo        = d.ChassisNo,
+        RegNo            = d.RegNo,
+        MotorNo          = d.MotorNo,
+        BatteryId        = d.BatteryId,
+        BatteryNo        = d.BatteryNo,
+        EcuSerialNo      = d.EcuSerialNo,
+        EcuImEi          = d.EcuImEi,
+        EcuBalMac        = d.EcuBalMac,
+        ImmoblizerNo     = d.ImmoblizerNo,
+        BikeSimId        = d.BikeSimId,
+        BikeMobileNo     = d.BikeMobileNo,
+        ChargerNo        = d.ChargerNo,
+        ControllerNo     = d.ControllerNo,
         SoundbarSerialNo = d.SoundbarSerialNo,
-        SoundbarBalMac  = d.SoundbarBalMac,
-        Voltage         = d.Voltage,
-        RegNumber       = d.RegNumber,
-        StartDate       = ParseDate(d.StartDate),
-        Tyre1           = d.Tyre1,
-        Tyre2           = d.Tyre2,
-        VehicleStatus   = d.VehicleStatus,
-        BookingId       = d.BookingId,
-        BillNo          = d.BillNo,
-        BillDate        = ParseDate(d.BillDate),
-        BillType        = d.BillType,
-        FinancerName    = d.FinancerName,
-        FinAmount       = ParseDecimal(d.FinAmount),
-        NameOfParty     = d.NameOfParty,
-        Address1        = d.Address1,
-        Address2        = d.Address2,
-        State           = d.State,
-        City            = d.City,
-        Pin             = d.Pin,
-        MobileNo        = d.MobileNo,
-        Email           = d.Email,
-        AppPush         = d.AppPush,
-        LeadId          = d.LeadId,
-        Vcu             = d.Vcu,
-        CreatedAt       = DateTime.UtcNow,
-        UpdatedAt       = DateTime.UtcNow
+        SoundbarBalMac   = d.SoundbarBalMac,
+        Voltage          = d.Voltage,
+        RegNumber        = d.RegNumber,
+        StartDate        = ParseDate(d.StartDate),
+        Tyre1            = d.Tyre1,
+        Tyre2            = d.Tyre2,
+        VehicleStatus    = d.VehicleStatus,
+        BookingId        = d.BookingId,
+        BillNo           = d.BillNo,
+        BillDate         = ParseDate(d.BillDate),
+        BillType         = d.BillType,
+        FinancerName     = d.FinancerName,
+        FinAmount        = ParseDecimal(d.FinAmount),
+        NameOfParty      = d.NameOfParty,
+        Address1         = d.Address1,
+        Address2         = d.Address2,
+        State            = d.State,
+        City             = d.City,
+        Pin              = d.Pin,
+        MobileNo         = d.MobileNo,
+        Email            = d.Email,
+        AppPush          = d.AppPush,
+        LeadId           = d.LeadId,
+        Vcu              = d.Vcu,
+        CreatedAt        = DateTime.UtcNow,
+        UpdatedAt        = DateTime.UtcNow
     };
 
     private static void UpdateVehicleDispatch(DmsVehicleDispatch e, DmsVehicleDispatch n)
     {
-        e.SaleDate = n.SaleDate; e.InvoiceDate = n.InvoiceDate;
-        e.Location = n.Location; e.LocationCode = n.LocationCode;
-        e.LocationCity = n.LocationCity; e.LocationStatus = n.LocationStatus;
-        e.DealerName = n.DealerName; e.Zone = n.Zone; e.AreaOffice = n.AreaOffice;
-        e.MfgYear = n.MfgYear; e.BrandName = n.BrandName; e.ModelCode = n.ModelCode;
-        e.ColorCode = n.ColorCode; e.RegNo = n.RegNo; e.MotorNo = n.MotorNo;
-        e.BatteryId = n.BatteryId; e.BatteryNo = n.BatteryNo;
-        e.EcuSerialNo = n.EcuSerialNo; e.EcuImEi = n.EcuImEi; e.EcuBalMac = n.EcuBalMac;
-        e.ImmoblizerNo = n.ImmoblizerNo; e.BikeSimId = n.BikeSimId;
-        e.BikeMobileNo = n.BikeMobileNo; e.ChargerNo = n.ChargerNo;
-        e.ControllerNo = n.ControllerNo; e.SoundbarSerialNo = n.SoundbarSerialNo;
-        e.SoundbarBalMac = n.SoundbarBalMac; e.Voltage = n.Voltage;
-        e.RegNumber = n.RegNumber; e.StartDate = n.StartDate;
-        e.Tyre1 = n.Tyre1; e.Tyre2 = n.Tyre2; e.VehicleStatus = n.VehicleStatus;
-        e.BookingId = n.BookingId; e.BillNo = n.BillNo; e.BillDate = n.BillDate;
-        e.BillType = n.BillType; e.FinancerName = n.FinancerName; e.FinAmount = n.FinAmount;
-        e.NameOfParty = n.NameOfParty; e.Address1 = n.Address1; e.Address2 = n.Address2;
-        e.State = n.State; e.City = n.City; e.Pin = n.Pin; e.MobileNo = n.MobileNo;
-        e.Email = n.Email; e.AppPush = n.AppPush; e.LeadId = n.LeadId; e.Vcu = n.Vcu;
-        e.UpdatedAt = DateTime.UtcNow;
+        e.SaleDate         = n.SaleDate;
+        e.InvoiceDate      = n.InvoiceDate;
+        e.Location         = n.Location;
+        e.LocationCode     = n.LocationCode;
+        e.LocationCity     = n.LocationCity;
+        e.LocationStatus   = n.LocationStatus;
+        e.DealerName       = n.DealerName;
+        e.Zone             = n.Zone;
+        e.AreaOffice       = n.AreaOffice;
+        e.MfgYear          = n.MfgYear;
+        e.BrandName        = n.BrandName;
+        e.ModelCode        = n.ModelCode;
+        e.ColorCode        = n.ColorCode;
+        e.RegNo            = n.RegNo;
+        e.MotorNo          = n.MotorNo;
+        e.BatteryId        = n.BatteryId;
+        e.BatteryNo        = n.BatteryNo;
+        e.EcuSerialNo      = n.EcuSerialNo;
+        e.EcuImEi          = n.EcuImEi;
+        e.EcuBalMac        = n.EcuBalMac;
+        e.ImmoblizerNo     = n.ImmoblizerNo;
+        e.BikeSimId        = n.BikeSimId;
+        e.BikeMobileNo     = n.BikeMobileNo;
+        e.ChargerNo        = n.ChargerNo;
+        e.ControllerNo     = n.ControllerNo;
+        e.SoundbarSerialNo = n.SoundbarSerialNo;
+        e.SoundbarBalMac   = n.SoundbarBalMac;
+        e.Voltage          = n.Voltage;
+        e.RegNumber        = n.RegNumber;
+        e.StartDate        = n.StartDate;
+        e.Tyre1            = n.Tyre1;
+        e.Tyre2            = n.Tyre2;
+        e.VehicleStatus    = n.VehicleStatus;
+        e.BookingId        = n.BookingId;
+        e.BillNo           = n.BillNo;
+        e.BillDate         = n.BillDate;
+        e.BillType         = n.BillType;
+        e.FinancerName     = n.FinancerName;
+        e.FinAmount        = n.FinAmount;
+        e.NameOfParty      = n.NameOfParty;
+        e.Address1         = n.Address1;
+        e.Address2         = n.Address2;
+        e.State            = n.State;
+        e.City             = n.City;
+        e.Pin              = n.Pin;
+        e.MobileNo         = n.MobileNo;
+        e.Email            = n.Email;
+        e.AppPush          = n.AppPush;
+        e.LeadId           = n.LeadId;
+        e.Vcu              = n.Vcu;
+        e.UpdatedAt        = DateTime.UtcNow;
     }
+
+    // ─────────────────────────────────────────────────────────
+    // SHARED PARSE HELPERS
+    // ─────────────────────────────────────────────────────────
 
     private static DateOnly? ParseDate(string? val)
     {
@@ -942,13 +1074,17 @@ public class DataSyncService
             System.Globalization.CultureInfo.InvariantCulture,
             System.Globalization.DateTimeStyles.None, out var d))
             return DateOnly.FromDateTime(d);
-        if (DateTime.TryParse(val, out var d2)) return DateOnly.FromDateTime(d2);
+        if (DateTime.TryParse(val, out var d2))
+            return DateOnly.FromDateTime(d2);
         return null;
     }
 
     private static decimal ParseDecimal(string? val)
     {
         if (string.IsNullOrWhiteSpace(val)) return 0;
-        return decimal.TryParse(val, out var d) ? d : 0;
+        return decimal.TryParse(val,
+            System.Globalization.NumberStyles.Any,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out var d) ? d : 0;
     }
 }

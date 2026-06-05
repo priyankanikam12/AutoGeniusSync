@@ -31,7 +31,7 @@ public class SyncController : ControllerBase
             .ToListAsync();
 
         var totalServiceRecords = await _db.DmsServiceHistories.CountAsync();
-        var totalDealers = await _db.DmsDealers.CountAsync();
+        var totalDealers        = await _db.DmsDealers.CountAsync();
 
         var tokenActive = await _db.DmsAuthTokens
             .Where(t => t.IsActive && t.ExpiresAt > DateTime.UtcNow)
@@ -66,7 +66,6 @@ public class SyncController : ControllerBase
     }
 
     // ── POST /api/sync/service-history/force-today ──────────
-    /// <summary>Force re-sync today even if already marked Success</summary>
     [HttpPost("service-history/force-today")]
     public async Task<IActionResult> ForceSyncToday()
     {
@@ -76,7 +75,7 @@ public class SyncController : ControllerBase
     }
 
     // ── POST /api/sync/service-history/date/{date} ──────────
-    /// <summary>date format: yyyy-MM-dd e.g. 2022-07-27</summary>
+    /// <summary>date format: yyyy-MM-dd e.g. 2024-06-01</summary>
     [HttpPost("service-history/date/{date}")]
     public async Task<IActionResult> SyncDate(string date)
     {
@@ -92,24 +91,22 @@ public class SyncController : ControllerBase
     public async Task<IActionResult> SyncRange([FromBody] DateRangeRequest req)
     {
         if (!DateTime.TryParse(req.From, out var from) ||
-            !DateTime.TryParse(req.To, out var to))
+            !DateTime.TryParse(req.To,   out var to))
             return BadRequest(new { error = "Use yyyy-MM-dd format for both dates." });
 
         if ((to - from).TotalDays > 365)
             return BadRequest(new { error = "Max range is 365 days per request." });
 
-        // Fire and forget for large ranges
         _ = Task.Run(() => _sync.BackfillHistoricalDataAsync(from, to));
         return Accepted(new
         {
             message = $"Backfill started for {from:dd-MM-yyyy} to {to:dd-MM-yyyy}",
-            from = from.ToString("dd-MM-yyyy"),
-            to = to.ToString("dd-MM-yyyy")
+            from    = from.ToString("dd-MM-yyyy"),
+            to      = to.ToString("dd-MM-yyyy")
         });
     }
 
     // ── POST /api/sync/backfill ──────────────────────────────
-    /// <summary>Runs full historical backfill from configured start date to today</summary>
     [HttpPost("backfill")]
     public IActionResult StartBackfill()
     {
@@ -131,5 +128,68 @@ public class SyncController : ControllerBase
             return BadRequest(new { error = ex.Message });
         }
     }
-}
 
+    // ── POST /api/sync/service-history/debug/{date} ─────────
+    /// <summary>
+    /// Shows parsed field values after deserialization.
+    /// Use this to confirm DealerCode/JobNo are now populated after the SanitizeJson fix.
+    /// date format: yyyy-MM-dd
+    /// </summary>
+    [HttpPost("service-history/debug/{date}")]
+    public async Task<IActionResult> DebugDate(string date, [FromServices] ErpApiService erpApi)
+    {
+        if (!DateTime.TryParse(date, out var parsed))
+            return BadRequest(new { error = "Use yyyy-MM-dd" });
+
+        var token = await erpApi.GetValidTokenAsync();
+        var jobs  = await erpApi.FetchDjrAsync(parsed, token, "");
+
+        var emptyDealerCount = jobs.Count(j => string.IsNullOrEmpty(j.DealerCode));
+        var emptyJobNoCount  = jobs.Count(j => string.IsNullOrEmpty(j.JobNo));
+        var bothEmptyCount   = jobs.Count(j => string.IsNullOrEmpty(j.DealerCode) && string.IsNullOrEmpty(j.JobNo));
+
+        // Show first 5 records with key fields so you can confirm mapping is working
+        var sample = jobs.Take(5).Select(j => new
+        {
+            j.DealerCode,
+            j.JobNo,
+            j.JobDate,
+            j.ChassisNo,
+            j.Model,
+            j.NetTotal
+        });
+
+        return Ok(new
+        {
+            TotalFetched    = jobs.Count,
+            EmptyDealerCode = emptyDealerCount,
+            EmptyJobNo      = emptyJobNoCount,
+            BothEmpty       = bothEmptyCount,
+            Sample          = sample
+        });
+    }
+
+    // ── POST /api/sync/service-history/debug-raw/{date} ─────
+    /// <summary>
+    /// Returns the raw JSON string from the ERP API before any deserialization.
+    /// Use this if debug/{date} still shows empty fields — paste the output
+    /// here to see the actual property names the API is sending.
+    /// date format: yyyy-MM-dd
+    /// </summary>
+    [HttpPost("service-history/debug-raw/{date}")]
+    public async Task<IActionResult> DebugRaw(string date, [FromServices] ErpApiService erpApi)
+    {
+        if (!DateTime.TryParse(date, out var parsed))
+            return BadRequest(new { error = "Use yyyy-MM-dd" });
+
+        var token   = await erpApi.GetValidTokenAsync();
+        var rawJson = await erpApi.FetchRawDjrAsync(parsed, token);
+
+        // Return first 3000 chars — enough to see all property names in one record
+        return Ok(new
+        {
+            Length       = rawJson.Length,
+            RawPreview   = rawJson[..Math.Min(3000, rawJson.Length)]
+        });
+    }
+}
