@@ -143,6 +143,61 @@ public class ErpApiService
     }
 
     // ─────────────────────────────────────────────────────────
+    // LINE ORDER REPORT (LOR)
+    // Iterates per-dealer since the API requires dealercode.
+    // date range: startDate → endDate (pass same date for daily sync)
+    // ─────────────────────────────────────────────────────────
+    public async Task<List<LorValue>> FetchLorAsync(
+        string dealerCode, DateTime startDate, DateTime endDate, string token)
+    {
+        await Task.Delay(_delayMs);
+        var url      = $"{_baseUrl}/V1/erpreport/lor?Ver=1.0";
+        var vendorId = _config.GetValue<int>("AutoGeniusERP:VendorId", 14);
+
+        var req = new LorRequest
+        {
+            VendorId   = vendorId,
+            StartDate  = startDate.ToString("dd-MM-yyyy"),
+            EndDate    = endDate.ToString("dd-MM-yyyy"),
+            DealerCode = dealerCode   // ← from DMS_Dealers.DealerCode
+        };
+
+        _logger.LogInformation(
+            "Fetching LOR for dealer {dc} | {from} → {to}",
+            dealerCode,
+            startDate.ToString("dd-MM-yyyy"),
+            endDate.ToString("dd-MM-yyyy"));
+
+        return await PostWithRetryAsync<LorValue>(url, req, token, maxRetries: 3);
+    }
+
+    //────────────────────────────────────────────────────
+    // Fetch Raw LOR JSON — debug endpoint only
+    // ─────────────────────────────────────────────────────────
+
+    public async Task<string> FetchRawLorAsync(
+    string dealerCode, DateTime date, string token)
+    {
+        await Task.Delay(_delayMs);
+        var url      = $"{_baseUrl}/V1/erpreport/lor?Ver=1.0";
+        var vendorId = _config.GetValue<int>("AutoGeniusERP:VendorId", 14);
+
+        var req = new LorRequest
+        {
+            VendorId   = vendorId,
+            StartDate  = date.ToString("dd-MM-yyyy"),
+            EndDate    = date.ToString("dd-MM-yyyy"),
+            DealerCode = dealerCode
+        };
+
+        using var http    = _httpFactory.CreateClient("ErpApi");
+        using var request = BuildPostRequest(url, req, token);
+        var resp = await http.SendAsync(request);
+        var bytes = await resp.Content.ReadAsByteArrayAsync();
+        return StripBomAndDecode(bytes);
+    }
+
+    // ─────────────────────────────────────────────────────────
     // VEHICLE SALES REPORT (VSR)
     // ─────────────────────────────────────────────────────────
 
@@ -426,9 +481,8 @@ public class ErpApiService
         catch (JsonException firstEx)
         {
             _logger.LogWarning(
-                "Attempt {attempt}/{max} standard parse failed for {url}: {msg}. " +
-                "Trying tolerant parse.",
-                attempt, maxRetries, url, firstEx.Message);
+                "LOR fast parse failed for {url}: {msg}. Trying tolerant parse.",
+                url, firstEx.Message);
         }
 
         // ── Slow path: item-by-item with error suppression ───

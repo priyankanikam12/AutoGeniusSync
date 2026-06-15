@@ -7,9 +7,14 @@ namespace AutoGeniusSync.DTOs;
 // ─────────────────────────────────────────────
 public class ErpApiResponse<T>
 {
-    [JsonProperty("Valid")]       public bool    Valid       { get; set; }
-    [JsonProperty("Description")] public string? Description { get; set; }
-    [JsonProperty("Value")]       public List<T>? Value      { get; set; }
+    [JsonProperty("Valid")]          
+    public bool Valid { get; set; }
+
+    [JsonProperty("Description")]
+    public string? Description { get; set; }
+
+    [JsonProperty("Value")]          // ← capital V — matches API response
+    public List<T>? Value { get; set; }
 }
 
 // ─────────────────────────────────────────────

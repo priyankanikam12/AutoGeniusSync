@@ -192,4 +192,109 @@ public class SyncController : ControllerBase
             RawPreview   = rawJson[..Math.Min(3000, rawJson.Length)]
         });
     }
+
+    // POST /api/sync/lor/{date}
+    // Example: POST /api/sync/lor/2025-06-01
+    [HttpPost("lor/{date}")]
+    public async Task<IActionResult> TriggerLorSync(string date)
+    {
+        if (!DateTime.TryParse(date, out var parsedDate))
+            return BadRequest("Invalid date format. Use YYYY-MM-DD");
+
+        _logger.LogInformation("Manual LOR sync triggered for {date}", date);
+        var result = await _sync.SyncLineOrderReportForDateAsync(parsedDate);
+
+        return Ok(new
+        {
+            result.SyncType,
+            result.RecordsFetched,
+            result.RecordsInserted,
+            result.RecordsUpdated,
+            result.Error
+        });
+    }
+
+    // POST /api/sync/lor/backfill?from=2022-01-01&to=2026-06-09
+    [HttpPost("lor/backfill")]
+    public async Task<IActionResult> TriggerLorBackfill(
+        [FromQuery] DateTime? from = null,
+        [FromQuery] DateTime? to = null)
+    {
+        _logger.LogInformation("Manual LOR backfill {from} → {to}", from, to);
+        // Run in background — this can take a while across many dealers
+        _ = Task.Run(() => _sync.BackfillLineOrderReportAsync(from, to));
+        return Accepted(new
+        {
+            message = $"LOR backfill started: {from:yyyy-MM-dd} → {to:yyyy-MM-dd}. Check /api/sync/status."
+        });
+    }
+
+    // POST /api/sync/lor/range?from=2026-01-01&to=2026-06-09
+    [HttpPost("lor/range")]
+    public async Task<IActionResult> TriggerLorRange(
+        [FromQuery] DateTime from,
+        [FromQuery] DateTime to)
+    {
+        var result = await _sync.SyncLineOrderReportAsync(from, to);
+        return Ok(new
+        {
+            result.SyncType,
+            result.RecordsFetched,
+            result.RecordsInserted,
+            result.RecordsUpdated,
+            result.Error
+        });
+    }
+
+    // POST /api/sync/lor/debug?dealerCode=CUS0087&date=2026-04-01
+    [HttpPost("lor/debug")]
+    public async Task<IActionResult> DebugLor(
+        [FromQuery] string dealerCode,
+        [FromQuery] string date,
+        [FromServices] ErpApiService erpApi)
+    {
+        if (!DateTime.TryParse(date, out var parsed))
+            return BadRequest("Use yyyy-MM-dd");
+
+        var token   = await erpApi.GetValidTokenAsync();
+        var records = await erpApi.FetchLorAsync(dealerCode, parsed, parsed, token);
+
+        return Ok(new
+        {
+            DealerCode    = dealerCode,
+            Date          = date,
+            TotalFetched  = records.Count,
+            Sample        = records.Take(3).Select(r => new
+            {
+                r.UniqueId,
+                r.DealerCode,
+                r.JobNo,
+                r.JobDate,
+                r.ChassisNo,
+                r.JobCardType,
+                r.ItemType,
+                r.TotalAmount
+            })
+        });
+    }
+
+    // In SyncController.cs — add this endpoint
+    [HttpPost("lor/debug-raw")]
+    public async Task<IActionResult> DebugLorRaw(
+        [FromQuery] string dealerCode,
+        [FromQuery] string date,
+        [FromServices] ErpApiService erpApi)
+    {
+        if (!DateTime.TryParse(date, out var parsed))
+            return BadRequest("Use yyyy-MM-dd");
+
+        var token = await erpApi.GetValidTokenAsync();
+        var raw   = await erpApi.FetchRawLorAsync(dealerCode, parsed, token);
+
+        return Ok(new
+        {
+            Length     = raw.Length,
+            Preview    = raw[..Math.Min(2000, raw.Length)]
+        });
+    }
 }

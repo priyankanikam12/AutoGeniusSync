@@ -14,6 +14,7 @@ public class SyncHostedService : BackgroundService
     private DateTime _lastServiceHistory   = DateTime.MinValue;
     private DateTime _lastVehicleSales     = DateTime.MinValue;
     private DateTime _lastVehicleDispatches = DateTime.MinValue;
+    private DateTime _lastLineOrderReport = DateTime.MinValue;
 
     public SyncHostedService(
         IServiceScopeFactory scopeFactory,
@@ -42,6 +43,7 @@ public class SyncHostedService : BackgroundService
             await RunBackfillAsync(ct);
             await RunVehicleSalesBackfillAsync(ct);
             await RunVehicleDispatchesBackfillAsync(ct);
+            await RunLineOrderBackfillAsync(ct);
 
         }, ct);
 
@@ -57,6 +59,7 @@ public class SyncHostedService : BackgroundService
         var serviceHistoryMin    = _config.GetValue<int>("SyncSettings:ServiceHistoryIntervalMinutes", intervalMinutes);
         var vehicleSalesMin      = _config.GetValue<int>("SyncSettings:VehicleSalesIntervalMinutes", intervalMinutes);
         var vehicleDispatchMin   = _config.GetValue<int>("SyncSettings:VehicleDispatchIntervalMinutes", intervalMinutes);
+        var lineOrderMin = _config.GetValue<int>("SyncSettings:LineOrderIntervalMinutes", intervalMinutes);
 
         while (!ct.IsCancellationRequested)
         {
@@ -95,6 +98,12 @@ public class SyncHostedService : BackgroundService
                 tasks.Add(RunVehicleDispatchesSyncAsync(ct));
             }
 
+            if ((now - _lastLineOrderReport).TotalMinutes >= lineOrderMin)
+            {
+                _lastLineOrderReport = now;
+                tasks.Add(RunLineOrderReportSyncAsync(ct));
+            }
+
             // Run all due syncs in parallel
             if (tasks.Any())
                 await Task.WhenAll(tasks);
@@ -103,6 +112,20 @@ public class SyncHostedService : BackgroundService
             _logger.LogDebug("Sync loop sleeping 1 minute...");
             await Task.Delay(TimeSpan.FromMinutes(1), ct);
         }
+    }
+
+    private async Task RunLineOrderBackfillAsync(CancellationToken ct)
+    {
+        try
+        {
+            _logger.LogInformation("[Backfill] LOR starting...");
+            using var scope = _scopeFactory.CreateScope();
+            var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
+            var r = await svc.BackfillLineOrderReportAsync(ct: ct);
+            _logger.LogInformation("[Backfill] LOR done: {ins} inserted", r.RecordsInserted);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { _logger.LogError(ex, "[Backfill] LOR error"); }
     }
 
     // ── Dealer syncs ─────────────────────────────────────────
@@ -206,6 +229,30 @@ public class SyncHostedService : BackgroundService
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             _logger.LogError(ex, "[Sync] Vehicle dispatches error");
+        }
+    }
+
+    private async Task RunLineOrderReportSyncAsync(CancellationToken ct)
+    {
+        try
+        {
+            var today = DateTime.UtcNow.Date;
+            // LOR: fetch last 30 days on each daily run to catch any updates
+            var from  = today.AddDays(-30);
+
+            _logger.LogInformation("[Sync] LOR: {from} → {today}",
+                from.ToShortDateString(), today.ToShortDateString());
+
+            using var scope = _scopeFactory.CreateScope();
+            var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
+            var r = await svc.SyncLineOrderReportAsync(from, today);
+
+            _logger.LogInformation("[Sync] LOR: {ins} inserted, {upd} updated",
+                r.RecordsInserted, r.RecordsUpdated);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _logger.LogError(ex, "[Sync] LOR sync error");
         }
     }
 

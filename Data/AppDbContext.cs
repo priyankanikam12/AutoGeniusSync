@@ -33,6 +33,7 @@ public partial class AppDbContext : DbContext
     public virtual DbSet<SixSenseVehicleTelemetry> SixSenseVehicleTelemetries { get; set; }
     public DbSet<DmsVehicleDispatch>  DmsVehicleDispatches  { get; set; }
     public DbSet<DmsCallCentreDealer> DmsCallCentreDealers  { get; set; }
+    public DbSet<DmsLineOrderReport> DmsLineOrderReports { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -412,6 +413,65 @@ public partial class AppDbContext : DbContext
                 .IsUnique();
 
             entity.HasIndex(d => d.PinCode);
+        });
+
+        modelBuilder.Entity<DmsLineOrderReport>(entity =>
+        {
+            entity.ToTable("DMS_LineOrderReport");
+
+            entity.HasKey(e => e.Id);
+
+            // UniqueId per dealer uniquely identifies a line item row
+            entity.HasIndex(e => new { e.DealerCode, e.UniqueId })
+                .IsUnique()
+                .HasDatabaseName("UQ_DMS_LOR_DealerUniqueId");
+
+            entity.HasIndex(e => e.ChassisNo)
+                .HasDatabaseName("IX_DMS_LOR_ChassisNo");
+
+            entity.HasIndex(e => e.JobDate)
+                .HasDatabaseName("IX_DMS_LOR_JobDate");
+
+            entity.HasIndex(e => e.DealerCode)
+                .HasDatabaseName("IX_DMS_LOR_DealerCode");
+
+            entity.Property(e => e.DealerName).HasMaxLength(500);
+            entity.Property(e => e.DealerCode).HasMaxLength(50);
+            entity.Property(e => e.UniqueId).HasMaxLength(50);
+            entity.Property(e => e.LocCode).HasMaxLength(100);
+            entity.Property(e => e.DocNo).HasMaxLength(50);
+            entity.Property(e => e.DocType).HasMaxLength(100);
+            entity.Property(e => e.JobNo).HasMaxLength(50);
+            entity.Property(e => e.BrandName).HasMaxLength(200);
+            entity.Property(e => e.Model).HasMaxLength(300);
+            entity.Property(e => e.JobCardType).HasMaxLength(200);
+            entity.Property(e => e.PaymentMode).HasMaxLength(100);
+            entity.Property(e => e.PartyName).HasMaxLength(500);
+            entity.Property(e => e.PartyMobile).HasMaxLength(50);
+            entity.Property(e => e.RegNo).HasMaxLength(100);
+            entity.Property(e => e.VehicleType).HasMaxLength(100);
+            entity.Property(e => e.ChassisNo).HasMaxLength(100);
+            entity.Property(e => e.Location).HasMaxLength(500);
+            entity.Property(e => e.ItemName).HasMaxLength(300);
+            entity.Property(e => e.ItemDescription).HasMaxLength(500);
+            entity.Property(e => e.ItemType).HasMaxLength(100);
+            entity.Property(e => e.Qty).HasMaxLength(50);
+            entity.Property(e => e.DealerType).HasMaxLength(100);
+
+            entity.Property(e => e.Rate).HasColumnType("decimal(18,2)");
+            entity.Property(e => e.Total).HasColumnType("decimal(18,2)");
+            entity.Property(e => e.SgstPer).HasColumnType("decimal(8,2)");
+            entity.Property(e => e.SgstAmount).HasColumnType("decimal(18,2)");
+            entity.Property(e => e.CgstPer).HasColumnType("decimal(8,2)");
+            entity.Property(e => e.CgstAmount).HasColumnType("decimal(18,2)");
+            entity.Property(e => e.IgstPer).HasColumnType("decimal(8,2)");
+            entity.Property(e => e.IgstAmount).HasColumnType("decimal(18,2)");
+            entity.Property(e => e.Discount).HasColumnType("decimal(18,2)");
+            entity.Property(e => e.TotalAmount).HasColumnType("decimal(18,2)");
+            entity.Property(e => e.Mrp).HasColumnType("decimal(18,2)");
+
+            entity.Property(e => e.CreatedAt).HasDefaultValueSql("(getutcdate())");
+            entity.Property(e => e.UpdatedAt).HasDefaultValueSql("(getutcdate())");
         });
 
         OnModelCreatingPartial(modelBuilder);

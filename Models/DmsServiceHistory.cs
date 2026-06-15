@@ -118,4 +118,7 @@ public partial class DmsServiceHistory
     public DateTime? CreatedAt { get; set; }
 
     public DateTime? UpdatedAt { get; set; }
+    public string? Status { get; set; }
+    public string? RepairType { get; set; }
+    public DateOnly? CompletionDate { get; set; }
 }

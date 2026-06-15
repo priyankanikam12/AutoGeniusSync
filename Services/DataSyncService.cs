@@ -138,8 +138,6 @@ public class DataSyncService
             _logger.LogInformation("Date {date}: fetched {n} records",
                 date.ToString("dd-MM-yyyy"), jobs.Count);
 
-            // Dedup within the API response — key is DealerCode|JobNo only.
-            // JobDate can arrive blank on first fetch; don't include it in the key.
             var dedupedJobs = jobs
                 .Where(j => j.JobNo != "Total")
                 .Where(j => !string.IsNullOrEmpty(j.DealerCode) && !string.IsNullOrEmpty(j.JobNo))
@@ -159,10 +157,6 @@ public class DataSyncService
                     if (parsed.JobDate == null)
                         parsed.JobDate = DateOnly.FromDateTime(date);
 
-                    // ── Lookup by DealerCode + JobNo only ────────────────────
-                    // JobDate is NOT in the lookup key — it can change between
-                    // syncs (null on first arrival, real date on re-fetch).
-                    // The DB unique index is also (DealerCode, JobNo) only.
                     var existing = await db.DmsServiceHistories
                         .FirstOrDefaultAsync(x =>
                             x.DealerCode == parsed.DealerCode &&
@@ -175,10 +169,6 @@ public class DataSyncService
                     }
                     else
                     {
-                        // ── CRITICAL: never call SetValues() or assign .Id ──
-                        // EF Core will throw if you touch a PK column on a
-                        // tracked entity. UpdateServiceHistory only sets
-                        // non-key columns, so it is always safe.
                         UpdateServiceHistory(existing, parsed);
                         result.RecordsUpdated++;
                     }
@@ -198,8 +188,7 @@ public class DataSyncService
             log.Status       = "Failed";
             log.ErrorMessage = ex.Message;
             result.Error     = ex.Message;
-            _logger.LogError(ex, "Service history sync failed for {date}",
-                date.ToShortDateString());
+            _logger.LogError(ex, "Service history sync failed for {date}", date.ToShortDateString());
         }
 
         log.CompletedAt     = DateTime.UtcNow;
@@ -351,8 +340,7 @@ public class DataSyncService
             log.Status       = "Failed";
             log.ErrorMessage = ex.Message;
             result.Error     = ex.Message;
-            _logger.LogError(ex, "Vehicle sales sync failed for {date}",
-                date.ToShortDateString());
+            _logger.LogError(ex, "Vehicle sales sync failed for {date}", date.ToShortDateString());
         }
 
         log.CompletedAt     = DateTime.UtcNow;
@@ -398,15 +386,7 @@ public class DataSyncService
                 totalResult.RecordsFetched  += r.RecordsFetched;
                 totalResult.RecordsInserted += r.RecordsInserted;
                 totalResult.RecordsUpdated  += r.RecordsUpdated;
-                _logger.LogInformation("VSR Backfill {date}: +{ins} inserted, +{upd} updated",
-                    current.ToShortDateString(), r.RecordsInserted, r.RecordsUpdated);
             }
-            else
-            {
-                _logger.LogDebug("VSR Backfill {date}: already done, skipping",
-                    current.ToShortDateString());
-            }
-
             current = current.AddDays(1);
         }
 
@@ -595,8 +575,7 @@ public class DataSyncService
             log.Status       = "Failed";
             log.ErrorMessage = ex.Message;
             result.Error     = ex.Message;
-            _logger.LogError(ex, "Vehicle dispatches sync failed for {date}",
-                date.ToShortDateString());
+            _logger.LogError(ex, "Vehicle dispatches sync failed for {date}", date.ToShortDateString());
         }
 
         log.CompletedAt     = DateTime.UtcNow;
@@ -622,8 +601,6 @@ public class DataSyncService
         var today = DateTime.UtcNow.Date;
 
         var totalResult = new SyncResult { SyncType = "BackfillVehicleDispatches" };
-        _logger.LogInformation("VDR Backfill: {start} → {end}",
-            start.ToShortDateString(), end.ToShortDateString());
 
         var current = start;
         while (current <= end && !ct.IsCancellationRequested)
@@ -642,19 +619,179 @@ public class DataSyncService
                 totalResult.RecordsFetched  += r.RecordsFetched;
                 totalResult.RecordsInserted += r.RecordsInserted;
                 totalResult.RecordsUpdated  += r.RecordsUpdated;
-                _logger.LogInformation("VDR Backfill {date}: +{ins} inserted, +{upd} updated",
-                    current.ToShortDateString(), r.RecordsInserted, r.RecordsUpdated);
-            }
-            else
-            {
-                _logger.LogDebug("VDR Backfill {date}: already done, skipping",
-                    current.ToShortDateString());
             }
 
             current = current.AddDays(1);
         }
 
         return totalResult;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // SYNC LINE ORDER REPORT (LOR)
+    //
+    // WHY THIS IS RANGE-BASED (not day-by-day like DJR):
+    //   The LOR API requires a dealercode per request.
+    //   It ignores single-day ranges and returns all records within
+    //   the date window. Day-by-day calls return 0 for almost every
+    //   dealer on any single day. We must pass a wide date range.
+    //
+    // FIX: removed ActiveStatus filter — DMS_Dealers may store
+    //   "Active", "1", "active" or NULL depending on pincode API.
+    //   Filtering by ActiveStatus silently returned 0 dealers.
+    //   Now we take ALL dealers with a non-null DealerCode.
+    // ─────────────────────────────────────────────────────────
+
+    public async Task<SyncResult> SyncLineOrderReportAsync(
+        DateTime startDate, DateTime endDate,
+        CancellationToken ct = default)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var log = new DmsSyncLog
+        {
+            SyncType  = "LineOrderReport",
+            SyncDate  = DateOnly.FromDateTime(endDate),
+            StartedAt = DateTime.UtcNow,
+            Status    = "Running"
+        };
+        db.DmsSyncLogs.Add(log);
+        await db.SaveChangesAsync();
+
+        var result = new SyncResult { SyncType = "LineOrderReport", Date = endDate };
+
+        try
+        {
+            var token = await _erpApi.GetValidTokenAsync();
+
+            // ── FIX: NO ActiveStatus filter ──────────────────────────
+            // The pincode API (booking/pin) stores ActiveStatus as "Active"
+            // but this is inconsistent across dealers.
+            // Take ALL dealers regardless of status — same as VSR sync.
+            var dealerCodes = await db.DmsDealers
+                .Where(d => d.DealerCode != null)
+                .Select(d => d.DealerCode!)
+                .Distinct()
+                .ToListAsync();
+
+            if (!dealerCodes.Any())
+            {
+                _logger.LogWarning(
+                    "LOR sync: DMS_Dealers is empty. Run POST /api/sync/dealers first.");
+                log.Status       = "Failed";
+                log.ErrorMessage = "No dealers in DMS_Dealers. Run dealer sync first.";
+                log.CompletedAt  = DateTime.UtcNow;
+                await db.SaveChangesAsync();
+                return result;
+            }
+
+            _logger.LogInformation(
+                "LOR sync {from} → {to}: {n} dealers",
+                startDate.ToString("dd-MM-yyyy"),
+                endDate.ToString("dd-MM-yyyy"),
+                dealerCodes.Count);
+
+            foreach (var dealerCode in dealerCodes)
+            {
+                if (ct.IsCancellationRequested) break;
+                try
+                {
+                    // Pass FULL date range — not a single day
+                    var records = await _erpApi.FetchLorAsync(
+                        dealerCode, startDate, endDate, token);
+
+                    result.RecordsFetched += records.Count;
+
+                    // Dedup within API response by (DealerCode, UniqueId)
+                    var deduped = records
+                        .Where(r => !string.IsNullOrEmpty(r.UniqueId)
+                                 && !string.IsNullOrEmpty(r.DealerCode))
+                        .GroupBy(r => $"{r.DealerCode}|{r.UniqueId}")
+                        .Select(g => g.Last())
+                        .ToList();
+
+                    _logger.LogInformation(
+                        "LOR dealer {dc}: {raw} fetched → {dedup} after dedup",
+                        dealerCode, records.Count, deduped.Count);
+
+                    foreach (var rec in deduped)
+                    {
+                        try
+                        {
+                            var parsed = MapLineOrderReport(rec);
+
+                            var existing = await db.DmsLineOrderReports
+                                .FirstOrDefaultAsync(x =>
+                                    x.DealerCode == parsed.DealerCode &&
+                                    x.UniqueId   == parsed.UniqueId);
+
+                            if (existing == null)
+                            {
+                                db.DmsLineOrderReports.Add(parsed);
+                                result.RecordsInserted++;
+                            }
+                            else
+                            {
+                                UpdateLineOrderReport(existing, parsed);
+                                result.RecordsUpdated++;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(
+                                "Skipping LOR UniqueId {id} for dealer {dc}: {msg}",
+                                rec.UniqueId, dealerCode, ex.Message);
+                        }
+                    }
+
+                    if (deduped.Any())
+                        await db.SaveChangesAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        "LOR fetch failed for dealer {dc}: {msg}",
+                        dealerCode, ex.Message);
+                }
+            }
+
+            log.Status = "Success";
+        }
+        catch (Exception ex)
+        {
+            log.Status       = "Failed";
+            log.ErrorMessage = ex.Message;
+            result.Error     = ex.Message;
+            _logger.LogError(ex, "LOR sync failed");
+        }
+
+        log.CompletedAt     = DateTime.UtcNow;
+        log.RecordsFetched  = result.RecordsFetched;
+        log.RecordsInserted = result.RecordsInserted;
+        log.RecordsUpdated  = result.RecordsUpdated;
+        await db.SaveChangesAsync();
+
+        return result;
+    }
+
+    // Thin wrapper — keeps SyncHostedService compatible
+    public Task<SyncResult> SyncLineOrderReportForDateAsync(DateTime date)
+        => SyncLineOrderReportAsync(date, date);
+
+    // Full historical backfill — one wide range call per dealer
+    public async Task<SyncResult> BackfillLineOrderReportAsync(
+        DateTime? fromDate = null, DateTime? toDate = null,
+        CancellationToken ct = default)
+    {
+        var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2022-01-01";
+        var start = fromDate ?? DateTime.Parse(startDateStr);
+        var end   = toDate   ?? DateTime.UtcNow.Date;
+
+        _logger.LogInformation("LOR Backfill: {start} → {end}",
+            start.ToShortDateString(), end.ToShortDateString());
+
+        return await SyncLineOrderReportAsync(start, end, ct);
     }
 
     // ─────────────────────────────────────────────────────────
@@ -752,15 +889,8 @@ public class DataSyncService
         };
     }
 
-    // ─────────────────────────────────────────────────────────
-    // UpdateServiceHistory — NEVER assigns .Id or calls SetValues()
-    // SetValues() copies ALL properties including the PK (Id), which
-    // causes EF Core to throw "Id is part of a key and cannot be modified".
-    // Always use explicit field-by-field assignment here.
-    // ─────────────────────────────────────────────────────────
     private static void UpdateServiceHistory(DmsServiceHistory e, DmsServiceHistory n)
     {
-        // Key fields (DealerCode, JobNo) intentionally omitted — never change a PK.
         e.JobDate              = n.JobDate;
         e.CompName             = n.CompName;
         e.Location             = n.Location;
@@ -794,8 +924,8 @@ public class DataSyncService
         e.MobileNumber         = n.MobileNumber;
         e.Supervisor           = n.Supervisor;
         e.Technician           = n.Technician;
-        e.ServiceHead          = n.ServiceHead;   // ← was NULL before DTO fix
-        e.JobType              = n.JobType;        // ← was NULL before DTO fix
+        e.ServiceHead          = n.ServiceHead;
+        e.JobType              = n.JobType;
         e.SaleDate             = n.SaleDate;
         e.CouponNo             = n.CouponNo;
         e.ExpectedDeliveryDate = n.ExpectedDeliveryDate;
@@ -886,181 +1016,143 @@ public class DataSyncService
 
     private static void UpdateVehicleSale(DmsVehicleSale e, DmsVehicleSale n)
     {
-        e.DealerName        = n.DealerName;
-        e.InvoiceDate       = n.InvoiceDate;
-        e.Location          = n.Location;
-        e.LocCode           = n.LocCode;
-        e.LocationCity      = n.LocationCity;
-        e.CustDob           = n.CustDob;
-        e.Gender            = n.Gender;
-        e.SoldTo            = n.SoldTo;
-        e.AccountType       = n.AccountType;
-        e.PartyEmail        = n.PartyEmail;
-        e.CusMob            = n.CusMob;
-        e.Address1          = n.Address1;
-        e.Address2          = n.Address2;
-        e.City              = n.City;
-        e.State             = n.State;
-        e.ExecutiveName     = n.ExecutiveName;
-        e.Pin               = n.Pin;
-        e.ChassisNo         = n.ChassisNo;
-        e.MotorNo           = n.MotorNo;
-        e.Remarks           = n.Remarks;
-        e.ItemModel         = n.ItemModel;
-        e.Oemmodel          = n.Oemmodel;
-        e.ColorCode         = n.ColorCode;
-        e.VehicleType       = n.VehicleType;
-        e.VehicleGroup      = n.VehicleGroup;
-        e.Hsnsaccode        = n.Hsnsaccode;
-        e.SaleType          = n.SaleType;
-        e.FinancedBy        = n.FinancedBy;
-        e.FinAmount         = n.FinAmount;
-        e.ItemRate          = n.ItemRate;
-        e.InsuAmount        = n.InsuAmount;
-        e.RegnAmount        = n.RegnAmount;
-        e.AcsryAmount       = n.AcsryAmount;
-        e.PreGstdiscAmount  = n.PreGstdiscAmount;
-        e.DiscTypeName      = n.DiscTypeName;
-        e.PostGstdisc       = n.PostGstdisc;
-        e.FameIi            = n.FameIi;
-        e.StateFameIi       = n.StateFameIi;
-        e.Sgstper           = n.Sgstper;
-        e.Sgstamount        = n.Sgstamount;
-        e.Cgstper           = n.Cgstper;
-        e.Cgstamount        = n.Cgstamount;
-        e.Igstper           = n.Igstper;
-        e.Igstamount        = n.Igstamount;
-        e.NetAmount         = n.NetAmount;
-        e.ReferenceNo       = n.ReferenceNo;
-        e.BookingDate       = n.BookingDate;
-        e.TotalCount        = n.TotalCount;
-        e.Battery           = n.Battery;
-        e.BatteryChemical   = n.BatteryChemical;
-        e.BatteryCapacity   = n.BatteryCapacity;
-        e.BatteryMake       = n.BatteryMake;
-        e.ChargerNo         = n.ChargerNo;
-        e.ChargerNo2        = n.ChargerNo2;
-        e.Converter         = n.Converter;
-        e.Vcu               = n.Vcu;
-        e.ControllerNo      = n.ControllerNo;
-        e.FameIirequired    = n.FameIirequired;
-        e.SegmentName       = n.SegmentName;
-        e.InstitutionalName = n.InstitutionalName;
-        e.SchemeName        = n.SchemeName;
-        e.UpdatedAt         = DateTime.UtcNow;
+        e.DealerName = n.DealerName; e.InvoiceDate = n.InvoiceDate;
+        e.Location = n.Location; e.LocCode = n.LocCode; e.LocationCity = n.LocationCity;
+        e.CustDob = n.CustDob; e.Gender = n.Gender; e.SoldTo = n.SoldTo;
+        e.AccountType = n.AccountType; e.PartyEmail = n.PartyEmail; e.CusMob = n.CusMob;
+        e.Address1 = n.Address1; e.Address2 = n.Address2; e.City = n.City;
+        e.State = n.State; e.ExecutiveName = n.ExecutiveName; e.Pin = n.Pin;
+        e.ChassisNo = n.ChassisNo; e.MotorNo = n.MotorNo; e.Remarks = n.Remarks;
+        e.ItemModel = n.ItemModel; e.Oemmodel = n.Oemmodel; e.ColorCode = n.ColorCode;
+        e.VehicleType = n.VehicleType; e.VehicleGroup = n.VehicleGroup;
+        e.Hsnsaccode = n.Hsnsaccode; e.SaleType = n.SaleType; e.FinancedBy = n.FinancedBy;
+        e.FinAmount = n.FinAmount; e.ItemRate = n.ItemRate; e.InsuAmount = n.InsuAmount;
+        e.RegnAmount = n.RegnAmount; e.AcsryAmount = n.AcsryAmount;
+        e.PreGstdiscAmount = n.PreGstdiscAmount; e.DiscTypeName = n.DiscTypeName;
+        e.PostGstdisc = n.PostGstdisc; e.FameIi = n.FameIi; e.StateFameIi = n.StateFameIi;
+        e.Sgstper = n.Sgstper; e.Sgstamount = n.Sgstamount;
+        e.Cgstper = n.Cgstper; e.Cgstamount = n.Cgstamount;
+        e.Igstper = n.Igstper; e.Igstamount = n.Igstamount; e.NetAmount = n.NetAmount;
+        e.ReferenceNo = n.ReferenceNo; e.BookingDate = n.BookingDate;
+        e.TotalCount = n.TotalCount; e.Battery = n.Battery;
+        e.BatteryChemical = n.BatteryChemical; e.BatteryCapacity = n.BatteryCapacity;
+        e.BatteryMake = n.BatteryMake; e.ChargerNo = n.ChargerNo;
+        e.ChargerNo2 = n.ChargerNo2; e.Converter = n.Converter;
+        e.Vcu = n.Vcu; e.ControllerNo = n.ControllerNo;
+        e.FameIirequired = n.FameIirequired; e.SegmentName = n.SegmentName;
+        e.InstitutionalName = n.InstitutionalName; e.SchemeName = n.SchemeName;
+        e.UpdatedAt = DateTime.UtcNow;
     }
 
     private static DmsVehicleDispatch MapVehicleDispatch(VdrValue d) => new()
     {
-        SaleDate         = ParseDate(d.SaleDate),
-        InvoiceNo        = d.InvoiceNo,
-        InvoiceDate      = ParseDate(d.InvoiceDate),
-        Location         = d.Location,
-        LocationCode     = d.LocationCode,
-        LocationCity     = d.LocationCity,
-        LocationStatus   = d.LocationStatus,
-        DealerName       = d.DealerName,
-        Zone             = d.Zone,
-        AreaOffice       = d.AreaOffice,
-        MfgYear          = d.MfgYear,
-        BrandName        = d.BrandName,
-        ModelCode        = d.ModelCode,
-        ColorCode        = d.ColorCode,
-        ChassisNo        = d.ChassisNo,
-        RegNo            = d.RegNo,
-        MotorNo          = d.MotorNo,
-        BatteryId        = d.BatteryId,
-        BatteryNo        = d.BatteryNo,
-        EcuSerialNo      = d.EcuSerialNo,
-        EcuImEi          = d.EcuImEi,
-        EcuBalMac        = d.EcuBalMac,
-        ImmoblizerNo     = d.ImmoblizerNo,
-        BikeSimId        = d.BikeSimId,
-        BikeMobileNo     = d.BikeMobileNo,
-        ChargerNo        = d.ChargerNo,
-        ControllerNo     = d.ControllerNo,
-        SoundbarSerialNo = d.SoundbarSerialNo,
-        SoundbarBalMac   = d.SoundbarBalMac,
-        Voltage          = d.Voltage,
-        RegNumber        = d.RegNumber,
-        StartDate        = ParseDate(d.StartDate),
-        Tyre1            = d.Tyre1,
-        Tyre2            = d.Tyre2,
-        VehicleStatus    = d.VehicleStatus,
-        BookingId        = d.BookingId,
-        BillNo           = d.BillNo,
-        BillDate         = ParseDate(d.BillDate),
-        BillType         = d.BillType,
-        FinancerName     = d.FinancerName,
-        FinAmount        = ParseDecimal(d.FinAmount),
-        NameOfParty      = d.NameOfParty,
-        Address1         = d.Address1,
-        Address2         = d.Address2,
-        State            = d.State,
-        City             = d.City,
-        Pin              = d.Pin,
-        MobileNo         = d.MobileNo,
-        Email            = d.Email,
-        AppPush          = d.AppPush,
-        LeadId           = d.LeadId,
-        Vcu              = d.Vcu,
-        CreatedAt        = DateTime.UtcNow,
-        UpdatedAt        = DateTime.UtcNow
+        SaleDate = ParseDate(d.SaleDate), InvoiceNo = d.InvoiceNo,
+        InvoiceDate = ParseDate(d.InvoiceDate), Location = d.Location,
+        LocationCode = d.LocationCode, LocationCity = d.LocationCity,
+        LocationStatus = d.LocationStatus, DealerName = d.DealerName,
+        Zone = d.Zone, AreaOffice = d.AreaOffice, MfgYear = d.MfgYear,
+        BrandName = d.BrandName, ModelCode = d.ModelCode, ColorCode = d.ColorCode,
+        ChassisNo = d.ChassisNo, RegNo = d.RegNo, MotorNo = d.MotorNo,
+        BatteryId = d.BatteryId, BatteryNo = d.BatteryNo,
+        EcuSerialNo = d.EcuSerialNo, EcuImEi = d.EcuImEi, EcuBalMac = d.EcuBalMac,
+        ImmoblizerNo = d.ImmoblizerNo, BikeSimId = d.BikeSimId,
+        BikeMobileNo = d.BikeMobileNo, ChargerNo = d.ChargerNo,
+        ControllerNo = d.ControllerNo, SoundbarSerialNo = d.SoundbarSerialNo,
+        SoundbarBalMac = d.SoundbarBalMac, Voltage = d.Voltage,
+        RegNumber = d.RegNumber, StartDate = ParseDate(d.StartDate),
+        Tyre1 = d.Tyre1, Tyre2 = d.Tyre2, VehicleStatus = d.VehicleStatus,
+        BookingId = d.BookingId, BillNo = d.BillNo,
+        BillDate = ParseDate(d.BillDate), BillType = d.BillType,
+        FinancerName = d.FinancerName, FinAmount = ParseDecimal(d.FinAmount),
+        NameOfParty = d.NameOfParty, Address1 = d.Address1, Address2 = d.Address2,
+        State = d.State, City = d.City, Pin = d.Pin, MobileNo = d.MobileNo,
+        Email = d.Email, AppPush = d.AppPush, LeadId = d.LeadId, Vcu = d.Vcu,
+        CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
     };
 
     private static void UpdateVehicleDispatch(DmsVehicleDispatch e, DmsVehicleDispatch n)
     {
-        e.SaleDate         = n.SaleDate;
-        e.InvoiceDate      = n.InvoiceDate;
-        e.Location         = n.Location;
-        e.LocationCode     = n.LocationCode;
-        e.LocationCity     = n.LocationCity;
-        e.LocationStatus   = n.LocationStatus;
-        e.DealerName       = n.DealerName;
-        e.Zone             = n.Zone;
-        e.AreaOffice       = n.AreaOffice;
-        e.MfgYear          = n.MfgYear;
-        e.BrandName        = n.BrandName;
-        e.ModelCode        = n.ModelCode;
-        e.ColorCode        = n.ColorCode;
-        e.RegNo            = n.RegNo;
-        e.MotorNo          = n.MotorNo;
-        e.BatteryId        = n.BatteryId;
-        e.BatteryNo        = n.BatteryNo;
-        e.EcuSerialNo      = n.EcuSerialNo;
-        e.EcuImEi          = n.EcuImEi;
-        e.EcuBalMac        = n.EcuBalMac;
-        e.ImmoblizerNo     = n.ImmoblizerNo;
-        e.BikeSimId        = n.BikeSimId;
-        e.BikeMobileNo     = n.BikeMobileNo;
-        e.ChargerNo        = n.ChargerNo;
-        e.ControllerNo     = n.ControllerNo;
-        e.SoundbarSerialNo = n.SoundbarSerialNo;
-        e.SoundbarBalMac   = n.SoundbarBalMac;
-        e.Voltage          = n.Voltage;
-        e.RegNumber        = n.RegNumber;
-        e.StartDate        = n.StartDate;
-        e.Tyre1            = n.Tyre1;
-        e.Tyre2            = n.Tyre2;
-        e.VehicleStatus    = n.VehicleStatus;
-        e.BookingId        = n.BookingId;
-        e.BillNo           = n.BillNo;
-        e.BillDate         = n.BillDate;
-        e.BillType         = n.BillType;
-        e.FinancerName     = n.FinancerName;
-        e.FinAmount        = n.FinAmount;
-        e.NameOfParty      = n.NameOfParty;
-        e.Address1         = n.Address1;
-        e.Address2         = n.Address2;
-        e.State            = n.State;
-        e.City             = n.City;
-        e.Pin              = n.Pin;
-        e.MobileNo         = n.MobileNo;
-        e.Email            = n.Email;
-        e.AppPush          = n.AppPush;
-        e.LeadId           = n.LeadId;
-        e.Vcu              = n.Vcu;
-        e.UpdatedAt        = DateTime.UtcNow;
+        e.SaleDate = n.SaleDate; e.InvoiceDate = n.InvoiceDate;
+        e.Location = n.Location; e.LocationCode = n.LocationCode;
+        e.LocationCity = n.LocationCity; e.LocationStatus = n.LocationStatus;
+        e.DealerName = n.DealerName; e.Zone = n.Zone; e.AreaOffice = n.AreaOffice;
+        e.MfgYear = n.MfgYear; e.BrandName = n.BrandName; e.ModelCode = n.ModelCode;
+        e.ColorCode = n.ColorCode; e.RegNo = n.RegNo; e.MotorNo = n.MotorNo;
+        e.BatteryId = n.BatteryId; e.BatteryNo = n.BatteryNo;
+        e.EcuSerialNo = n.EcuSerialNo; e.EcuImEi = n.EcuImEi; e.EcuBalMac = n.EcuBalMac;
+        e.ImmoblizerNo = n.ImmoblizerNo; e.BikeSimId = n.BikeSimId;
+        e.BikeMobileNo = n.BikeMobileNo; e.ChargerNo = n.ChargerNo;
+        e.ControllerNo = n.ControllerNo; e.SoundbarSerialNo = n.SoundbarSerialNo;
+        e.SoundbarBalMac = n.SoundbarBalMac; e.Voltage = n.Voltage;
+        e.RegNumber = n.RegNumber; e.StartDate = n.StartDate;
+        e.Tyre1 = n.Tyre1; e.Tyre2 = n.Tyre2; e.VehicleStatus = n.VehicleStatus;
+        e.BookingId = n.BookingId; e.BillNo = n.BillNo; e.BillDate = n.BillDate;
+        e.BillType = n.BillType; e.FinancerName = n.FinancerName; e.FinAmount = n.FinAmount;
+        e.NameOfParty = n.NameOfParty; e.Address1 = n.Address1; e.Address2 = n.Address2;
+        e.State = n.State; e.City = n.City; e.Pin = n.Pin; e.MobileNo = n.MobileNo;
+        e.Email = n.Email; e.AppPush = n.AppPush; e.LeadId = n.LeadId; e.Vcu = n.Vcu;
+        e.UpdatedAt = DateTime.UtcNow;
+    }
+
+    private static DmsLineOrderReport MapLineOrderReport(LorValue r) => new()
+    {
+        DealerName      = r.DealerName,
+        DealerCode      = r.DealerCode,
+        UniqueId        = r.UniqueId,
+        LocCode         = r.LocCode,
+        DocDate         = ParseDate(r.DocDate),
+        DocNo           = r.DocNo,
+        DocType         = r.DocType,
+        JobDate         = ParseDate(r.JobDate),
+        JobNo           = r.JobNo,
+        BrandName       = r.BrandName,
+        Model           = r.Model,
+        JobCardType     = r.JobCardType,
+        PaymentMode     = r.PaymentMode,
+        PartyName       = r.PartyName,
+        PartyMobile     = r.PartyMobile,
+        RegNo           = r.RegNo,
+        VehicleType     = r.VehicleType,
+        ChassisNo       = r.ChassisNo,
+        Location        = r.Location,
+        ItemName        = r.ItemName,
+        ItemDescription = r.ItemDescription,
+        ItemType        = r.ItemType,
+        Qty             = r.Qty,
+        Rate            = ParseDecimal(r.Rate),
+        Total           = ParseDecimal(r.Total),
+        SgstPer         = ParseDecimal(r.SgstPer),
+        SgstAmount      = ParseDecimal(r.SgstAmount),
+        CgstPer         = ParseDecimal(r.CgstPer),
+        CgstAmount      = ParseDecimal(r.CgstAmount),
+        IgstPer         = ParseDecimal(r.IgstPer),
+        IgstAmount      = ParseDecimal(r.IgstAmount),
+        Discount        = ParseDecimal(r.Discount),
+        TotalAmount     = ParseDecimal(r.TotalAmount),
+        Mrp             = ParseDecimal(r.Mrp),
+        DealerType      = r.DealerType,
+        CreatedAt       = DateTime.UtcNow,
+        UpdatedAt       = DateTime.UtcNow
+    };
+
+    private static void UpdateLineOrderReport(DmsLineOrderReport e, DmsLineOrderReport n)
+    {
+        e.DocDate = n.DocDate; e.DocNo = n.DocNo; e.DocType = n.DocType;
+        e.JobDate = n.JobDate; e.JobNo = n.JobNo;
+        e.BrandName = n.BrandName; e.Model = n.Model;
+        e.JobCardType = n.JobCardType; e.PaymentMode = n.PaymentMode;
+        e.PartyName = n.PartyName; e.PartyMobile = n.PartyMobile;
+        e.RegNo = n.RegNo; e.VehicleType = n.VehicleType;
+        e.ChassisNo = n.ChassisNo; e.Location = n.Location;
+        e.ItemName = n.ItemName; e.ItemDescription = n.ItemDescription;
+        e.ItemType = n.ItemType; e.Qty = n.Qty;
+        e.Rate = n.Rate; e.Total = n.Total;
+        e.SgstPer = n.SgstPer; e.SgstAmount = n.SgstAmount;
+        e.CgstPer = n.CgstPer; e.CgstAmount = n.CgstAmount;
+        e.IgstPer = n.IgstPer; e.IgstAmount = n.IgstAmount;
+        e.Discount = n.Discount; e.TotalAmount = n.TotalAmount;
+        e.Mrp = n.Mrp; e.DealerType = n.DealerType;
+        e.UpdatedAt = DateTime.UtcNow;
     }
 
     // ─────────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 using AutoGeniusSync.Data;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using AutoGeniusSync.DTOs;
 
 namespace AutoGeniusSync.Controllers;
 
@@ -99,5 +100,49 @@ public class ServiceHistoryController : ControllerBase
             .ToListAsync();
 
         return Ok(summary);
+    }
+
+    [HttpGet("shadowfax/vehicles")]
+    public async Task<IActionResult> GetShadowfaxVehicleData(
+        [FromQuery] string? chassisNo = null,
+        [FromQuery] DateTime? from = null,
+        [FromQuery] DateTime? to = null)
+    {
+        var query = _db.DmsServiceHistories.AsQueryable();
+
+        if (!string.IsNullOrEmpty(chassisNo))
+            query = query.Where(x => x.ChassisNo != null && 
+                                    x.ChassisNo.Contains(chassisNo));
+
+        if (from.HasValue)
+        {
+            var fromDate = DateOnly.FromDateTime(from.Value);
+            query = query.Where(x => x.JobDate >= fromDate);
+        }
+
+        if (to.HasValue)
+        {
+            var toDate = DateOnly.FromDateTime(to.Value);
+            query = query.Where(x => x.JobDate <= toDate);
+        }
+
+        var result = await query
+            .Select(x => new ShadowfaxVehicleDto
+            {
+                ChassisNo           = x.ChassisNo,
+                JobNo               = x.JobNo,
+                JobcardCreationDate = x.JobDate,
+                CompletionDate      = x.InvoiceDate,
+                RepairType          = x.JobType,
+
+                // Derive status from available date fields:
+                // If InvoiceDate exists → complete, else if JobDate exists → in repair
+                Status = x.InvoiceDate != null ? "Repair Complete"
+                    : x.JobDate != null    ? "In Repair"
+                    : "Not in Hub"
+            })
+            .ToListAsync();
+
+        return Ok(result);
     }
 }
