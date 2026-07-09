@@ -106,12 +106,16 @@ public class ServiceHistoryController : ControllerBase
     public async Task<IActionResult> GetShadowfaxVehicleData(
         [FromQuery] string? chassisNo = null,
         [FromQuery] DateTime? from = null,
-        [FromQuery] DateTime? to = null)
+        [FromQuery] DateTime? to = null,
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 100)
     {
-        var query = _db.DmsServiceHistories.AsQueryable();
+        var query = _db.DmsServiceHistories
+            .Where(x => !x.IsRowTotal)
+            .AsQueryable();
 
         if (!string.IsNullOrEmpty(chassisNo))
-            query = query.Where(x => x.ChassisNo != null && 
+            query = query.Where(x => x.ChassisNo != null &&
                                     x.ChassisNo.Contains(chassisNo));
 
         if (from.HasValue)
@@ -126,23 +130,36 @@ public class ServiceHistoryController : ControllerBase
             query = query.Where(x => x.JobDate <= toDate);
         }
 
-        var result = await query
+        var total = await query.CountAsync();
+
+        var records = await query
+            .OrderByDescending(x => x.JobDate)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
             .Select(x => new ShadowfaxVehicleDto
             {
                 ChassisNo           = x.ChassisNo,
                 JobNo               = x.JobNo,
+                RegNo               = x.RegNo,          // FIX: was never assigned
+                Model               = x.Model,          // FIX: was never assigned
                 JobcardCreationDate = x.JobDate,
                 CompletionDate      = x.InvoiceDate,
                 RepairType          = x.JobType,
 
-                // Derive status from available date fields:
-                // If InvoiceDate exists → complete, else if JobDate exists → in repair
+                DealerCode   = x.DealerCode,
+                DealerName   = x.CompName,
+                PartyName    = x.PartyName,
+                MobileNumber = x.MobileNumber,
+                DocNo        = x.DocNo,
+                DocType      = x.DocType,
+                NetTotal     = x.NetTotal,
+
                 Status = x.InvoiceDate != null ? "Repair Complete"
                     : x.JobDate != null    ? "In Repair"
                     : "Not in Hub"
             })
             .ToListAsync();
 
-        return Ok(result);
+        return Ok(new { Total = total, Page = page, PageSize = pageSize, Records = records });
     }
 }

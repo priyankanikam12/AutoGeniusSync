@@ -10,5 +10,14 @@ namespace AutoGeniusSync.DTOs
         public DateOnly? CompletionDate { get; set; }
         public string? RepairType { get; set; }
         public string? Status { get; set; }
+
+        // NEW fields
+        public string? DealerCode { get; set; }
+        public string? DealerName { get; set; }
+        public string? PartyName { get; set; }
+        public string? MobileNumber { get; set; }
+        public string? DocNo { get; set; }
+        public string? DocType { get; set; }
+        public decimal? NetTotal { get; set; }
     }
 }
