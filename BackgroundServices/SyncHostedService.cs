@@ -1,3 +1,4 @@
+//BackgroundServices\SyncHostedService.cs
 using AutoGeniusSync.Services;
 
 namespace AutoGeniusSync.BackgroundServices;
@@ -8,13 +9,13 @@ public class SyncHostedService : BackgroundService
     private readonly IConfiguration _config;
     private readonly ILogger<SyncHostedService> _logger;
 
-    // Tracks last run time for each sync type so we don't overlap
     private DateTime _lastDealerSync       = DateTime.MinValue;
     private DateTime _lastCallCentreSync   = DateTime.MinValue;
     private DateTime _lastServiceHistory   = DateTime.MinValue;
     private DateTime _lastVehicleSales     = DateTime.MinValue;
     private DateTime _lastVehicleDispatches = DateTime.MinValue;
     private DateTime _lastLineOrderReport = DateTime.MinValue;
+    private DateTime _lastReconcile        = DateTime.MinValue;   // NEW
 
     public SyncHostedService(
         IServiceScopeFactory scopeFactory,
@@ -30,46 +31,44 @@ public class SyncHostedService : BackgroundService
     {
         _logger.LogInformation("SyncHostedService starting — realtime mode...");
 
-        // On startup: run backfills first, then start the realtime loop
         _ = Task.Run(async () =>
         {
             await Task.Delay(TimeSpan.FromSeconds(10), ct);
 
-            // Step 1 — Dealers first (sequential, others depend on this)
             await RunDealerSyncAsync(ct);
             await RunCallCentreDealerSyncAsync(ct);
 
-            // Step 2 — Historical backfills sequentially, NOT in parallel
-            // Running them in parallel exhausts the DB connection pool
             await RunBackfillAsync(ct);
             await RunVehicleSalesBackfillAsync(ct);
             await RunVehicleDispatchesBackfillAsync(ct);
 
-            // Step 3 — LOR last, after all others complete
-            await Task.Delay(TimeSpan.FromSeconds(30), ct); // brief pause
+            await Task.Delay(TimeSpan.FromSeconds(30), ct);
             await RunLineOrderBackfillAsync(ct);
+
+            // NEW — one-time deep reconcile on startup, catches historical
+            // open jobs that closed after the fact, going back 2 years.
+            await Task.Delay(TimeSpan.FromSeconds(30), ct);
+            await RunReconcileAsync(ct, lookbackDays: 730);
 
         }, ct);
 
-        // Read interval from config (default 30 minutes)
         var intervalMinutes = _config.GetValue<int>("SyncSettings:RealtimeSyncIntervalMinutes", 30);
         var interval = TimeSpan.FromMinutes(intervalMinutes);
 
         _logger.LogInformation("Realtime sync interval: every {min} minutes", intervalMinutes);
 
-        // Separate intervals per sync type (in minutes)
-        var dealerIntervalMin    = _config.GetValue<int>("SyncSettings:DealerIntervalMinutes", 1440);   // once a day
+        var dealerIntervalMin    = _config.GetValue<int>("SyncSettings:DealerIntervalMinutes", 1440);
         var callCentreIntervalMin = _config.GetValue<int>("SyncSettings:CallCentreIntervalMinutes", 1440);
         var serviceHistoryMin    = _config.GetValue<int>("SyncSettings:ServiceHistoryIntervalMinutes", intervalMinutes);
         var vehicleSalesMin      = _config.GetValue<int>("SyncSettings:VehicleSalesIntervalMinutes", intervalMinutes);
         var vehicleDispatchMin   = _config.GetValue<int>("SyncSettings:VehicleDispatchIntervalMinutes", intervalMinutes);
         var lineOrderMin = _config.GetValue<int>("SyncSettings:LineOrderIntervalMinutes", intervalMinutes);
+        var reconcileMin = _config.GetValue<int>("SyncSettings:ReconcileIntervalMinutes", 1440); // NEW — daily by default
 
         while (!ct.IsCancellationRequested)
         {
             var now = DateTime.UtcNow;
 
-            // Run each sync type based on its own interval
             var tasks = new List<Task>();
 
             if ((now - _lastDealerSync).TotalMinutes >= dealerIntervalMin)
@@ -108,11 +107,16 @@ public class SyncHostedService : BackgroundService
                 tasks.Add(RunLineOrderReportSyncAsync(ct));
             }
 
-            // Run all due syncs in parallel
+            // NEW — daily reconcile of open jobs (90-day lookback on the recurring cadence)
+            if ((now - _lastReconcile).TotalMinutes >= reconcileMin)
+            {
+                _lastReconcile = now;
+                tasks.Add(RunReconcileAsync(ct, lookbackDays: 90));
+            }
+
             if (tasks.Any())
                 await Task.WhenAll(tasks);
 
-            // Sleep 1 minute between checks
             _logger.LogDebug("Sync loop sleeping 1 minute...");
             await Task.Delay(TimeSpan.FromMinutes(1), ct);
         }
@@ -132,7 +136,6 @@ public class SyncHostedService : BackgroundService
         catch (Exception ex) { _logger.LogError(ex, "[Backfill] LOR error"); }
     }
 
-    // ── Dealer syncs ─────────────────────────────────────────
     private async Task RunDealerSyncAsync(CancellationToken ct)
     {
         try
@@ -167,7 +170,6 @@ public class SyncHostedService : BackgroundService
         }
     }
 
-    // ── Service history — today + yesterday ──────────────────
     private async Task RunDailyJobSyncAsync(CancellationToken ct)
     {
         try
@@ -190,7 +192,22 @@ public class SyncHostedService : BackgroundService
         }
     }
 
-    // ── Vehicle sales — today + yesterday ────────────────────
+    // ── NEW: Reconcile open jobs ──────────────────────────────
+    private async Task RunReconcileAsync(CancellationToken ct, int lookbackDays)
+    {
+        try
+        {
+            _logger.LogInformation("[Sync] Reconcile open jobs starting (lookback {d}d)...", lookbackDays);
+            using var scope = _scopeFactory.CreateScope();
+            var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
+            var r = await svc.ReconcileOpenJobsAsync(lookbackDays, ct);
+            _logger.LogInformation("[Sync] Reconcile done: {upd} updated, {ins} inserted",
+                r.RecordsUpdated, r.RecordsInserted);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { _logger.LogError(ex, "[Sync] Reconcile error"); }
+    }
+
     private async Task RunVehicleSalesSyncAsync(CancellationToken ct)
     {
         try
@@ -213,7 +230,6 @@ public class SyncHostedService : BackgroundService
         }
     }
 
-    // ── Vehicle dispatches — today + yesterday ───────────────
     private async Task RunVehicleDispatchesSyncAsync(CancellationToken ct)
     {
         try
@@ -241,7 +257,6 @@ public class SyncHostedService : BackgroundService
         try
         {
             var today = DateTime.UtcNow.Date;
-            // LOR: fetch last 30 days on each daily run to catch any updates
             var from  = today.AddDays(-30);
 
             _logger.LogInformation("[Sync] LOR: {from} → {today}",
@@ -260,7 +275,6 @@ public class SyncHostedService : BackgroundService
         }
     }
 
-    // ── Backfills (run once on startup) ──────────────────────
     private async Task RunBackfillAsync(CancellationToken ct)
     {
         try

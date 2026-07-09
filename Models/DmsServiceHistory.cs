@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations.Schema;
 
 namespace AutoGeniusSync.Models;
 
@@ -11,7 +12,7 @@ public partial class DmsServiceHistory
 
     public string? JobNo { get; set; }
 
-    public DateOnly? JobDate { get; set; }      // FIXED: nullable
+    public DateOnly? JobDate { get; set; }
 
     public string? CompName { get; set; }
 
@@ -29,7 +30,7 @@ public partial class DmsServiceHistory
 
     public string? DocType { get; set; }
 
-    public DateOnly? DocDate { get; set; }      // FIXED: nullable
+    public DateOnly? DocDate { get; set; }
 
     public string? Model { get; set; }
 
@@ -81,15 +82,15 @@ public partial class DmsServiceHistory
 
     public string? JobType { get; set; }
 
-    public DateOnly? SaleDate { get; set; }              // FIXED: nullable
+    public DateOnly? SaleDate { get; set; }
 
-    public string? CouponNo { get; set; }                // FIXED: nullable
+    public string? CouponNo { get; set; }
 
-    public DateOnly? ExpectedDeliveryDate { get; set; }  // FIXED: nullable
+    public DateOnly? ExpectedDeliveryDate { get; set; }
 
-    public DateOnly? ProformaDate { get; set; }          // FIXED: nullable
+    public DateOnly? ProformaDate { get; set; }
 
-    public DateOnly? InvoiceDate { get; set; }           // FIXED: nullable
+    public DateOnly? InvoiceDate { get; set; }
 
     public decimal? EstimatedJobExpenses { get; set; }
 
@@ -118,7 +119,15 @@ public partial class DmsServiceHistory
     public DateTime? CreatedAt { get; set; }
 
     public DateTime? UpdatedAt { get; set; }
-    public string? Status { get; set; }
+
     public string? RepairType { get; set; }
+
     public DateOnly? CompletionDate { get; set; }
+
+    // ── JobStatus ────────────────────────────────────────────
+    // This is a DB-computed column (see SQL: JobStatus AS (CASE ...) PERSISTED).
+    // Mapped here as a read-only, database-generated property so EF never
+    // tries to write to it and it can never drift from InvoiceDate.
+    [DatabaseGenerated(DatabaseGeneratedOption.Computed)]
+    public string? JobStatus { get; set; }
 }

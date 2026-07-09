@@ -22,21 +22,26 @@ public class SyncController : ControllerBase
     }
 
     // ── GET /api/sync/status ─────────────────────────────────
+    // Controllers/SyncController.cs — replace GetStatus with this
     [HttpGet("status")]
     public async Task<IActionResult> GetStatus()
     {
         var latestLogs = await _db.DmsSyncLogs
             .OrderByDescending(l => l.StartedAt)
             .Take(20)
+            .AsNoTracking()
             .ToListAsync();
 
-        var totalServiceRecords = await _db.DmsServiceHistories.CountAsync();
-        var totalDealers        = await _db.DmsDealers.CountAsync();
+        // NOLOCK via raw SQL — dashboard counts don't need to block on
+        // or be blocked by in-flight backfill writes to these tables.
+        var totalServiceRecords = await GetApproxCountAsync("dbo.DMS_ServiceHistory");
+        var totalDealers        = await GetApproxCountAsync("dbo.DMS_Dealers");
 
         var tokenActive = await _db.DmsAuthTokens
             .Where(t => t.IsActive && t.ExpiresAt > DateTime.UtcNow)
             .OrderByDescending(t => t.CreatedAt)
             .Select(t => new { t.ExpiresAt, t.VendorName })
+            .AsNoTracking()
             .FirstOrDefaultAsync();
 
         return Ok(new
@@ -45,6 +50,60 @@ public class SyncController : ControllerBase
             TotalDealers        = totalDealers,
             ActiveToken         = tokenActive,
             RecentSyncLogs      = latestLogs
+        });
+    }
+
+    // Fast, non-blocking row count using sys.dm_db_partition_stats.
+    // This reads SQL Server's internal metadata (updated continuously by
+    // the engine) instead of scanning/locking the actual table — it never
+    // waits behind other transactions and returns in milliseconds even on
+    // huge tables under heavy write load.
+    private async Task<long> GetApproxCountAsync(string tableName)
+    {
+        var conn = _db.Database.GetDbConnection();
+        if (conn.State != System.Data.ConnectionState.Open)
+            await conn.OpenAsync();
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandTimeout = 10; // this must return fast — if it doesn't, something else is wrong
+        cmd.CommandText = @"
+            SELECT SUM(p.rows)
+            FROM sys.partitions p
+            WHERE p.object_id = OBJECT_ID(@tableName)
+            AND p.index_id IN (0, 1);"; // 0 = heap, 1 = clustered index
+
+        var param = cmd.CreateParameter();
+        param.ParameterName = "@tableName";
+        param.Value = tableName;
+        cmd.Parameters.Add(param);
+
+        var result = await cmd.ExecuteScalarAsync();
+        return result == DBNull.Value || result == null ? 0 : Convert.ToInt64(result);
+    }
+
+    // ── POST /api/sync/service-history/debug-raw-djrn/{date} ───
+    /// <summary>
+    /// Returns raw DJRN JSON before deserialization, so we can confirm
+    /// whether its field names actually match DjrValue or need their own DTO.
+    /// date format: yyyy-MM-dd
+    /// </summary>
+    [HttpPost("service-history/debug-raw-djrn/{date}")]
+    public async Task<IActionResult> DebugRawDjrn(
+        string date,
+        [FromServices] ErpApiService erpApi,
+        [FromQuery] string dealerCode = "",
+        [FromQuery] string chassisNo = "")
+    {
+        if (!DateTime.TryParse(date, out var parsed))
+            return BadRequest(new { error = "Use yyyy-MM-dd" });
+
+        var token   = await erpApi.GetValidTokenAsync();
+        var rawJson = await erpApi.FetchRawDjrnAsync(parsed, token, chassisNo, dealerCode);
+
+        return Ok(new
+        {
+            Length     = rawJson.Length,
+            RawPreview = rawJson[..Math.Min(3000, rawJson.Length)]
         });
     }
 
@@ -204,6 +263,26 @@ public class SyncController : ControllerBase
         _logger.LogInformation("Manual LOR sync triggered for {date}", date);
         var result = await _sync.SyncLineOrderReportForDateAsync(parsedDate);
 
+        return Ok(new
+        {
+            result.SyncType,
+            result.RecordsFetched,
+            result.RecordsInserted,
+            result.RecordsUpdated,
+            result.Error
+        });
+    }
+
+    // ── POST /api/sync/reconcile?lookbackDays=90 ─────────────
+    // Manually trigger the open-jobs reconciliation sweep.
+    // Use a large lookbackDays (e.g. 730) once, right after deploying
+    // the index fix, to catch historical open jobs that already
+    // closed on the ERP side but never got refreshed locally.
+    [HttpPost("reconcile")]
+    public async Task<IActionResult> Reconcile([FromQuery] int lookbackDays = 90)
+    {
+        _logger.LogInformation("Manual reconcile triggered, lookback {d} days", lookbackDays);
+        var result = await _sync.ReconcileOpenJobsAsync(lookbackDays);
         return Ok(new
         {
             result.SyncType,

@@ -93,17 +93,15 @@ public partial class AppDbContext : DbContext
 
             entity.HasIndex(e => e.ChassisNo, "IX_DMS_Service_ChassisNo");
 
-            entity.HasIndex(e => e.DealerCode, "IX_DMS_Service_DealerCode").IsUnique();;
+            // ── FIXED: these were incorrectly marked .IsUnique() ──────────
+            // That meant "only one row per dealer, ever" and "only one row
+            // per JobDate across ALL dealers, ever" — silently dropping the
+            // vast majority of real jobs on insert. They are now plain,
+            // non-unique indexes kept only for query performance.
+            entity.HasIndex(e => e.DealerCode, "IX_DMS_Service_DealerCode");
+            entity.HasIndex(e => e.JobDate, "IX_DMS_Service_JobDate");
 
-            entity.HasIndex(e => e.JobDate, "IX_DMS_Service_JobDate").IsUnique();;
-
-            // ── FIX: Unique constraint is now (DealerCode, JobNo) only.
-            // Previously it included JobDate, which caused duplicate-key errors
-            // when the same job was re-synced after its JobDate was populated
-            // (the row existed with syncDate, new arrival had realDate → DB
-            // rejected it as a new insert violating the old 3-column key).
-            // JobNo alone is stable and sufficient to identify a unique job
-            // per dealer. JobDate is now just a data field that gets updated.
+            // The ONLY correct unique constraint: one row per (DealerCode, JobNo).
             entity.HasIndex(e => new { e.DealerCode, e.JobNo }, "UQ_DMS_Service_Job").IsUnique();
 
             entity.Property(e => e.Accessory)
@@ -197,6 +195,12 @@ public partial class AppDbContext : DbContext
                 .HasColumnName("TotalWOTax");
             entity.Property(e => e.UpdatedAt).HasDefaultValueSql("(getutcdate())");
             entity.Property(e => e.VehicleType).HasMaxLength(100);
+
+            // ── NEW: JobStatus — DB-computed column, EF never writes to it ──
+            entity.Property(e => e.JobStatus)
+                .HasComputedColumnSql("(CASE WHEN [InvoiceDate] IS NOT NULL THEN 'Closed' ELSE 'Open' END)", stored: true)
+                .HasMaxLength(10)
+                .ValueGeneratedOnAddOrUpdate();
         });
 
         modelBuilder.Entity<DmsSyncLog>(entity =>
@@ -421,7 +425,6 @@ public partial class AppDbContext : DbContext
 
             entity.HasKey(e => e.Id);
 
-            // UniqueId per dealer uniquely identifies a line item row
             entity.HasIndex(e => new { e.DealerCode, e.UniqueId })
                 .IsUnique()
                 .HasDatabaseName("UQ_DMS_LOR_DealerUniqueId");

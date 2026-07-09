@@ -1,3 +1,4 @@
+//Services\DataSyncService.cs
 using AutoGeniusSync.Data;
 using AutoGeniusSync.DTOs;
 using AutoGeniusSync.Models;
@@ -244,6 +245,65 @@ public class DataSyncService
             }
 
             current = current.AddDays(1);
+        }
+
+        return totalResult;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // RECONCILE OPEN JOBS
+    //
+    // WHY THIS EXISTS:
+    //   RunDailyJobSyncAsync only re-syncs "today" and "yesterday".
+    //   A job opened on day X but not invoiced/closed until day X+7
+    //   will never get its InvoiceDate/DocType refreshed once X is
+    //   more than 1 day in the past. This sweep finds every distinct
+    //   JobDate that still has an open (InvoiceDate == null) job in
+    //   our DB and re-pulls DJR for that specific date, so any job
+    //   that has since closed on the ERP side gets updated here too.
+    // ─────────────────────────────────────────────────────────
+
+    public async Task<SyncResult> ReconcileOpenJobsAsync(
+        int lookbackDays = 90, CancellationToken ct = default)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var cutoff = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(-lookbackDays));
+
+        var staleDates = await db.DmsServiceHistories
+            .Where(x => x.InvoiceDate == null
+                     && x.JobDate != null
+                     && x.JobDate >= cutoff
+                     && !x.IsRowTotal)
+            .Select(x => x.JobDate!.Value)
+            .Distinct()
+            .ToListAsync(ct);
+
+        var totalResult = new SyncResult { SyncType = "ReconcileOpenJobs" };
+
+        _logger.LogInformation(
+            "Reconcile: {n} distinct dates have open jobs within last {d} days",
+            staleDates.Count, lookbackDays);
+
+        foreach (var date in staleDates)
+        {
+            if (ct.IsCancellationRequested) break;
+
+            try
+            {
+                var r = await SyncServiceHistoryForDateAsync(date.ToDateTime(TimeOnly.MinValue));
+                totalResult.RecordsUpdated  += r.RecordsUpdated;
+                totalResult.RecordsInserted += r.RecordsInserted;
+
+                _logger.LogInformation(
+                    "Reconcile {date}: +{ins} inserted, +{upd} updated",
+                    date, r.RecordsInserted, r.RecordsUpdated);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning("Reconcile failed for {date}: {msg}", date, ex.Message);
+            }
         }
 
         return totalResult;

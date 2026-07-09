@@ -1,3 +1,4 @@
+//Services\ErpApiService.cs
 using AutoGeniusSync.Data;
 using AutoGeniusSync.DTOs;
 using AutoGeniusSync.Models;
@@ -221,6 +222,34 @@ public class ErpApiService
         };
 
         return await PostWithRetryAsync<VsrValue>(url, req, token, maxRetries: 3);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // FETCH RAW DJRN JSON — debug endpoint only
+    // ─────────────────────────────────────────────────────────
+
+    public async Task<string> FetchRawDjrnAsync(
+        DateTime date, string token, string chassisNo = "", string dealerCode = "")
+    {
+        await Task.Delay(_delayMs);
+        var url      = _baseUrl + _config["AutoGeniusERP:DjrnUrl"];
+        var vendorId = _config.GetValue<int>("AutoGeniusERP:VendorId", 14);
+        var dateStr  = date.ToString("dd-MM-yyyy");
+
+        var bodyObj = new
+        {
+            vendorid   = vendorId,
+            startdate  = dateStr,
+            enddate    = dateStr,
+            dealercode = dealerCode,
+            chassisno  = chassisNo
+        };
+
+        using var http    = _httpFactory.CreateClient("ErpApi");
+        using var request = BuildPostRequest(url, bodyObj, token);
+        var resp  = await http.SendAsync(request);
+        var bytes = await resp.Content.ReadAsByteArrayAsync();
+        return StripBomAndDecode(bytes);
     }
 
     // ─────────────────────────────────────────────────────────
