@@ -695,25 +695,32 @@ public class DataSyncService
             foreach (var dealerCode in dealerCodes)
             {
                 if (ct.IsCancellationRequested) break;
+                await Task.Delay(200, ct);
                 try
                 {
-                    // Pass FULL date range — not a single day
                     var records = await _erpApi.FetchLorAsync(
                         dealerCode, startDate, endDate, token);
 
                     result.RecordsFetched += records.Count;
 
-                    // Dedup within API response by (DealerCode, UniqueId)
                     var deduped = records
                         .Where(r => !string.IsNullOrEmpty(r.UniqueId)
-                                 && !string.IsNullOrEmpty(r.DealerCode))
+                                && !string.IsNullOrEmpty(r.DealerCode))
                         .GroupBy(r => $"{r.DealerCode}|{r.UniqueId}")
                         .Select(g => g.Last())
                         .ToList();
 
-                    _logger.LogInformation(
-                        "LOR dealer {dc}: {raw} fetched → {dedup} after dedup",
-                        dealerCode, records.Count, deduped.Count);
+                    if (!deduped.Any()) continue;
+
+                    // ── BULK LOOKUP: one query per dealer instead of one per record ──
+                    var uniqueIds = deduped
+                        .Select(r => r.UniqueId!)
+                        .ToList();
+
+                    var existingRecords = await db.DmsLineOrderReports
+                        .Where(x => x.DealerCode == dealerCode
+                                && uniqueIds.Contains(x.UniqueId!))
+                        .ToDictionaryAsync(x => x.UniqueId!, x => x);
 
                     foreach (var rec in deduped)
                     {
@@ -721,20 +728,15 @@ public class DataSyncService
                         {
                             var parsed = MapLineOrderReport(rec);
 
-                            var existing = await db.DmsLineOrderReports
-                                .FirstOrDefaultAsync(x =>
-                                    x.DealerCode == parsed.DealerCode &&
-                                    x.UniqueId   == parsed.UniqueId);
-
-                            if (existing == null)
-                            {
-                                db.DmsLineOrderReports.Add(parsed);
-                                result.RecordsInserted++;
-                            }
-                            else
+                            if (existingRecords.TryGetValue(parsed.UniqueId!, out var existing))
                             {
                                 UpdateLineOrderReport(existing, parsed);
                                 result.RecordsUpdated++;
+                            }
+                            else
+                            {
+                                db.DmsLineOrderReports.Add(parsed);
+                                result.RecordsInserted++;
                             }
                         }
                         catch (Exception ex)
@@ -745,13 +747,11 @@ public class DataSyncService
                         }
                     }
 
-                    if (deduped.Any())
-                        await db.SaveChangesAsync();
+                    await db.SaveChangesAsync(); // one save per dealer, not per record
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(
-                        "LOR fetch failed for dealer {dc}: {msg}",
+                    _logger.LogWarning("LOR fetch failed for dealer {dc}: {msg}",
                         dealerCode, ex.Message);
                 }
             }

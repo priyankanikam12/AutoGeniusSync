@@ -35,14 +35,18 @@ public class SyncHostedService : BackgroundService
         {
             await Task.Delay(TimeSpan.FromSeconds(10), ct);
 
-            // Dealers first (needed for VSR)
+            // Step 1 — Dealers first (sequential, others depend on this)
             await RunDealerSyncAsync(ct);
             await RunCallCentreDealerSyncAsync(ct);
 
-            // Historical backfills (skip already-done dates)
+            // Step 2 — Historical backfills sequentially, NOT in parallel
+            // Running them in parallel exhausts the DB connection pool
             await RunBackfillAsync(ct);
             await RunVehicleSalesBackfillAsync(ct);
             await RunVehicleDispatchesBackfillAsync(ct);
+
+            // Step 3 — LOR last, after all others complete
+            await Task.Delay(TimeSpan.FromSeconds(30), ct); // brief pause
             await RunLineOrderBackfillAsync(ct);
 
         }, ct);
