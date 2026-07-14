@@ -732,7 +732,8 @@ public class DataSyncService
 
     public async Task<SyncResult> SyncLineOrderReportAsync(
         DateTime startDate, DateTime endDate,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        List<string>? dealerCodesOverride = null)   // ← NEW parameter
     {
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -753,49 +754,63 @@ public class DataSyncService
         {
             var token = await _erpApi.GetValidTokenAsync();
 
-            // ── FIX: NO ActiveStatus filter ──────────────────────────
-            // The pincode API (booking/pin) stores ActiveStatus as "Active"
-            // but this is inconsistent across dealers.
-            // Take ALL dealers regardless of status — same as VSR sync.
-            var dealerCodesFromDb = await db.DmsDealers
-                .Where(d => d.DealerCode != null)
-                .Select(d => d.DealerCode!)
-                .Distinct()
-                .ToListAsync();
+            List<string> dealerCodes;
 
-            // ── FIX: always include configured Shadowfax dealer codes,
-            // even if they don't exist yet in DMS_Dealers ────────────
-            var shadowfaxCodes = GetConfiguredShadowfaxDealerCodes();
-
-            var dealerCodes = dealerCodesFromDb
-                .Union(shadowfaxCodes, StringComparer.OrdinalIgnoreCase)
-                .Distinct()
-                .ToList();
-
-            if (shadowfaxCodes.Except(dealerCodesFromDb, StringComparer.OrdinalIgnoreCase).Any())
+            if (dealerCodesOverride != null && dealerCodesOverride.Any())
             {
+                // ── NEW: restricted sync — only the given dealer codes,
+                // regardless of what's in DMS_Dealers or the full
+                // ShadowfaxSettings list. Used by the fast Shadowfax
+                // realtime sync so it never touches other dealers. ──
+                dealerCodes = dealerCodesOverride.Distinct().ToList();
+
                 _logger.LogInformation(
-                    "LOR sync: {n} configured Shadowfax dealer code(s) not yet in DMS_Dealers, syncing them anyway: {codes}",
-                    shadowfaxCodes.Except(dealerCodesFromDb, StringComparer.OrdinalIgnoreCase).Count(),
-                    string.Join(", ", shadowfaxCodes.Except(dealerCodesFromDb, StringComparer.OrdinalIgnoreCase)));
+                    "LOR sync {from} → {to}: RESTRICTED to {n} explicit dealer code(s): {codes}",
+                    startDate.ToString("dd-MM-yyyy"), endDate.ToString("dd-MM-yyyy"),
+                    dealerCodes.Count, string.Join(", ", dealerCodes));
             }
-
-            if (!dealerCodes.Any())
+            else
             {
-                _logger.LogWarning(
-                    "LOR sync: no dealers found in DMS_Dealers or ShadowfaxSettings:DealerCodes. Run POST /api/sync/dealers first.");
-                log.Status       = "Failed";
-                log.ErrorMessage = "No dealers in DMS_Dealers or configured Shadowfax codes. Run dealer sync first.";
-                log.CompletedAt  = DateTime.UtcNow;
-                await db.SaveChangesAsync();
-                return result;
-            }
+                // ── Original behavior: all dealers in DMS_Dealers,
+                // unioned with any configured Shadowfax codes not yet
+                // present locally ──────────────────────────────────
+                var dealerCodesFromDb = await db.DmsDealers
+                    .Where(d => d.DealerCode != null)
+                    .Select(d => d.DealerCode!)
+                    .Distinct()
+                    .ToListAsync();
 
-            _logger.LogInformation(
-                "LOR sync {from} → {to}: {n} dealers ({dbCount} from DB, {sfxCount} configured Shadowfax)",
-                startDate.ToString("dd-MM-yyyy"),
-                endDate.ToString("dd-MM-yyyy"),
-                dealerCodes.Count, dealerCodesFromDb.Count, shadowfaxCodes.Count);
+                var shadowfaxCodes = GetConfiguredShadowfaxDealerCodes();
+
+                dealerCodes = dealerCodesFromDb
+                    .Union(shadowfaxCodes, StringComparer.OrdinalIgnoreCase)
+                    .Distinct()
+                    .ToList();
+
+                if (shadowfaxCodes.Except(dealerCodesFromDb, StringComparer.OrdinalIgnoreCase).Any())
+                {
+                    _logger.LogInformation(
+                        "LOR sync: {n} configured Shadowfax dealer code(s) not yet in DMS_Dealers, syncing them anyway: {codes}",
+                        shadowfaxCodes.Except(dealerCodesFromDb, StringComparer.OrdinalIgnoreCase).Count(),
+                        string.Join(", ", shadowfaxCodes.Except(dealerCodesFromDb, StringComparer.OrdinalIgnoreCase)));
+                }
+
+                if (!dealerCodes.Any())
+                {
+                    _logger.LogWarning(
+                        "LOR sync: no dealers found in DMS_Dealers or ShadowfaxSettings:DealerCodes. Run POST /api/sync/dealers first.");
+                    log.Status       = "Failed";
+                    log.ErrorMessage = "No dealers in DMS_Dealers or configured Shadowfax codes. Run dealer sync first.";
+                    log.CompletedAt  = DateTime.UtcNow;
+                    await db.SaveChangesAsync();
+                    return result;
+                }
+
+                _logger.LogInformation(
+                    "LOR sync {from} → {to}: {n} dealers ({dbCount} from DB, {sfxCount} configured Shadowfax)",
+                    startDate.ToString("dd-MM-yyyy"), endDate.ToString("dd-MM-yyyy"),
+                    dealerCodes.Count, dealerCodesFromDb.Count, shadowfaxCodes.Count);
+            }
 
             foreach (var dealerCode in dealerCodes)
             {
@@ -817,7 +832,6 @@ public class DataSyncService
 
                     if (!deduped.Any()) continue;
 
-                    // ── BULK LOOKUP: one query per dealer instead of one per record ──
                     var uniqueIds = deduped
                         .Select(r => r.UniqueId!)
                         .ToList();
@@ -852,7 +866,7 @@ public class DataSyncService
                         }
                     }
 
-                    await db.SaveChangesAsync(); // one save per dealer, not per record
+                    await db.SaveChangesAsync();
                 }
                 catch (Exception ex)
                 {
@@ -883,6 +897,38 @@ public class DataSyncService
     // Thin wrapper — keeps SyncHostedService compatible
     public Task<SyncResult> SyncLineOrderReportForDateAsync(DateTime date)
         => SyncLineOrderReportAsync(date, date);
+    
+
+    // ─────────────────────────────────────────────────────────
+    // SHADOWFAX REALTIME SYNC — fast, restricted-scope LOR pull
+    //
+    // Only hits the small, curated set of Shadowfax dealer codes
+    // from ShadowfaxSettings:DealerCodes (currently the Magnemite
+    // Moto LLP dealers), over a short recent window. Safe to run
+    // every few minutes since it's just a handful of dealers,
+    // unlike the full LOR sync which iterates every dealer.
+    // ─────────────────────────────────────────────────────────
+    public async Task<SyncResult> SyncShadowfaxRealtimeAsync(CancellationToken ct = default)
+    {
+        var shadowfaxCodes = GetConfiguredShadowfaxDealerCodes();
+
+        if (!shadowfaxCodes.Any())
+        {
+            _logger.LogWarning(
+                "Shadowfax realtime sync skipped: ShadowfaxSettings:DealerCodes is empty in appsettings.json.");
+            return new SyncResult { SyncType = "ShadowfaxRealtime", Error = "No Shadowfax dealer codes configured." };
+        }
+
+        var lookbackDays = _config.GetValue<int>("ShadowfaxSettings:LookbackDays", 3);
+        var today = DateTime.UtcNow.Date;
+        var from  = today.AddDays(-lookbackDays);
+
+        _logger.LogInformation(
+            "Shadowfax realtime sync: {n} dealer(s), {from} → {today}",
+            shadowfaxCodes.Count, from.ToShortDateString(), today.ToShortDateString());
+
+        return await SyncLineOrderReportAsync(from, today, ct, dealerCodesOverride: shadowfaxCodes);
+    }
 
     // Full historical backfill — one wide range call per dealer
     public async Task<SyncResult> BackfillLineOrderReportAsync(

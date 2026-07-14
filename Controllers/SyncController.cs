@@ -273,6 +273,26 @@ public class SyncController : ControllerBase
         });
     }
 
+    // ── POST /api/sync/shadowfax/realtime ────────────────────
+    // Manually trigger the fast, restricted Shadowfax-only LOR sync
+    // (only the dealer codes in ShadowfaxSettings:DealerCodes,
+    // over the last ShadowfaxSettings:LookbackDays days). This also
+    // runs automatically every ShadowfaxSettings:RealtimeIntervalMinutes.
+    [HttpPost("shadowfax/realtime")]
+    public async Task<IActionResult> TriggerShadowfaxRealtime()
+    {
+        _logger.LogInformation("Manual Shadowfax realtime sync triggered");
+        var result = await _sync.SyncShadowfaxRealtimeAsync();
+        return Ok(new
+        {
+            result.SyncType,
+            result.RecordsFetched,
+            result.RecordsInserted,
+            result.RecordsUpdated,
+            result.Error
+        });
+    }
+
     // ── POST /api/sync/reconcile?lookbackDays=90 ─────────────
     // Manually trigger the open-jobs reconciliation sweep.
     // Use a large lookbackDays (e.g. 730) once, right after deploying
