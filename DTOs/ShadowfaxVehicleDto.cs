@@ -11,7 +11,7 @@ namespace AutoGeniusSync.DTOs
         public string? RepairType { get; set; }
         public string? Status { get; set; }
 
-        // NEW fields
+        // ── Fields that were missing ──────────────────────
         public string? DealerCode { get; set; }
         public string? DealerName { get; set; }
         public string? PartyName { get; set; }
@@ -19,5 +19,7 @@ namespace AutoGeniusSync.DTOs
         public string? DocNo { get; set; }
         public string? DocType { get; set; }
         public decimal? NetTotal { get; set; }
+        public string? Location { get; set; }
+        public string? PaymentMode { get; set; }
     }
 }

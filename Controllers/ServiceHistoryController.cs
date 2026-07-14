@@ -140,22 +140,21 @@ public class ServiceHistoryController : ControllerBase
             {
                 ChassisNo           = x.ChassisNo,
                 JobNo               = x.JobNo,
-                RegNo               = x.RegNo,          // FIX: was never assigned
-                Model               = x.Model,          // FIX: was never assigned
+                RegNo               = x.RegNo,
+                Model               = x.Model,
                 JobcardCreationDate = x.JobDate,
                 CompletionDate      = x.InvoiceDate,
                 RepairType          = x.JobType,
-
-                DealerCode   = x.DealerCode,
-                DealerName   = x.CompName,
-                PartyName    = x.PartyName,
-                MobileNumber = x.MobileNumber,
-                DocNo        = x.DocNo,
-                DocType      = x.DocType,
-                NetTotal     = x.NetTotal,
-
+                DealerCode          = x.DealerCode,
+                DealerName          = x.CompName,      // CompName = dealer company name
+                PartyName           = x.PartyName,
+                MobileNumber        = x.MobileNumber,
+                DocNo               = x.DocNo,
+                DocType             = x.DocType,
+                NetTotal            = x.NetTotal,
+                Location            = x.Location,
                 Status = x.InvoiceDate != null ? "Repair Complete"
-                    : x.JobDate != null    ? "In Repair"
+                    : x.JobDate != null     ? "In Repair"
                     : "Not in Hub"
             })
             .ToListAsync();
