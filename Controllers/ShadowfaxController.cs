@@ -22,31 +22,31 @@ public class ShadowfaxController : ControllerBase
     }
 
     // ── Helper: load Shadowfax dealer codes from config ───
-    // private List<string> GetShadowfaxDealerCodes()
-    //     => _config.GetSection("ShadowfaxSettings:DealerCodes")
-    //               .Get<List<string>>() ?? new();
+    private List<string> GetShadowfaxDealerCodes()
+        => _config.GetSection("ShadowfaxSettings:DealerCodes")
+                  .Get<List<string>>() ?? new();
 
-    private async Task<List<string>> GetShadowfaxDealerCodes()
-    {
-        // Get all Shadowfax pincodes
-        var pincodes = await _db.DmsPincodeMasters
-            .Where(x => !string.IsNullOrEmpty(x.PinCode))
-            .Select(x => x.PinCode!)
-            .Distinct()
-            .ToListAsync();
+    // private async Task<List<string>> GetShadowfaxDealerCodes()
+    // {
+    //     // Get all Shadowfax pincodes
+    //     var pincodes = await _db.DmsPincodeMasters
+    //         .Where(x => !string.IsNullOrEmpty(x.PinCode))
+    //         .Select(x => x.PinCode!)
+    //         .Distinct()
+    //         .ToListAsync();
 
-        if (!pincodes.Any())
-            return new List<string>();
+    //     if (!pincodes.Any())
+    //         return new List<string>();
 
-        // Get dealer codes whose pincode matches
-        return await _db.DmsDealers
-            .Where(x => x.PinCode != null &&
-                        pincodes.Contains(x.PinCode) &&
-                        x.ActiveStatus == "Active")
-            .Select(x => x.DealerCode!)
-            .Distinct()
-            .ToListAsync();
-    }
+    //     // Get dealer codes whose pincode matches
+    //     return await _db.DmsDealers
+    //         .Where(x => x.PinCode != null &&
+    //                     pincodes.Contains(x.PinCode) &&
+    //                     x.ActiveStatus == "Active")
+    //         .Select(x => x.DealerCode!)
+    //         .Distinct()
+    //         .ToListAsync();
+    // }
 
     // ─────────────────────────────────────────────────────
     // GET /api/shadowfax/vehicles
@@ -59,7 +59,7 @@ public class ShadowfaxController : ControllerBase
         [FromQuery] int page = 1,
         [FromQuery] int pageSize = 100)
     {
-        var sfxDealers = await GetShadowfaxDealerCodes();
+        var sfxDealers =  GetShadowfaxDealerCodes();
 
         // ── If no Shadowfax dealer codes are configured, warn loudly
         // instead of silently returning every dealer's data ──────
@@ -142,7 +142,7 @@ public class ShadowfaxController : ControllerBase
         [FromQuery] int page = 1,
         [FromQuery] int pageSize = 100)
     {
-        var sfxDealers = await GetShadowfaxDealerCodes();
+        var sfxDealers = GetShadowfaxDealerCodes();
 
         var query = _db.DmsLineOrderReports
             .Where(x => x.DocNo != null && x.ChassisNo != null) // invoice raised
@@ -212,7 +212,7 @@ public class ShadowfaxController : ControllerBase
         [FromQuery] int page = 1,
         [FromQuery] int pageSize = 100)
     {
-        var sfxDealers = await GetShadowfaxDealerCodes();
+        var sfxDealers =  GetShadowfaxDealerCodes();
 
         var query = _db.DmsLineOrderReports
             .Where(x => !string.IsNullOrEmpty(x.ItemType))
@@ -289,7 +289,7 @@ public class ShadowfaxController : ControllerBase
         [FromQuery] int page = 1,
         [FromQuery] int pageSize = 100)
     {
-        var sfxDealers = await GetShadowfaxDealerCodes();
+        var sfxDealers = GetShadowfaxDealerCodes();
 
         var query = _db.DmsLineOrderReports
             .Where(x => x.DocNo != null)
@@ -354,7 +354,7 @@ public class ShadowfaxController : ControllerBase
     [HttpGet("dealers")]
     public async Task<IActionResult> GetConfiguredDealers()
     {
-        var codes = await GetShadowfaxDealerCodes();
+        var codes = GetShadowfaxDealerCodes();
 
         return Ok(new
         {

@@ -9,7 +9,13 @@ namespace AutoGeniusSync.Controllers;
 public class DealersController : ControllerBase
 {
     private readonly AppDbContext _db;
-    public DealersController(AppDbContext db) => _db = db;
+    private readonly IConfiguration _config;
+
+    public DealersController(AppDbContext db, IConfiguration config)
+    {
+        _db = db;
+        _config = config;
+    }
 
     [HttpGet]
     public async Task<IActionResult> GetAll([FromQuery] string? state, [FromQuery] string? city)
@@ -31,14 +37,11 @@ public class DealersController : ControllerBase
     public async Task<IActionResult> GetByPin(string pin)
         => Ok(await _db.DmsDealers.Where(d => d.PinCode == pin).ToListAsync());
 
-    // ── NEW: GET /api/dealers/search?name=shadowfax ──────────
+    // ── GET /api/dealers/search?name=shadowfax ────────────────
     // Search dealer company names by substring — use this to
     // find the exact DealerCode(s) for Shadowfax-onboarded dealers
     // so they can be added to ShadowfaxSettings:DealerCodes in
-    // appsettings.json. Try "shadowfax" first; if nothing matches,
-    // your ERP may have them under a different partner/tag name —
-    // ask your ERP admin what dealer company name is used internally
-    // for the Shadowfax hub-partner dealers.
+    // appsettings.json.
     [HttpGet("search")]
     public async Task<IActionResult> SearchByName([FromQuery] string name)
     {
@@ -52,5 +55,38 @@ public class DealersController : ControllerBase
             .ToListAsync();
 
         return Ok(new { Count = results.Count, Results = results });
+    }
+
+    // ── NEW: GET /api/dealers/shadowfax-status ─────────────────
+    // Cross-checks ShadowfaxSettings:DealerCodes (appsettings.json)
+    // against what's actually present in DMS_Dealers, so you can see
+    // at a glance which configured Shadowfax dealer codes are still
+    // missing locally. LOR/VSR sync will still pull data for them
+    // regardless (see DataSyncService.GetConfiguredShadowfaxDealerCodes),
+    // but they won't show up in GET /api/dealers or /api/dealers/{code}
+    // until a regular dealer sync happens to return them via pincode,
+    // or you seed stub rows manually.
+    [HttpGet("shadowfax-status")]
+    public async Task<IActionResult> ShadowfaxStatus()
+    {
+        var configured = _config.GetSection("ShadowfaxSettings:DealerCodes").Get<List<string>>() ?? new();
+
+        var existing = await _db.DmsDealers
+            .Where(d => d.DealerCode != null && configured.Contains(d.DealerCode))
+            .Select(d => d.DealerCode!)
+            .ToListAsync();
+
+        var missing = configured
+            .Except(existing, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(c => c)
+            .ToList();
+
+        return Ok(new
+        {
+            ConfiguredCount   = configured.Count,
+            ExistingInDbCount = existing.Count,
+            MissingCount      = missing.Count,
+            MissingDealerCodes = missing
+        });
     }
 }

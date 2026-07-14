@@ -26,6 +26,19 @@ public class DataSyncService
     }
 
     // ─────────────────────────────────────────────────────────
+    // SHADOWFAX DEALER CODES FROM CONFIG
+    //
+    // WHY THIS EXISTS: some Shadowfax-onboarded dealer codes may
+    // not yet exist as rows in DMS_Dealers (e.g. sourced from
+    // another system, not yet returned by the pincode/dealer ERP
+    // API). Without this, LOR/VSR sync would silently skip them
+    // forever, even after adding them to ShadowfaxSettings:DealerCodes,
+    // because those syncs only iterate codes already in DMS_Dealers.
+    // ─────────────────────────────────────────────────────────
+    private List<string> GetConfiguredShadowfaxDealerCodes()
+        => _config.GetSection("ShadowfaxSettings:DealerCodes").Get<List<string>>() ?? new();
+
+    // ─────────────────────────────────────────────────────────
     // SYNC ALL DEALERS from pincode list
     // ─────────────────────────────────────────────────────────
 
@@ -57,6 +70,8 @@ public class DataSyncService
 
             _logger.LogInformation("Syncing dealers for {count} pincodes", pincodes.Count);
 
+            int processed = 0;
+
             foreach (var pin in pincodes)
             {
                 try
@@ -87,6 +102,19 @@ public class DataSyncService
                 catch (Exception ex)
                 {
                     _logger.LogWarning("Pin {pin} dealer fetch failed: {msg}", pin, ex.Message);
+                }
+
+                processed++;
+                if (processed % 100 == 0 || processed == pincodes.Count)
+                {
+                    _logger.LogInformation(
+                        "Dealer sync progress: {done}/{total} pincodes processed | {ins} inserted, {upd} updated so far",
+                        processed, pincodes.Count, result.RecordsInserted, result.RecordsUpdated);
+
+                    log.RecordsFetched  = result.RecordsFetched;
+                    log.RecordsInserted = result.RecordsInserted;
+                    log.RecordsUpdated  = result.RecordsUpdated;
+                    await db.SaveChangesAsync();
                 }
             }
 
@@ -252,15 +280,6 @@ public class DataSyncService
 
     // ─────────────────────────────────────────────────────────
     // RECONCILE OPEN JOBS
-    //
-    // WHY THIS EXISTS:
-    //   RunDailyJobSyncAsync only re-syncs "today" and "yesterday".
-    //   A job opened on day X but not invoiced/closed until day X+7
-    //   will never get its InvoiceDate/DocType refreshed once X is
-    //   more than 1 day in the past. This sweep finds every distinct
-    //   JobDate that still has an open (InvoiceDate == null) job in
-    //   our DB and re-pulls DJR for that specific date, so any job
-    //   that has since closed on the ERP side gets updated here too.
     // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> ReconcileOpenJobsAsync(
@@ -334,14 +353,23 @@ public class DataSyncService
         {
             var token = await _erpApi.GetValidTokenAsync();
 
-            var dealerCodes = await db.DmsDealers
+            var dealerCodesFromDb = await db.DmsDealers
                 .Where(d => d.DealerCode != null)
                 .Select(d => d.DealerCode!)
                 .Distinct()
                 .ToListAsync();
 
-            _logger.LogInformation("VSR sync for {date}: {n} dealers",
-                date.ToString("dd-MM-yyyy"), dealerCodes.Count);
+            // ── FIX: always include configured Shadowfax dealer codes,
+            // even if they don't exist yet in DMS_Dealers ────────────
+            var shadowfaxCodes = GetConfiguredShadowfaxDealerCodes();
+
+            var dealerCodes = dealerCodesFromDb
+                .Union(shadowfaxCodes, StringComparer.OrdinalIgnoreCase)
+                .Distinct()
+                .ToList();
+
+            _logger.LogInformation("VSR sync for {date}: {n} dealers ({dbCount} from DB, {sfxCount} configured Shadowfax)",
+                date.ToString("dd-MM-yyyy"), dealerCodes.Count, dealerCodesFromDb.Count, shadowfaxCodes.Count);
 
             foreach (var dealerCode in dealerCodes)
             {
@@ -729,28 +757,45 @@ public class DataSyncService
             // The pincode API (booking/pin) stores ActiveStatus as "Active"
             // but this is inconsistent across dealers.
             // Take ALL dealers regardless of status — same as VSR sync.
-            var dealerCodes = await db.DmsDealers
+            var dealerCodesFromDb = await db.DmsDealers
                 .Where(d => d.DealerCode != null)
                 .Select(d => d.DealerCode!)
                 .Distinct()
                 .ToListAsync();
 
+            // ── FIX: always include configured Shadowfax dealer codes,
+            // even if they don't exist yet in DMS_Dealers ────────────
+            var shadowfaxCodes = GetConfiguredShadowfaxDealerCodes();
+
+            var dealerCodes = dealerCodesFromDb
+                .Union(shadowfaxCodes, StringComparer.OrdinalIgnoreCase)
+                .Distinct()
+                .ToList();
+
+            if (shadowfaxCodes.Except(dealerCodesFromDb, StringComparer.OrdinalIgnoreCase).Any())
+            {
+                _logger.LogInformation(
+                    "LOR sync: {n} configured Shadowfax dealer code(s) not yet in DMS_Dealers, syncing them anyway: {codes}",
+                    shadowfaxCodes.Except(dealerCodesFromDb, StringComparer.OrdinalIgnoreCase).Count(),
+                    string.Join(", ", shadowfaxCodes.Except(dealerCodesFromDb, StringComparer.OrdinalIgnoreCase)));
+            }
+
             if (!dealerCodes.Any())
             {
                 _logger.LogWarning(
-                    "LOR sync: DMS_Dealers is empty. Run POST /api/sync/dealers first.");
+                    "LOR sync: no dealers found in DMS_Dealers or ShadowfaxSettings:DealerCodes. Run POST /api/sync/dealers first.");
                 log.Status       = "Failed";
-                log.ErrorMessage = "No dealers in DMS_Dealers. Run dealer sync first.";
+                log.ErrorMessage = "No dealers in DMS_Dealers or configured Shadowfax codes. Run dealer sync first.";
                 log.CompletedAt  = DateTime.UtcNow;
                 await db.SaveChangesAsync();
                 return result;
             }
 
             _logger.LogInformation(
-                "LOR sync {from} → {to}: {n} dealers",
+                "LOR sync {from} → {to}: {n} dealers ({dbCount} from DB, {sfxCount} configured Shadowfax)",
                 startDate.ToString("dd-MM-yyyy"),
                 endDate.ToString("dd-MM-yyyy"),
-                dealerCodes.Count);
+                dealerCodes.Count, dealerCodesFromDb.Count, shadowfaxCodes.Count);
 
             foreach (var dealerCode in dealerCodes)
             {
