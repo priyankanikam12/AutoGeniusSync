@@ -113,74 +113,16 @@ public class VehicleDispatchesController : ControllerBase
             !DateTime.TryParse(req.To, out var to))
             return BadRequest(new { error = "Use yyyy-MM-dd for both dates." });
 
-        if ((to - from).TotalDays > 365)
-            return BadRequest(new { error = "Max range is 365 days." });
-
-        _ = Task.Run(() => _sync.BackfillVehicleDispatchesAsync(from, to));
-        return Accepted(new { message = $"VDR backfill started: {from:dd-MM-yyyy} to {to:dd-MM-yyyy}" });
+        var result = await _sync.SyncVehicleDispatchesForRangeAsync(from, to);
+        return Ok(result);
     }
 
-    // POST /api/vehicledispatches/backfill
     [HttpPost("backfill")]
-    public IActionResult StartBackfill()
+    public IActionResult StartBackfill([FromQuery] bool forceResync = false)
     {
-        _ = Task.Run(() => _sync.BackfillVehicleDispatchesAsync());
-        return Accepted(new { message = "Full VDR backfill started." });
+        _ = Task.Run(() => _sync.BackfillVehicleDispatchesAsync(forceResync: forceResync));
+        return Accepted(new { message = $"Full VDR backfill started (range-based, forceResync={forceResync})." });
     }
 }
 
 
-// ─────────────────────────────────────────────────────────────
-// Call Centre Dealers Controller
-// ─────────────────────────────────────────────────────────────
-[ApiController]
-[Route("api/[controller]")]
-public class CallCentreDealersController : ControllerBase
-{
-    private readonly AppDbContext _db;
-    private readonly DataSyncService _sync;
-
-    public CallCentreDealersController(AppDbContext db, DataSyncService sync)
-    {
-        _db = db;
-        _sync = sync;
-    }
-
-    // GET /api/callcentredealers
-    [HttpGet]
-    public async Task<IActionResult> GetAll(
-        [FromQuery] string? state,
-        [FromQuery] string? activeStatus)
-    {
-        var q = _db.DmsCallCentreDealers.AsQueryable();
-
-        if (!string.IsNullOrEmpty(state))
-            q = q.Where(d => d.DealerStateName != null && d.DealerStateName.Contains(state));
-
-        if (!string.IsNullOrEmpty(activeStatus))
-            q = q.Where(d => d.ActiveStatus == activeStatus);
-
-        return Ok(await q.OrderBy(d => d.DealerCompany).ToListAsync());
-    }
-
-    // GET /api/callcentredealers/pincode/401105
-    [HttpGet("pincode/{pin}")]
-    public async Task<IActionResult> GetByPin(string pin)
-        => Ok(await _db.DmsCallCentreDealers
-            .Where(d => d.PinCode == pin)
-            .ToListAsync());
-
-    // GET /api/callcentredealers/{dealerCode}
-    [HttpGet("{dealerCode}")]
-    public async Task<IActionResult> Get(string dealerCode)
-    {
-        var d = await _db.DmsCallCentreDealers
-            .FirstOrDefaultAsync(x => x.DealerCode == dealerCode);
-        return d == null ? NotFound() : Ok(d);
-    }
-
-    // POST /api/callcentredealers/sync
-    [HttpPost("sync")]
-    public async Task<IActionResult> Sync()
-        => Ok(await _sync.SyncCallCentreDealersAsync());
-}

@@ -17,26 +17,32 @@ public class VdrValue
     [JsonProperty("Brand Name")]       public string? BrandName       { get; set; }
     [JsonProperty("Model Code")]       public string? ModelCode       { get; set; }
     [JsonProperty("Color Code")]       public string? ColorCode       { get; set; }
-    [JsonProperty("Chassis No")]       public string? ChassisNo       { get; set; }
+    // FIX: API sends "Chasis No" (single S), same typo pattern as VSR
+    [JsonProperty("Chasis No")]        public string? ChassisNo       { get; set; }
     [JsonProperty("Reg No")]           public string? RegNo           { get; set; }
     [JsonProperty("Motor No")]         public string? MotorNo         { get; set; }
-    [JsonProperty("Battery Id")]       public string? BatteryId       { get; set; }
+    // FIX: API sends "Battery ID" (capital ID), not "Battery Id"
+    [JsonProperty("Battery ID")]       public string? BatteryId       { get; set; }
     [JsonProperty("Battery No")]       public string? BatteryNo       { get; set; }
     [JsonProperty("ECU Serial No")]    public string? EcuSerialNo     { get; set; }
-    [JsonProperty("ECU IMEI")]         public string? EcuImEi         { get; set; }
-    [JsonProperty("ECU Bal Mac")]      public string? EcuBalMac       { get; set; }
+    // FIX: API sends "ECU Im EI" (with a space before EI), not "ECU IMEI"
+    [JsonProperty("ECU Im EI")]        public string? EcuImEi         { get; set; }
+    // FIX: API sends "ECU BAL MAC" (all caps), not "ECU Bal Mac"
+    [JsonProperty("ECU BAL MAC")]      public string? EcuBalMac       { get; set; }
     [JsonProperty("Immoblizer No")]    public string? ImmoblizerNo    { get; set; }
     [JsonProperty("Bike Sim Id")]      public string? BikeSimId       { get; set; }
     [JsonProperty("Bike Mobile No")]   public string? BikeMobileNo    { get; set; }
     [JsonProperty("Charger No")]       public string? ChargerNo       { get; set; }
     [JsonProperty("Controller No")]    public string? ControllerNo    { get; set; }
     [JsonProperty("Soundbar Serial No")] public string? SoundbarSerialNo { get; set; }
-    [JsonProperty("Soundbar Bal Mac")] public string? SoundbarBalMac  { get; set; }
+    // FIX: API sends "Soundbar BAL MAC" (all caps), not "Soundbar Bal Mac"
+    [JsonProperty("Soundbar BAL MAC")] public string? SoundbarBalMac  { get; set; }
     [JsonProperty("Voltage")]          public string? Voltage         { get; set; }
     [JsonProperty("Reg Number")]       public string? RegNumber       { get; set; }
     [JsonProperty("Start Date")]       public string? StartDate       { get; set; }
-    [JsonProperty("Tyre1")]            public string? Tyre1           { get; set; }
-    [JsonProperty("Tyre2")]            public string? Tyre2           { get; set; }
+    // FIX: API sends "Tyre 1" / "Tyre 2" (with a space), not "Tyre1" / "Tyre2"
+    [JsonProperty("Tyre 1")]           public string? Tyre1           { get; set; }
+    [JsonProperty("Tyre 2")]           public string? Tyre2           { get; set; }
     [JsonProperty("Vehicle Status")]   public string? VehicleStatus   { get; set; }
     [JsonProperty("Booking Id")]       public string? BookingId       { get; set; }
     [JsonProperty("Bill No")]          public string? BillNo          { get; set; }
@@ -44,7 +50,8 @@ public class VdrValue
     [JsonProperty("Bill Type")]        public string? BillType        { get; set; }
     [JsonProperty("Financer Name")]    public string? FinancerName    { get; set; }
     [JsonProperty("Fin Amount")]       public string? FinAmount       { get; set; }
-    [JsonProperty("Name Of Party")]    public string? NameOfParty     { get; set; }
+    // FIX: API sends "Name of the Party" (lowercase "of the"), not "Name Of Party"
+    [JsonProperty("Name of the Party")] public string? NameOfParty    { get; set; }
     [JsonProperty("Address1")]         public string? Address1        { get; set; }
     [JsonProperty("Address2")]         public string? Address2        { get; set; }
     [JsonProperty("State")]            public string? State           { get; set; }
@@ -53,6 +60,7 @@ public class VdrValue
     [JsonProperty("Mobile No")]        public string? MobileNo        { get; set; }
     [JsonProperty("Email")]            public string? Email           { get; set; }
     [JsonProperty("App Push")]         public string? AppPush         { get; set; }
-    [JsonProperty("Lead Id")]          public string? LeadId          { get; set; }
+    // FIX: API sends "LeadId" (no space), not "Lead Id"
+    [JsonProperty("LeadId")]           public string? LeadId          { get; set; }
     [JsonProperty("VCU")]              public string? Vcu             { get; set; }
 }

@@ -13,43 +13,47 @@ public class ShadowfaxController : ControllerBase
     private readonly IConfiguration _config;
     private readonly ILogger<ShadowfaxController> _logger;
 
-    public ShadowfaxController(AppDbContext db, IConfiguration config,
-        ILogger<ShadowfaxController> logger)
+    public ShadowfaxController(AppDbContext db, IConfiguration config, ILogger<ShadowfaxController> logger)
     {
         _db = db;
         _config = config;
         _logger = logger;
     }
 
-    // ── Helper: load Shadowfax dealer codes from config ───
+    // ── FIX: no longer gating on DMS_ShadowfaxChassisMaster (the locally
+    // uploaded 3,285-chassis CSV). That list is a secondary, manually
+    // maintained snapshot — it can drift out of sync with what the ERP
+    // itself reports (new bikes added, CSV not re-uploaded, chassis
+    // typos, etc.), and gating on it was silently hiding legitimate
+    // Shadowfax data or letting in rows that happened to share a chassis
+    // number with the CSV.
+    //
+    // Source of truth is now exactly what /V1/erpreport/lor (via
+    // ErpApiService -> DataSyncService -> DMS_LineOrderReport) reports
+    // as Shadowfax, using the same two ERP-native signals everywhere:
+    //   1) DealerCode is one of the configured Shadowfax dealer codes
+    //      (ShadowfaxSettings:DealerCodes in appsettings.json), AND
+    //   2) PartyName starts with "shadowfax" (case-insensitive)
+    // No chassis whitelist involved — chassisNo (when supplied) is now
+    // purely an optional narrowing/search filter, not a gate.
+    // ──────────────────────────────────────────────────────────────
     private List<string> GetShadowfaxDealerCodes()
-        => _config.GetSection("ShadowfaxSettings:DealerCodes")
-                  .Get<List<string>>() ?? new();
+    {
+        var codes = _config.GetSection("ShadowfaxSettings:DealerCodes").Get<List<string>>() ?? new();
 
-    // private async Task<List<string>> GetShadowfaxDealerCodes()
-    // {
-    //     // Get all Shadowfax pincodes
-    //     var pincodes = await _db.DmsPincodeMasters
-    //         .Where(x => !string.IsNullOrEmpty(x.PinCode))
-    //         .Select(x => x.PinCode!)
-    //         .Distinct()
-    //         .ToListAsync();
+        if (!codes.Any())
+        {
+            _logger.LogWarning(
+                "ShadowfaxSettings:DealerCodes is empty in appsettings.json — " +
+                "every /api/shadowfax/* endpoint will return zero records.");
+        }
 
-    //     if (!pincodes.Any())
-    //         return new List<string>();
-
-    //     // Get dealer codes whose pincode matches
-    //     return await _db.DmsDealers
-    //         .Where(x => x.PinCode != null &&
-    //                     pincodes.Contains(x.PinCode) &&
-    //                     x.ActiveStatus == "Active")
-    //         .Select(x => x.DealerCode!)
-    //         .Distinct()
-    //         .ToListAsync();
-    // }
+        return codes;
+    }
 
     // ─────────────────────────────────────────────────────
     // GET /api/shadowfax/vehicles
+    // One row per job, aggregated across all its line items.
     // ─────────────────────────────────────────────────────
     [HttpGet("vehicles")]
     public async Task<IActionResult> GetVehicles(
@@ -59,28 +63,15 @@ public class ShadowfaxController : ControllerBase
         [FromQuery] int page = 1,
         [FromQuery] int pageSize = 100)
     {
-        var sfxDealers =  GetShadowfaxDealerCodes();
+        var dealerCodes = GetShadowfaxDealerCodes();
 
-        // ── If no Shadowfax dealer codes are configured, warn loudly
-        // instead of silently returning every dealer's data ──────
-        if (!sfxDealers.Any())
-        {
-            _logger.LogWarning(
-                "ShadowfaxSettings:DealerCodes is empty — /api/shadowfax/vehicles " +
-                "is returning ALL dealers, not just Shadowfax ones. " +
-                "Use GET /api/dealers/search?name=... to find the correct codes " +
-                "and add them to appsettings.json.");
-        }
-
-        var query = _db.DmsLineOrderReports.AsQueryable();
-
-        if (sfxDealers.Any())
-            query = query.Where(x => x.DealerCode != null &&
-                                     sfxDealers.Contains(x.DealerCode));
+        var query = _db.DmsLineOrderReports
+            .Where(x => x.DealerCode != null && dealerCodes.Contains(x.DealerCode)
+                     && x.PartyName != null && EF.Functions.Like(x.PartyName, "shadowfax%"))
+            .AsQueryable();
 
         if (!string.IsNullOrEmpty(chassisNo))
-            query = query.Where(x => x.ChassisNo != null &&
-                                     x.ChassisNo.Contains(chassisNo));
+            query = query.Where(x => x.ChassisNo != null && x.ChassisNo.Contains(chassisNo));
 
         if (from.HasValue)
         {
@@ -94,9 +85,31 @@ public class ShadowfaxController : ControllerBase
             query = query.Where(x => x.JobDate <= toDate);
         }
 
-        var total = await query.CountAsync();
+        var grouped = query
+            .GroupBy(x => new { x.DealerCode, x.JobNo, x.ChassisNo })
+            .Select(g => new
+            {
+                g.Key.ChassisNo,
+                g.Key.JobNo,
+                g.Key.DealerCode,
+                RegNo        = g.Select(x => x.RegNo).FirstOrDefault(),
+                Model        = g.Select(x => x.Model).FirstOrDefault(),
+                DealerName   = g.Select(x => x.DealerName).FirstOrDefault(),
+                PartyName    = g.Select(x => x.PartyName).FirstOrDefault(),
+                MobileNumber = g.Select(x => x.PartyMobile).FirstOrDefault(),
+                DocNo        = g.Select(x => x.DocNo).FirstOrDefault(),
+                DocType      = g.Select(x => x.DocType).FirstOrDefault(),
+                Location     = g.Select(x => x.Location).FirstOrDefault(),
+                PaymentMode  = g.Select(x => x.PaymentMode).FirstOrDefault(),
+                JobDate      = g.Max(x => x.JobDate),
+                DocDate      = g.Max(x => x.DocDate),
+                JobCardType  = g.Select(x => x.JobCardType).FirstOrDefault(),
+                NetTotal     = g.Sum(x => x.TotalAmount ?? 0)
+            });
 
-        var records = await query
+        var total = await grouped.CountAsync();
+
+        var records = await grouped
             .OrderByDescending(x => x.JobDate)
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
@@ -106,18 +119,18 @@ public class ShadowfaxController : ControllerBase
                 JobNo               = x.JobNo,
                 RegNo               = x.RegNo,
                 Model               = x.Model,
-                JobcardCreationDate = x.JobDate,
-                CompletionDate      = x.DocDate,
-                RepairType          = x.JobCardType,
                 DealerCode          = x.DealerCode,
                 DealerName          = x.DealerName,
                 PartyName           = x.PartyName,
-                MobileNumber        = x.PartyMobile,
+                MobileNumber        = x.MobileNumber,
                 DocNo               = x.DocNo,
                 DocType             = x.DocType,
-                NetTotal            = x.TotalAmount,   // ← FIX: was never mapped before
                 Location            = x.Location,
                 PaymentMode         = x.PaymentMode,
+                JobcardCreationDate = x.JobDate,
+                CompletionDate      = x.DocDate,
+                RepairType          = x.JobCardType,
+                NetTotal            = x.NetTotal,
                 Status = x.DocDate != null ? "Repair Complete"
                        : x.JobDate != null ? "In Repair"
                        : "Not in Hub"
@@ -128,80 +141,7 @@ public class ShadowfaxController : ControllerBase
     }
 
     // ─────────────────────────────────────────────────────
-    // NEW: GET /api/shadowfax/vehicles/invoiced
-    // A separate, invoice-stage-only view — one row per
-    // (chassis, invoice), not one row per LOR line item.
-    // This directly answers point 3: "a separate table of
-    // vehicles reaching invoice stage."
-    // ─────────────────────────────────────────────────────
-    [HttpGet("vehicles/invoiced")]
-    public async Task<IActionResult> GetInvoicedVehicles(
-        [FromQuery] string? chassisNo = null,
-        [FromQuery] DateTime? from = null,
-        [FromQuery] DateTime? to = null,
-        [FromQuery] int page = 1,
-        [FromQuery] int pageSize = 100)
-    {
-        var sfxDealers = GetShadowfaxDealerCodes();
-
-        var query = _db.DmsLineOrderReports
-            .Where(x => x.DocNo != null && x.ChassisNo != null) // invoice raised
-            .AsQueryable();
-
-        if (sfxDealers.Any())
-            query = query.Where(x => x.DealerCode != null &&
-                                     sfxDealers.Contains(x.DealerCode));
-
-        if (!string.IsNullOrEmpty(chassisNo))
-            query = query.Where(x => x.ChassisNo!.Contains(chassisNo));
-
-        if (from.HasValue)
-        {
-            var fromDate = DateOnly.FromDateTime(from.Value);
-            query = query.Where(x => x.DocDate >= fromDate);
-        }
-
-        if (to.HasValue)
-        {
-            var toDate = DateOnly.FromDateTime(to.Value);
-            query = query.Where(x => x.DocDate <= toDate);
-        }
-
-        // Collapse multiple line items down to one row per
-        // (ChassisNo, DocNo) — pick the row with the highest
-        // TotalAmount as the representative header-level row,
-        // since header fields (DealerName/PartyName/etc.) repeat
-        // identically across all line items for the same invoice.
-        var grouped = await query
-            .GroupBy(x => new { x.ChassisNo, x.DocNo })
-            .Select(g => new
-            {
-                g.Key.ChassisNo,
-                g.Key.DocNo,
-                InvoiceDate  = g.Max(x => x.DocDate),
-                JobNo        = g.Select(x => x.JobNo).FirstOrDefault(),
-                JobDate      = g.Min(x => x.JobDate),
-                RegNo        = g.Select(x => x.RegNo).FirstOrDefault(),
-                Model        = g.Select(x => x.Model).FirstOrDefault(),
-                DealerCode   = g.Select(x => x.DealerCode).FirstOrDefault(),
-                DealerName   = g.Select(x => x.DealerName).FirstOrDefault(),
-                PartyName    = g.Select(x => x.PartyName).FirstOrDefault(),
-                MobileNumber = g.Select(x => x.PartyMobile).FirstOrDefault(),
-                DocType      = g.Select(x => x.DocType).FirstOrDefault(),
-                Location     = g.Select(x => x.Location).FirstOrDefault(),
-                NetTotal     = g.Sum(x => x.TotalAmount)   // sum of all line items = invoice total
-            })
-            .OrderByDescending(x => x.InvoiceDate)
-            .ToListAsync();
-
-        var total = grouped.Count;
-        var page_ = grouped.Skip((page - 1) * pageSize).Take(pageSize).ToList();
-
-        return Ok(new { Total = total, Page = page, PageSize = pageSize, Records = page_ });
-    }
-
-    // ─────────────────────────────────────────────────────
-    // GET /api/shadowfax/parts
+    // GET /api/shadowfax/parts — line-item level detail
     // ─────────────────────────────────────────────────────
     [HttpGet("parts")]
     public async Task<IActionResult> GetParts(
@@ -212,19 +152,16 @@ public class ShadowfaxController : ControllerBase
         [FromQuery] int page = 1,
         [FromQuery] int pageSize = 100)
     {
-        var sfxDealers =  GetShadowfaxDealerCodes();
+        var dealerCodes = GetShadowfaxDealerCodes();
 
         var query = _db.DmsLineOrderReports
-            .Where(x => !string.IsNullOrEmpty(x.ItemType))
+            .Where(x => (x.ItemType == "Parts" || x.ItemType == "Part")
+                     && x.DealerCode != null && dealerCodes.Contains(x.DealerCode)
+                     && x.PartyName != null && EF.Functions.Like(x.PartyName, "shadowfax%"))
             .AsQueryable();
 
-        if (sfxDealers.Any())
-            query = query.Where(x => x.DealerCode != null &&
-                                     sfxDealers.Contains(x.DealerCode));
-
         if (!string.IsNullOrEmpty(chassisNo))
-            query = query.Where(x => x.ChassisNo != null &&
-                                     x.ChassisNo.Contains(chassisNo));
+            query = query.Where(x => x.ChassisNo != null && x.ChassisNo.Contains(chassisNo));
 
         if (!string.IsNullOrEmpty(jobNo))
             query = query.Where(x => x.JobNo == jobNo);
@@ -256,10 +193,10 @@ public class ShadowfaxController : ControllerBase
                 x.DealerCode,
                 x.DealerName,
                 x.PartyName,
-                PartyMobile  = x.PartyMobile,
+                x.PartyMobile,
                 x.JobDate,
-                InvoiceNo    = x.DocNo,
-                InvoiceDate  = x.DocDate,
+                InvoiceNo   = x.DocNo,
+                InvoiceDate = x.DocDate,
                 x.ItemName,
                 x.ItemDescription,
                 x.ItemType,
@@ -278,7 +215,8 @@ public class ShadowfaxController : ControllerBase
     }
 
     // ─────────────────────────────────────────────────────
-    // GET /api/shadowfax/invoice-jobcard
+    // GET /api/shadowfax/invoice-jobcard — one row per invoice,
+    // aggregated across all line items.
     // ─────────────────────────────────────────────────────
     [HttpGet("invoice-jobcard")]
     public async Task<IActionResult> GetInvoiceJobcardMapping(
@@ -289,19 +227,16 @@ public class ShadowfaxController : ControllerBase
         [FromQuery] int page = 1,
         [FromQuery] int pageSize = 100)
     {
-        var sfxDealers = GetShadowfaxDealerCodes();
+        var dealerCodes = GetShadowfaxDealerCodes();
 
         var query = _db.DmsLineOrderReports
-            .Where(x => x.DocNo != null)
+            .Where(x => x.DocNo != null
+                     && x.DealerCode != null && dealerCodes.Contains(x.DealerCode)
+                     && x.PartyName != null && EF.Functions.Like(x.PartyName, "shadowfax%"))
             .AsQueryable();
 
-        if (sfxDealers.Any())
-            query = query.Where(x => x.DealerCode != null &&
-                                     sfxDealers.Contains(x.DealerCode));
-
         if (!string.IsNullOrEmpty(chassisNo))
-            query = query.Where(x => x.ChassisNo != null &&
-                                     x.ChassisNo.Contains(chassisNo));
+            query = query.Where(x => x.ChassisNo != null && x.ChassisNo.Contains(chassisNo));
 
         if (!string.IsNullOrEmpty(invoiceNo))
             query = query.Where(x => x.DocNo == invoiceNo);
@@ -318,51 +253,52 @@ public class ShadowfaxController : ControllerBase
             query = query.Where(x => x.DocDate <= toDate);
         }
 
-        var total = await query.CountAsync();
+        var grouped = query
+            .GroupBy(x => new { x.DealerCode, x.DocNo, x.ChassisNo })
+            .Select(g => new
+            {
+                InvoiceNo    = g.Key.DocNo,
+                InvoiceDate  = g.Max(x => x.DocDate),
+                InvoiceType  = g.Select(x => x.DocType).FirstOrDefault(),
+                JobNo        = g.Select(x => x.JobNo).FirstOrDefault(),
+                JobDate      = g.Max(x => x.JobDate),
+                ChassisNo    = g.Key.ChassisNo,
+                RegNo        = g.Select(x => x.RegNo).FirstOrDefault(),
+                Model        = g.Select(x => x.Model).FirstOrDefault(),
+                DealerCode   = g.Key.DealerCode,
+                DealerName   = g.Select(x => x.DealerName).FirstOrDefault(),
+                PartyName    = g.Select(x => x.PartyName).FirstOrDefault(),
+                PartyMobile  = g.Select(x => x.PartyMobile).FirstOrDefault(),
+                JobCardType  = g.Select(x => x.JobCardType).FirstOrDefault(),
+                Location     = g.Select(x => x.Location).FirstOrDefault(),
+                TotalAmount  = g.Sum(x => x.TotalAmount ?? 0)
+            });
 
-        var records = await query
-            .OrderByDescending(x => x.DocDate)
+        var total = await grouped.CountAsync();
+
+        var records = await grouped
+            .OrderByDescending(x => x.InvoiceDate)
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
-            .Select(x => new
-            {
-                InvoiceNo   = x.DocNo,
-                InvoiceDate = x.DocDate,
-                InvoiceType = x.DocType,
-                JobNo       = x.JobNo,
-                JobDate     = x.JobDate,
-                x.ChassisNo,
-                x.RegNo,
-                x.Model,
-                x.DealerCode,
-                x.DealerName,
-                x.PartyName,
-                x.PartyMobile,
-                x.JobCardType,
-                x.TotalAmount,
-                x.Location
-            })
-            .Distinct()
             .ToListAsync();
 
         return Ok(new { Total = total, Page = page, PageSize = pageSize, Records = records });
     }
 
     // ─────────────────────────────────────────────────────
-    // GET /api/shadowfax/dealers
+    // GET /api/shadowfax/chassis-master-status
+    // Kept for visibility into the uploaded CSV, but it no longer
+    // gates any /api/shadowfax/* query — informational only now.
     // ─────────────────────────────────────────────────────
-    [HttpGet("dealers")]
-    public async Task<IActionResult> GetConfiguredDealers()
+    [HttpGet("chassis-master-status")]
+    public async Task<IActionResult> ChassisMasterStatus()
     {
-        var codes = GetShadowfaxDealerCodes();
-
+        var count = await _db.DmsShadowfaxChassisMasters.CountAsync();
         return Ok(new
         {
-            ConfiguredDealerCodes = codes,
-            Count = codes.Count,
-            Note = codes.Any()
-                ? "Dealer codes fetched successfully."
-                : "No dealer codes found."
+            TotalChassisLoaded = count,
+            Note = "This list is informational only — /api/shadowfax/* endpoints " +
+                   "filter by DealerCode + PartyName (ERP-native fields), not this table."
         });
     }
 }

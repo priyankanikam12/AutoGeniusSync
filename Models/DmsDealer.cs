@@ -28,4 +28,14 @@ public partial class DmsDealer
     public DateTime? CreatedAt { get; set; }
 
     public DateTime? UpdatedAt { get; set; }
+
+    // ── NEW: fields available from the ERP's ManageDealerReport export ──
+    public string? Email { get; set; }
+    public string? CityTier { get; set; }
+    public string? Source { get; set; }
+    public DateOnly? RegistrationDate { get; set; }
+    public string? PreviousStatus { get; set; }
+    public DateOnly? StatusModifiedDate { get; set; }
+    public string? ModifiedBy { get; set; }
+    public string? Remarks { get; set; }
 }

@@ -120,6 +120,79 @@ public class ErpApiService
         return result?.Valid == true ? result.Value ?? new() : new();
     }
 
+    public async Task<string> FetchRawVdrRangeAsync(DateTime fromDate, DateTime toDate, string token)
+    {
+        await Task.Delay(_delayMs);
+        var url = $"{_baseUrl}/V1/erpreport/vdr?Ver=1.0";
+        var vendorId = _config.GetValue<int>("AutoGeniusERP:VendorId", 14);
+
+        var req = new VdrRequest
+        {
+            VendorId = vendorId,
+            FromDate = fromDate.ToString("dd-MM-yyyy"),
+            ToDate   = toDate.ToString("dd-MM-yyyy"),
+            DealerCode = "", LocationCode = "", ChassisNo = "", MobileNo = "",
+            VhclStatus = "ALL", SubVendorCode = ""
+        };
+
+        using var http    = _httpFactory.CreateClient("ErpApi");
+        using var request = BuildPostRequest(url, req, token);
+        var resp  = await http.SendAsync(request);
+        var bytes = await resp.Content.ReadAsByteArrayAsync();
+        return StripBomAndDecode(bytes);
+    }
+
+    // Generic debug-parse — works for DJR, VSR, or VDR raw JSON given the type param
+    public object DebugParseRawJson<T>(string raw)
+    {
+        var sanitized = SanitizeJson(raw);
+
+        try
+        {
+            var result = JsonConvert.DeserializeObject<ErpApiResponse<T>>(sanitized);
+            return new { FastPathSucceeded = true, Valid = result?.Valid, ItemCount = result?.Value?.Count ?? 0, RawLength = raw.Length };
+        }
+        catch (JsonException ex)
+        {
+            int approxCharPos = 0;
+            if (ex is Newtonsoft.Json.JsonReaderException jre)
+            {
+                var lines = sanitized.Split('\n');
+                for (int i = 0; i < jre.LineNumber - 1 && i < lines.Length; i++)
+                    approxCharPos += lines[i].Length + 1;
+                approxCharPos += jre.LinePosition;
+            }
+            var start = Math.Max(0, approxCharPos - 200);
+            var len   = Math.Min(400, sanitized.Length - start);
+            return new
+            {
+                FastPathSucceeded = false,
+                ExceptionMessage  = ex.Message,
+                ApproxCharPosition = approxCharPos,
+                RawLength = raw.Length,
+                ContextAroundError = sanitized.Substring(start, len)
+            };
+        }
+    }
+
+    public async Task<string> FetchRawVsrRangeAsync(DateTime fromDate, DateTime toDate, string token)
+    {
+        await Task.Delay(_delayMs);
+        var url = $"{_baseUrl}/V1/erpreport/vsr?Ver=1.0";
+        var vendorId = _config.GetValue<int>("AutoGeniusERP:VendorId", 14);
+        var req = new VsrRequest
+        {
+            DealerCode = "", VendorId = vendorId,
+            StartDate = fromDate.ToString("dd-MM-yyyy"), EndDate = toDate.ToString("dd-MM-yyyy"),
+            SubVendorCode = "", DealerStatus = "1", AadharPanReq = "0", FameReq = "2"
+        };
+        using var http    = _httpFactory.CreateClient("ErpApi");
+        using var request = BuildPostRequest(url, req, token);
+        var resp  = await http.SendAsync(request);
+        var bytes = await resp.Content.ReadAsByteArrayAsync();
+        return StripBomAndDecode(bytes);
+    }
+
     // ─────────────────────────────────────────────────────────
     // DAILY JOB REPORT (DJR)
     // ─────────────────────────────────────────────────────────
@@ -145,8 +218,6 @@ public class ErpApiService
 
     // ─────────────────────────────────────────────────────────
     // LINE ORDER REPORT (LOR)
-    // Iterates per-dealer since the API requires dealercode.
-    // date range: startDate → endDate (pass same date for daily sync)
     // ─────────────────────────────────────────────────────────
     public async Task<List<LorValue>> FetchLorAsync(
         string dealerCode, DateTime startDate, DateTime endDate, string token)
@@ -160,7 +231,7 @@ public class ErpApiService
             VendorId   = vendorId,
             StartDate  = startDate.ToString("dd-MM-yyyy"),
             EndDate    = endDate.ToString("dd-MM-yyyy"),
-            DealerCode = dealerCode   // ← from DMS_Dealers.DealerCode
+            DealerCode = dealerCode
         };
 
         _logger.LogInformation(
@@ -172,12 +243,8 @@ public class ErpApiService
         return await PostWithRetryAsync<LorValue>(url, req, token, maxRetries: 3);
     }
 
-    //────────────────────────────────────────────────────
-    // Fetch Raw LOR JSON — debug endpoint only
-    // ─────────────────────────────────────────────────────────
-
     public async Task<string> FetchRawLorAsync(
-    string dealerCode, DateTime date, string token)
+        string dealerCode, DateTime date, string token)
     {
         await Task.Delay(_delayMs);
         var url      = $"{_baseUrl}/V1/erpreport/lor?Ver=1.0";
@@ -194,6 +261,51 @@ public class ErpApiService
         using var http    = _httpFactory.CreateClient("ErpApi");
         using var request = BuildPostRequest(url, req, token);
         var resp = await http.SendAsync(request);
+        var bytes = await resp.Content.ReadAsByteArrayAsync();
+        return StripBomAndDecode(bytes);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // DJR — WIDE RANGE, ALL DEALERS
+    // ─────────────────────────────────────────────────────────
+
+    public async Task<List<DjrValue>> FetchDjrRangeAsync(DateTime startDate, DateTime endDate, string token)
+    {
+        await Task.Delay(_delayMs);
+        var url      = _baseUrl + _config["AutoGeniusERP:DjrUrl"];
+        var vendorId = _config.GetValue<int>("AutoGeniusERP:VendorId", 14);
+
+        var req = new DjrRequest
+        {
+            VendorId   = vendorId,
+            StartDate  = startDate.ToString("dd-MM-yyyy"),
+            EndDate    = endDate.ToString("dd-MM-yyyy"),
+            DealerCode = ""
+        };
+
+        _logger.LogInformation("Fetching DJR range {from} → {to} (all dealers, one call)",
+            startDate.ToString("dd-MM-yyyy"), endDate.ToString("dd-MM-yyyy"));
+
+        return await PostWithRetryAsync<DjrValue>(url, req, token, maxRetries: 3);
+    }
+
+    public async Task<string> FetchRawDjrRangeAsync(DateTime startDate, DateTime endDate, string token)
+    {
+        await Task.Delay(_delayMs);
+        var url      = _baseUrl + _config["AutoGeniusERP:DjrUrl"];
+        var vendorId = _config.GetValue<int>("AutoGeniusERP:VendorId", 14);
+
+        var req = new DjrRequest
+        {
+            VendorId   = vendorId,
+            StartDate  = startDate.ToString("dd-MM-yyyy"),
+            EndDate    = endDate.ToString("dd-MM-yyyy"),
+            DealerCode = ""
+        };
+
+        using var http    = _httpFactory.CreateClient("ErpApi");
+        using var request = BuildPostRequest(url, req, token);
+        var resp  = await http.SendAsync(request);
         var bytes = await resp.Content.ReadAsByteArrayAsync();
         return StripBomAndDecode(bytes);
     }
@@ -224,6 +336,12 @@ public class ErpApiService
         return await PostWithRetryAsync<VsrValue>(url, req, token, maxRetries: 3);
     }
 
+    public async Task<object> DebugDjrRangeParseAsync(DateTime startDate, DateTime endDate, string token)
+    {
+        var raw = await FetchRawDjrRangeAsync(startDate, endDate, token);
+        return DebugParseRawJson<DjrValue>(raw);
+    }
+
     // ─────────────────────────────────────────────────────────
     // FETCH RAW DJRN JSON — debug endpoint only
     // ─────────────────────────────────────────────────────────
@@ -251,10 +369,6 @@ public class ErpApiService
         var bytes = await resp.Content.ReadAsByteArrayAsync();
         return StripBomAndDecode(bytes);
     }
-
-    // ─────────────────────────────────────────────────────────
-    // DJRN
-    // ─────────────────────────────────────────────────────────
 
     public async Task<List<DjrValue>> FetchDjrnAsync(
         DateTime date, string token, string chassisNo = "", string dealerCode = "")
@@ -324,12 +438,6 @@ public class ErpApiService
         return result?.Valid == true ? result.Value ?? new() : new();
     }
 
-    // ─────────────────────────────────────────────────────────
-    // FETCH RAW JSON — debug endpoint only
-    // Returns the raw response string before any deserialization.
-    // Use GET /api/sync/service-history/debug-raw/{date} to call this.
-    // ─────────────────────────────────────────────────────────
-
     public async Task<string> FetchRawDjrAsync(DateTime date, string token)
     {
         await Task.Delay(_delayMs);
@@ -352,6 +460,19 @@ public class ErpApiService
 
     // ─────────────────────────────────────────────────────────
     // SHARED: POST with retry
+    //
+    // FIX (critical): this used to swallow every failure — network
+    // errors, HTTP errors, and JSON parse errors alike — and return
+    // an empty list after logging a warning. That made a genuinely
+    // failed fetch indistinguishable from "the ERP really had zero
+    // records for this range," and the caller's SyncResult ended up
+    // marked Status=Success with RecordsFetched=0.
+    //
+    // Now: any exhausted-retry condition THROWS. The caller's own
+    // try/catch (already present in every Sync*ForRangeAsync method)
+    // will catch it, set log.Status="Failed", and store the real
+    // error message — so failures are now visible in DMS_SyncLog
+    // instead of silently masquerading as empty-but-successful runs.
     // ─────────────────────────────────────────────────────────
 
     private async Task<List<T>> PostWithRetryAsync<T>(
@@ -375,7 +496,6 @@ public class ErpApiService
 
                 var resp = await http.SendAsync(request, cts.Token);
 
-                // ── Strip UTF-8 BOM if present ────────────────
                 var rawBytes = await resp.Content.ReadAsByteArrayAsync();
                 var body     = StripBomAndDecode(rawBytes);
 
@@ -421,9 +541,12 @@ public class ErpApiService
                 if (attempt < maxRetries)
                     await Task.Delay(TimeSpan.FromSeconds(attempt * 10));
             }
+            catch (JsonException)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
-                // Non-retryable — surface immediately
                 _logger.LogError(ex,
                     "Attempt {attempt}/{max} unexpected error for {url}",
                     attempt, maxRetries, url);
@@ -431,16 +554,16 @@ public class ErpApiService
             }
         }
 
-        _logger.LogWarning(
-            "All {max} attempts failed for {url}. Last error: {err}. Returning empty.",
-            maxRetries, url, lastException?.Message);
-        return new();
+        // FIX: throw instead of "return new()". A genuine empty-but-valid
+        // API response (Valid=true, Value=[]) already returns cleanly from
+        // DeserializeTolerant above and never reaches this line — so
+        // reaching here means every attempt genuinely failed.
+        throw new Exception(
+            $"All {maxRetries} attempts failed for {url}. Last error: {lastException?.Message}");
     }
 
     // ─────────────────────────────────────────────────────────
     // BOM STRIPPER
-    // Some ERP responses arrive with a UTF-8 BOM (EF BB BF) that
-    // causes JSON parsers to choke on the very first character.
     // ─────────────────────────────────────────────────────────
 
     private static string StripBomAndDecode(byte[] bytes)
@@ -455,48 +578,164 @@ public class ErpApiService
 
     // ─────────────────────────────────────────────────────────
     // JSON SANITIZER
-    //
-    // WHY THIS EXISTS:
-    //   The ERP API emits "IndividualAH Battery1" with a mid-word
-    //   space, which makes the key structurally ambiguous in some
-    //   parsers. We collapse that specific space so the key becomes
-    //   "IndividualAHBattery1", matching the [JsonProperty] in DjrValue.
-    //
-    // IMPORTANT — DO NOT add a general "collapse all spaced keys" regex.
-    //   Every other spaced key ("Dealer Code", "Job No", "Service Head",
-    //   "Total W/O Tax", etc.) is intentional and matched exactly by
-    //   [JsonProperty("...")] in the DTOs. Collapsing them would make
-    //   ALL those fields deserialize as null.
     // ─────────────────────────────────────────────────────────
 
-    private static string SanitizeJson(string json)
+    private static string SanitizeJson(string raw)
     {
-        // "IndividualAH Battery1" → "IndividualAHBattery1"  (and 2–6)
-        json = System.Text.RegularExpressions.Regex.Replace(
-            json,
-            @"""IndividualAH Battery(\d+)""",
-            m => $@"""IndividualAHBattery{m.Groups[1].Value}"""
-        );
+        if (string.IsNullOrWhiteSpace(raw)) return raw;
 
-        return json;
+        // ── Pass 0: Fix embedded/unescaped quotes inside string VALUES ────
+        // FIX: the ERP sometimes emits values containing a raw " character,
+        // e.g. "IndividualAHBattery1":"12"AH" — the parser treats the quote
+        // after "12" as the string terminator and then chokes on the
+        // trailing AH". This was throwing out entire multi-year fetches
+        // (DJR/VSR/VDR/LOR) because ONE bad row anywhere in the payload
+        // failed the whole parse. This pass looks ahead past whitespace
+        // after every quote encountered inside a string: if the next
+        // significant character is one of , } ] : it's a real closing
+        // quote; otherwise it must be an embedded quote, so we escape it
+        // (\") and keep reading the string.
+        raw = FixUnescapedQuotes(raw);
+
+        // ── Pass 1: Remove literal control characters inside JSON strings ──
+        // The ERP API embeds raw \r \n \t and other control chars (0x00-0x1F)
+        // directly inside string values, which breaks the JSON parser.
+        // We scan char by char and strip them when inside a string literal.
+        var sb = new System.Text.StringBuilder(raw.Length);
+        bool inString = false;
+        bool escaped  = false;
+
+        for (int i = 0; i < raw.Length; i++)
+        {
+            char c = raw[i];
+
+            if (escaped)
+            {
+                sb.Append(c);
+                escaped = false;
+                continue;
+            }
+
+            if (c == '\\' && inString)
+            {
+                escaped = true;
+                sb.Append(c);
+                continue;
+            }
+
+            if (c == '"')
+            {
+                inString = !inString;
+                sb.Append(c);
+                continue;
+            }
+
+            // Drop bare control characters inside strings (0x00–0x1F except
+            // legitimate JSON whitespace outside strings)
+            if (inString && c < 0x20)
+            {
+                // Replace with a space so we don't corrupt adjacent words
+                sb.Append(' ');
+                continue;
+            }
+
+            sb.Append(c);
+        }
+
+        raw = sb.ToString();
+
+        // ── Pass 2: Fix spaced JSON keys (existing logic) ─────────────────
+        // e.g. "Dealer Code" → already handled by [JsonProperty("Dealer Code")]
+        // but some keys have extra whitespace around the colon
+        raw = System.Text.RegularExpressions.Regex.Replace(
+            raw, @"""(\w[\w\s]*?)""\s*:", m => $"\"{m.Groups[1].Value.Trim()}\":");
+
+        // ── Pass 3: Fix IndividualAH Battery → IndividualAHBattery ────────
+        raw = raw.Replace("IndividualAH Battery", "IndividualAHBattery");
+
+        return raw;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // FIX: escape stray embedded quotes inside JSON string values
+    // so a single malformed field doesn't corrupt the entire payload.
+    // ─────────────────────────────────────────────────────────
+    private static string FixUnescapedQuotes(string raw)
+    {
+        var sb = new System.Text.StringBuilder(raw.Length + 32);
+        bool inString = false;
+        bool escaped  = false;
+
+        for (int i = 0; i < raw.Length; i++)
+        {
+            char c = raw[i];
+
+            if (!inString)
+            {
+                sb.Append(c);
+                if (c == '"') inString = true;
+                continue;
+            }
+
+            if (escaped)
+            {
+                sb.Append(c);
+                escaped = false;
+                continue;
+            }
+
+            if (c == '\\')
+            {
+                escaped = true;
+                sb.Append(c);
+                continue;
+            }
+
+            if (c == '"')
+            {
+                // Look ahead past whitespace: a real closing quote is
+                // followed by , } ] or : (key/value separators/terminators).
+                // Anything else means this quote is embedded content, not
+                // a terminator — escape it and keep reading the string.
+                int j = i + 1;
+                while (j < raw.Length && char.IsWhiteSpace(raw[j])) j++;
+
+                bool looksLikeClose =
+                    j >= raw.Length ||
+                    raw[j] == ',' || raw[j] == '}' || raw[j] == ']' || raw[j] == ':';
+
+                if (looksLikeClose)
+                {
+                    inString = false;
+                    sb.Append(c);
+                }
+                else
+                {
+                    sb.Append("\\\"");
+                }
+                continue;
+            }
+
+            sb.Append(c);
+        }
+
+        return sb.ToString();
     }
 
     // ─────────────────────────────────────────────────────────
     // TOLERANT JSON DESERIALIZER
     //
-    // Fast path: standard JsonConvert — succeeds for well-formed responses.
-    // Slow path: JObject item-by-item with error suppression — used when
-    //   a single bad field (e.g. unescaped quote in a value) would
-    //   otherwise abort the entire response.
+    // FIX: the final catch used to log and return an empty list.
+    // Now it throws — so a genuinely malformed/unparseable response
+    // (distinct from "Valid=false" or "Value=[]", both of which
+    // return cleanly above) surfaces as a real failure to the caller.
     // ─────────────────────────────────────────────────────────
 
     private List<T> DeserializeTolerant<T>(
         string body, string url, int attempt, int maxRetries)
     {
-        // Always sanitize first — fixes the IndividualAH Battery key
         body = SanitizeJson(body);
 
-        // ── Fast path ────────────────────────────────────────
         try
         {
             var fastSettings = new JsonSerializerSettings
@@ -510,11 +749,10 @@ public class ErpApiService
         catch (JsonException firstEx)
         {
             _logger.LogWarning(
-                "LOR fast parse failed for {url}: {msg}. Trying tolerant parse.",
+                "Fast parse failed for {url}: {msg}. Trying tolerant parse.",
                 url, firstEx.Message);
         }
 
-        // ── Slow path: item-by-item with error suppression ───
         try
         {
             var root = JObject.Parse(body);
@@ -571,16 +809,14 @@ public class ErpApiService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex,
-                "Tolerant parse also failed for {url}. Returning empty.", url);
-            return new();
+            // FIX: throw instead of silently returning empty.
+            _logger.LogError(ex, "Tolerant parse also failed for {url}.", url);
+            throw new Exception($"JSON deserialization failed for {url}: {ex.Message}", ex);
         }
     }
 
     // ─────────────────────────────────────────────────────────
     // REQUEST BUILDERS
-    // Auth token is set per-request on the message, never on the
-    // shared HttpClient, so concurrent calls cannot collide.
     // ─────────────────────────────────────────────────────────
 
     private static HttpRequestMessage BuildPostRequest(

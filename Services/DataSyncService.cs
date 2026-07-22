@@ -1,4 +1,3 @@
-//Services\DataSyncService.cs
 using AutoGeniusSync.Data;
 using AutoGeniusSync.DTOs;
 using AutoGeniusSync.Models;
@@ -25,16 +24,6 @@ public class DataSyncService
         _logger = logger;
     }
 
-    // ─────────────────────────────────────────────────────────
-    // SHADOWFAX DEALER CODES FROM CONFIG
-    //
-    // WHY THIS EXISTS: some Shadowfax-onboarded dealer codes may
-    // not yet exist as rows in DMS_Dealers (e.g. sourced from
-    // another system, not yet returned by the pincode/dealer ERP
-    // API). Without this, LOR/VSR sync would silently skip them
-    // forever, even after adding them to ShadowfaxSettings:DealerCodes,
-    // because those syncs only iterate codes already in DMS_Dealers.
-    // ─────────────────────────────────────────────────────────
     private List<string> GetConfiguredShadowfaxDealerCodes()
         => _config.GetSection("ShadowfaxSettings:DealerCodes").Get<List<string>>() ?? new();
 
@@ -138,7 +127,8 @@ public class DataSyncService
     }
 
     // ─────────────────────────────────────────────────────────
-    // SYNC SERVICE HISTORY for a single date
+    // SYNC SERVICE HISTORY for a single date (kept for Reconcile,
+    // which needs to re-check individual stale dates one at a time)
     // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> SyncServiceHistoryForDateAsync(DateTime date)
@@ -230,50 +220,179 @@ public class DataSyncService
     }
 
     // ─────────────────────────────────────────────────────────
-    // HISTORICAL BACKFILL — service history
+    // SYNC SERVICE HISTORY — WIDE RANGE, ALL DEALERS IN ONE CALL
+    // ─────────────────────────────────────────────────────────
+
+    public async Task<SyncResult> SyncServiceHistoryForRangeAsync(DateTime startDate, DateTime endDate)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var log = new DmsSyncLog
+        {
+            SyncType  = "ServiceHistory",
+            SyncDate  = DateOnly.FromDateTime(endDate),
+            StartedAt = DateTime.UtcNow,
+            Status    = "Running"
+        };
+        db.DmsSyncLogs.Add(log);
+        await db.SaveChangesAsync();
+
+        var result = new SyncResult { SyncType = "ServiceHistory", Date = endDate };
+
+        try
+        {
+            var token = await _erpApi.GetValidTokenAsync();
+
+            _logger.LogInformation("DJR range sync: {from} → {to}",
+                startDate.ToString("dd-MM-yyyy"), endDate.ToString("dd-MM-yyyy"));
+
+            var jobs = await _erpApi.FetchDjrRangeAsync(startDate, endDate, token);
+            result.RecordsFetched = jobs.Count;
+
+            _logger.LogInformation("DJR range {from} → {to}: fetched {n} records",
+                startDate.ToString("dd-MM-yyyy"), endDate.ToString("dd-MM-yyyy"), jobs.Count);
+
+            var dedupedJobs = jobs
+                .Where(j => j.JobNo != "Total")
+                .Where(j => !string.IsNullOrEmpty(j.DealerCode) && !string.IsNullOrEmpty(j.JobNo))
+                .GroupBy(j => $"{j.DealerCode}|{j.JobNo}")
+                .Select(g => g.Last())
+                .ToList();
+
+            _logger.LogInformation("DJR range: {raw} raw → {dedup} after dedup", jobs.Count, dedupedJobs.Count);
+
+            var jobKeys = dedupedJobs.Select(j => $"{j.DealerCode}|{j.JobNo}").ToHashSet();
+            var existingRecords = await db.DmsServiceHistories
+                .Where(x => x.DealerCode != null && x.JobNo != null)
+                .ToListAsync();
+            var existingLookup = existingRecords
+                .Where(x => jobKeys.Contains($"{x.DealerCode}|{x.JobNo}"))
+                .ToDictionary(x => $"{x.DealerCode}|{x.JobNo}", x => x);
+
+            foreach (var job in dedupedJobs)
+            {
+                try
+                {
+                    var parsed = ParseServiceHistory(job);
+                    if (parsed.JobDate == null)
+                        parsed.JobDate = DateOnly.FromDateTime(endDate);
+
+                    var key = $"{parsed.DealerCode}|{parsed.JobNo}";
+
+                    if (existingLookup.TryGetValue(key, out var existing))
+                    {
+                        UpdateServiceHistory(existing, parsed);
+                        result.RecordsUpdated++;
+                    }
+                    else
+                    {
+                        db.DmsServiceHistories.Add(parsed);
+                        result.RecordsInserted++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("Skipping job {no} for {dc}: {msg}", job.JobNo, job.DealerCode, ex.Message);
+                }
+            }
+
+            await db.SaveChangesAsync();
+            log.Status = "Success";
+        }
+        catch (Exception ex)
+        {
+            log.Status       = "Failed";
+            log.ErrorMessage = ex.Message;
+            result.Error     = ex.Message;
+            _logger.LogError(ex, "DJR range sync failed for {from} → {to}",
+                startDate.ToShortDateString(), endDate.ToShortDateString());
+        }
+
+        log.CompletedAt     = DateTime.UtcNow;
+        log.RecordsFetched  = result.RecordsFetched;
+        log.RecordsInserted = result.RecordsInserted;
+        log.RecordsUpdated  = result.RecordsUpdated;
+        await db.SaveChangesAsync();
+
+        return result;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // HISTORICAL BACKFILL — service history (range-chunked, yearly)
+    // ─────────────────────────────────────────────────────────
+
+    // ─────────────────────────────────────────────────────────
+    // HISTORICAL BACKFILL — service history (range-chunked, yearly)
+    //
+    // FIX: now writes its own top-level DmsSyncLog row (SyncType =
+    // "BackfillHistorical") so SyncHostedService can check on startup
+    // whether a full backfill has ever completed successfully, instead
+    // of blindly re-running the entire historical backfill on every
+    // app restart (which was stacking concurrent backfills and causing
+    // the timeouts/contention visible in DMS_SyncLog).
     // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> BackfillHistoricalDataAsync(
         DateTime? fromDate = null, DateTime? toDate = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        bool forceResync = false)
     {
-        var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2022-01-01";
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var topLog = new DmsSyncLog
+        {
+            SyncType  = "BackfillHistorical",
+            StartedAt = DateTime.UtcNow,
+            Status    = "Running"
+        };
+        db.DmsSyncLogs.Add(topLog);
+        await db.SaveChangesAsync();
+
+        var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2020-01-01";
         var start = fromDate ?? DateTime.Parse(startDateStr);
         var end   = toDate   ?? DateTime.UtcNow.Date;
-        var today = DateTime.UtcNow.Date;
 
         var totalResult = new SyncResult { SyncType = "BackfillHistorical" };
-        _logger.LogInformation("Backfill: {start} → {end}",
+        _logger.LogInformation("Service History Backfill (range-based): {start} → {end}",
             start.ToShortDateString(), end.ToShortDateString());
 
-        var current = start;
-        while (current <= end && !ct.IsCancellationRequested)
+        try
         {
-            using var scope = _scopeFactory.CreateScope();
-            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-            bool alreadySynced = current != today && await db.DmsSyncLogs.AnyAsync(l =>
-                l.SyncType == "ServiceHistory" &&
-                l.SyncDate == DateOnly.FromDateTime(current) &&
-                l.Status   == "Success");
-
-            if (!alreadySynced)
+            var chunkStart = start;
+            while (chunkStart <= end && !ct.IsCancellationRequested)
             {
-                var r = await SyncServiceHistoryForDateAsync(current);
+                var chunkEnd = chunkStart.AddYears(1).AddDays(-1);
+                if (chunkEnd > end) chunkEnd = end;
+
+                var r = await SyncServiceHistoryForRangeAsync(chunkStart, chunkEnd);
                 totalResult.RecordsFetched  += r.RecordsFetched;
                 totalResult.RecordsInserted += r.RecordsInserted;
                 totalResult.RecordsUpdated  += r.RecordsUpdated;
-                _logger.LogInformation("Backfill {date}: +{ins} inserted, +{upd} updated",
-                    current.ToShortDateString(), r.RecordsInserted, r.RecordsUpdated);
-            }
-            else
-            {
-                _logger.LogDebug("Backfill {date}: already synced, skipping",
-                    current.ToShortDateString());
+
+                _logger.LogInformation("Service History Backfill chunk {from} → {to}: +{fet} fetched, +{ins} inserted, +{upd} updated",
+                    chunkStart.ToShortDateString(), chunkEnd.ToShortDateString(),
+                    r.RecordsFetched, r.RecordsInserted, r.RecordsUpdated);
+
+                chunkStart = chunkEnd.AddDays(1);
             }
 
-            current = current.AddDays(1);
+            topLog.Status = "Success";
         }
+        catch (Exception ex)
+        {
+            topLog.Status = "Failed";
+            topLog.ErrorMessage = ex.Message;
+            totalResult.Error = ex.Message;
+            _logger.LogError(ex, "Historical service history backfill failed");
+        }
+
+        topLog.CompletedAt = DateTime.UtcNow;
+        topLog.RecordsFetched  = totalResult.RecordsFetched;
+        topLog.RecordsInserted = totalResult.RecordsInserted;
+        topLog.RecordsUpdated  = totalResult.RecordsUpdated;
+        await db.SaveChangesAsync();
 
         return totalResult;
     }
@@ -329,7 +448,8 @@ public class DataSyncService
     }
 
     // ─────────────────────────────────────────────────────────
-    // SYNC VEHICLE SALES (VSR) for a single date
+    // SYNC VEHICLE SALES (VSR) for a single date (kept for
+    // manual single-day triggers via the controller)
     // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> SyncVehicleSalesForDateAsync(DateTime date)
@@ -353,23 +473,18 @@ public class DataSyncService
         {
             var token = await _erpApi.GetValidTokenAsync();
 
-            var dealerCodesFromDb = await db.DmsDealers
+            // FIX: no longer unioned with Shadowfax dealer codes here.
+            // GetConfiguredShadowfaxDealerCodes() is now used ONLY by
+            // SyncShadowfaxRealtimeAsync — this general VSR sync path
+            // just uses whatever dealers are already in DMS_Dealers.
+            var dealerCodes = await db.DmsDealers
                 .Where(d => d.DealerCode != null)
                 .Select(d => d.DealerCode!)
                 .Distinct()
                 .ToListAsync();
 
-            // ── FIX: always include configured Shadowfax dealer codes,
-            // even if they don't exist yet in DMS_Dealers ────────────
-            var shadowfaxCodes = GetConfiguredShadowfaxDealerCodes();
-
-            var dealerCodes = dealerCodesFromDb
-                .Union(shadowfaxCodes, StringComparer.OrdinalIgnoreCase)
-                .Distinct()
-                .ToList();
-
-            _logger.LogInformation("VSR sync for {date}: {n} dealers ({dbCount} from DB, {sfxCount} configured Shadowfax)",
-                date.ToString("dd-MM-yyyy"), dealerCodes.Count, dealerCodesFromDb.Count, shadowfaxCodes.Count);
+            _logger.LogInformation("VSR sync for {date}: {n} dealers",
+                date.ToString("dd-MM-yyyy"), dealerCodes.Count);
 
             foreach (var dealerCode in dealerCodes)
             {
@@ -441,42 +556,165 @@ public class DataSyncService
     }
 
     // ─────────────────────────────────────────────────────────
-    // HISTORICAL BACKFILL — vehicle sales
+    // SYNC VEHICLE SALES (VSR) — WIDE RANGE, ALL DEALERS IN ONE CALL
+    // ─────────────────────────────────────────────────────────
+
+    public async Task<SyncResult> SyncVehicleSalesForRangeAsync(DateTime startDate, DateTime endDate)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var log = new DmsSyncLog
+        {
+            SyncType  = "VehicleSales",
+            SyncDate  = DateOnly.FromDateTime(endDate),
+            StartedAt = DateTime.UtcNow,
+            Status    = "Running"
+        };
+        db.DmsSyncLogs.Add(log);
+        await db.SaveChangesAsync();
+
+        var result = new SyncResult { SyncType = "VehicleSales", Date = endDate };
+
+        try
+        {
+            var token = await _erpApi.GetValidTokenAsync();
+
+            _logger.LogInformation("VSR range sync: {from} → {to} (dealercode blank — all dealers in one call)",
+                startDate.ToString("dd-MM-yyyy"), endDate.ToString("dd-MM-yyyy"));
+
+            var sales = await _erpApi.FetchVsrAsync("", startDate, endDate, token);
+            result.RecordsFetched = sales.Count;
+
+            _logger.LogInformation("VSR range {from} → {to}: fetched {n} records",
+                startDate.ToString("dd-MM-yyyy"), endDate.ToString("dd-MM-yyyy"), sales.Count);
+
+            var dedupedSales = sales
+                .Where(s => !string.IsNullOrEmpty(s.InvoiceNo) && !string.IsNullOrEmpty(s.DealerCode))
+                .GroupBy(s => $"{s.DealerCode}|{s.InvoiceNo}")
+                .Select(g => g.Last())
+                .ToList();
+
+            _logger.LogInformation("VSR range: {raw} raw → {dedup} after dedup", sales.Count, dedupedSales.Count);
+
+            var invoiceKeys = dedupedSales.Select(s => $"{s.DealerCode}|{s.InvoiceNo}").ToHashSet();
+            var existingRecords = await db.DmsVehicleSales
+                .Where(x => x.DealerCode != null && x.InvoiceNo != null)
+                .ToListAsync();
+            var existingLookup = existingRecords
+                .Where(x => invoiceKeys.Contains($"{x.DealerCode}|{x.InvoiceNo}"))
+                .ToDictionary(x => $"{x.DealerCode}|{x.InvoiceNo}", x => x);
+
+            foreach (var sale in dedupedSales)
+            {
+                try
+                {
+                    var parsed = ParseVehicleSale(sale);
+                    var key = $"{parsed.DealerCode}|{parsed.InvoiceNo}";
+
+                    if (existingLookup.TryGetValue(key, out var existing))
+                    {
+                        UpdateVehicleSale(existing, parsed);
+                        result.RecordsUpdated++;
+                    }
+                    else
+                    {
+                        db.DmsVehicleSales.Add(parsed);
+                        result.RecordsInserted++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("Skipping invoice {no} for {dc}: {msg}",
+                        sale.InvoiceNo, sale.DealerCode, ex.Message);
+                }
+            }
+
+            await db.SaveChangesAsync();
+            log.Status = "Success";
+        }
+        catch (Exception ex)
+        {
+            log.Status       = "Failed";
+            log.ErrorMessage = ex.Message;
+            result.Error     = ex.Message;
+            _logger.LogError(ex, "VSR range sync failed for {from} → {to}",
+                startDate.ToShortDateString(), endDate.ToShortDateString());
+        }
+
+        log.CompletedAt     = DateTime.UtcNow;
+        log.RecordsFetched  = result.RecordsFetched;
+        log.RecordsInserted = result.RecordsInserted;
+        log.RecordsUpdated  = result.RecordsUpdated;
+        await db.SaveChangesAsync();
+
+        return result;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // HISTORICAL BACKFILL — vehicle sales (range-chunked, yearly)
     // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> BackfillVehicleSalesAsync(
         DateTime? fromDate = null, DateTime? toDate = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        bool forceResync = false)
     {
-        var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2022-01-01";
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var topLog = new DmsSyncLog
+        {
+            SyncType  = "BackfillVehicleSales",
+            StartedAt = DateTime.UtcNow,
+            Status    = "Running"
+        };
+        db.DmsSyncLogs.Add(topLog);
+        await db.SaveChangesAsync();
+
+        var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2020-01-01";
         var start = fromDate ?? DateTime.Parse(startDateStr);
         var end   = toDate   ?? DateTime.UtcNow.Date;
-        var today = DateTime.UtcNow.Date;
 
         var totalResult = new SyncResult { SyncType = "BackfillVehicleSales" };
-        _logger.LogInformation("VSR Backfill: {start} → {end}",
+        _logger.LogInformation("VSR Backfill (range-based): {start} → {end}",
             start.ToShortDateString(), end.ToShortDateString());
 
-        var current = start;
-        while (current <= end && !ct.IsCancellationRequested)
+        try
         {
-            using var scope = _scopeFactory.CreateScope();
-            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-            bool alreadySynced = current != today && await db.DmsSyncLogs.AnyAsync(l =>
-                l.SyncType == "VehicleSales" &&
-                l.SyncDate == DateOnly.FromDateTime(current) &&
-                l.Status   == "Success");
-
-            if (!alreadySynced)
+            var chunkStart = start;
+            while (chunkStart <= end && !ct.IsCancellationRequested)
             {
-                var r = await SyncVehicleSalesForDateAsync(current);
+                var chunkEnd = chunkStart.AddYears(1).AddDays(-1);
+                if (chunkEnd > end) chunkEnd = end;
+
+                var r = await SyncVehicleSalesForRangeAsync(chunkStart, chunkEnd);
                 totalResult.RecordsFetched  += r.RecordsFetched;
                 totalResult.RecordsInserted += r.RecordsInserted;
                 totalResult.RecordsUpdated  += r.RecordsUpdated;
+
+                _logger.LogInformation("VSR Backfill chunk {from} → {to}: +{fet} fetched, +{ins} inserted, +{upd} updated",
+                    chunkStart.ToShortDateString(), chunkEnd.ToShortDateString(),
+                    r.RecordsFetched, r.RecordsInserted, r.RecordsUpdated);
+
+                chunkStart = chunkEnd.AddDays(1);
             }
-            current = current.AddDays(1);
+
+            topLog.Status = "Success";
         }
+        catch (Exception ex)
+        {
+            topLog.Status = "Failed";
+            topLog.ErrorMessage = ex.Message;
+            totalResult.Error = ex.Message;
+            _logger.LogError(ex, "VSR historical backfill failed");
+        }
+
+        topLog.CompletedAt = DateTime.UtcNow;
+        topLog.RecordsFetched  = totalResult.RecordsFetched;
+        topLog.RecordsInserted = totalResult.RecordsInserted;
+        topLog.RecordsUpdated  = totalResult.RecordsUpdated;
+        await db.SaveChangesAsync();
 
         return totalResult;
     }
@@ -590,7 +828,96 @@ public class DataSyncService
     }
 
     // ─────────────────────────────────────────────────────────
-    // SYNC VEHICLE DISPATCHES for a single date
+    // SYNC VEHICLE DISPATCHES — WIDE RANGE, ALL DEALERS IN ONE CALL
+    // ─────────────────────────────────────────────────────────
+
+    public async Task<SyncResult> SyncVehicleDispatchesForRangeAsync(DateTime startDate, DateTime endDate)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var log = new DmsSyncLog
+        {
+            SyncType  = "VehicleDispatches",
+            SyncDate  = DateOnly.FromDateTime(endDate),
+            StartedAt = DateTime.UtcNow,
+            Status    = "Running"
+        };
+        db.DmsSyncLogs.Add(log);
+        await db.SaveChangesAsync();
+
+        var result = new SyncResult { SyncType = "VehicleDispatches", Date = endDate };
+
+        try
+        {
+            var token = await _erpApi.GetValidTokenAsync();
+            _logger.LogInformation("VDR range sync: {from} → {to}",
+                startDate.ToString("dd-MM-yyyy"), endDate.ToString("dd-MM-yyyy"));
+
+            var dispatches = await _erpApi.FetchVdrAsync(startDate, endDate, token);
+            result.RecordsFetched = dispatches.Count;
+
+            var deduped = dispatches
+                .Where(d => !string.IsNullOrEmpty(d.InvoiceNo))
+                .GroupBy(d => $"{d.InvoiceNo}|{d.ChassisNo}")
+                .Select(g => g.Last())
+                .ToList();
+
+            var dispatchKeys = deduped.Select(d => $"{d.InvoiceNo}|{d.ChassisNo}").ToHashSet();
+            var existingRecords = await db.DmsVehicleDispatches
+                .Where(x => x.InvoiceNo != null && x.ChassisNo != null)
+                .ToListAsync();
+            var existingLookup = existingRecords
+                .Where(x => dispatchKeys.Contains($"{x.InvoiceNo}|{x.ChassisNo}"))
+                .ToDictionary(x => $"{x.InvoiceNo}|{x.ChassisNo}", x => x);
+
+            foreach (var d in deduped)
+            {
+                try
+                {
+                    var parsed = MapVehicleDispatch(d);
+                    var key = $"{parsed.InvoiceNo}|{parsed.ChassisNo}";
+
+                    if (existingLookup.TryGetValue(key, out var existing))
+                    {
+                        UpdateVehicleDispatch(existing, parsed);
+                        result.RecordsUpdated++;
+                    }
+                    else
+                    {
+                        db.DmsVehicleDispatches.Add(parsed);
+                        result.RecordsInserted++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("Skipping dispatch {inv}/{ch}: {msg}", d.InvoiceNo, d.ChassisNo, ex.Message);
+                }
+            }
+
+            await db.SaveChangesAsync();
+            log.Status = "Success";
+        }
+        catch (Exception ex)
+        {
+            log.Status       = "Failed";
+            log.ErrorMessage = ex.Message;
+            result.Error     = ex.Message;
+            _logger.LogError(ex, "VDR range sync failed");
+        }
+
+        log.CompletedAt     = DateTime.UtcNow;
+        log.RecordsFetched  = result.RecordsFetched;
+        log.RecordsInserted = result.RecordsInserted;
+        log.RecordsUpdated  = result.RecordsUpdated;
+        await db.SaveChangesAsync();
+
+        return result;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // SYNC VEHICLE DISPATCHES for a single date (kept for manual
+    // single-day triggers via the controller)
     // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> SyncVehicleDispatchesForDateAsync(DateTime date)
@@ -676,64 +1003,83 @@ public class DataSyncService
     }
 
     // ─────────────────────────────────────────────────────────
-    // HISTORICAL BACKFILL — vehicle dispatches
+    // HISTORICAL BACKFILL — vehicle dispatches (range-chunked,
+    // yearly). ONLY ONE DEFINITION — the earlier duplicate day-by-day
+    // version has been removed; that was a compile error.
     // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> BackfillVehicleDispatchesAsync(
         DateTime? fromDate = null, DateTime? toDate = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        bool forceResync = false)
     {
-        var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2022-01-01";
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var topLog = new DmsSyncLog
+        {
+            SyncType  = "BackfillVehicleDispatches",
+            StartedAt = DateTime.UtcNow,
+            Status    = "Running"
+        };
+        db.DmsSyncLogs.Add(topLog);
+        await db.SaveChangesAsync();
+
+        var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2020-01-01";
         var start = fromDate ?? DateTime.Parse(startDateStr);
         var end   = toDate   ?? DateTime.UtcNow.Date;
-        var today = DateTime.UtcNow.Date;
 
         var totalResult = new SyncResult { SyncType = "BackfillVehicleDispatches" };
+        _logger.LogInformation("VDR Backfill (range-based): {start} → {end}",
+            start.ToShortDateString(), end.ToShortDateString());
 
-        var current = start;
-        while (current <= end && !ct.IsCancellationRequested)
+        try
         {
-            using var scope = _scopeFactory.CreateScope();
-            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-            bool alreadySynced = current != today && await db.DmsSyncLogs.AnyAsync(l =>
-                l.SyncType == "VehicleDispatches" &&
-                l.SyncDate == DateOnly.FromDateTime(current) &&
-                l.Status   == "Success");
-
-            if (!alreadySynced)
+            var chunkStart = start;
+            while (chunkStart <= end && !ct.IsCancellationRequested)
             {
-                var r = await SyncVehicleDispatchesForDateAsync(current);
+                var chunkEnd = chunkStart.AddYears(1).AddDays(-1);
+                if (chunkEnd > end) chunkEnd = end;
+
+                var r = await SyncVehicleDispatchesForRangeAsync(chunkStart, chunkEnd);
                 totalResult.RecordsFetched  += r.RecordsFetched;
                 totalResult.RecordsInserted += r.RecordsInserted;
                 totalResult.RecordsUpdated  += r.RecordsUpdated;
+
+                _logger.LogInformation("VDR Backfill chunk {from} → {to}: +{fet} fetched, +{ins} inserted, +{upd} updated",
+                    chunkStart.ToShortDateString(), chunkEnd.ToShortDateString(),
+                    r.RecordsFetched, r.RecordsInserted, r.RecordsUpdated);
+
+                chunkStart = chunkEnd.AddDays(1);
             }
 
-            current = current.AddDays(1);
+            topLog.Status = "Success";
         }
+        catch (Exception ex)
+        {
+            topLog.Status = "Failed";
+            topLog.ErrorMessage = ex.Message;
+            totalResult.Error = ex.Message;
+            _logger.LogError(ex, "VDR historical backfill failed");
+        }
+
+        topLog.CompletedAt = DateTime.UtcNow;
+        topLog.RecordsFetched  = totalResult.RecordsFetched;
+        topLog.RecordsInserted = totalResult.RecordsInserted;
+        topLog.RecordsUpdated  = totalResult.RecordsUpdated;
+        await db.SaveChangesAsync();
 
         return totalResult;
     }
 
     // ─────────────────────────────────────────────────────────
     // SYNC LINE ORDER REPORT (LOR)
-    //
-    // WHY THIS IS RANGE-BASED (not day-by-day like DJR):
-    //   The LOR API requires a dealercode per request.
-    //   It ignores single-day ranges and returns all records within
-    //   the date window. Day-by-day calls return 0 for almost every
-    //   dealer on any single day. We must pass a wide date range.
-    //
-    // FIX: removed ActiveStatus filter — DMS_Dealers may store
-    //   "Active", "1", "active" or NULL depending on pincode API.
-    //   Filtering by ActiveStatus silently returned 0 dealers.
-    //   Now we take ALL dealers with a non-null DealerCode.
     // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> SyncLineOrderReportAsync(
         DateTime startDate, DateTime endDate,
         CancellationToken ct = default,
-        List<string>? dealerCodesOverride = null)   // ← NEW parameter
+        List<string>? dealerCodesOverride = null)
     {
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -758,10 +1104,8 @@ public class DataSyncService
 
             if (dealerCodesOverride != null && dealerCodesOverride.Any())
             {
-                // ── NEW: restricted sync — only the given dealer codes,
-                // regardless of what's in DMS_Dealers or the full
-                // ShadowfaxSettings list. Used by the fast Shadowfax
-                // realtime sync so it never touches other dealers. ──
+                // Shadowfax-only realtime path — dealerCodesOverride comes from
+                // GetConfiguredShadowfaxDealerCodes() via SyncShadowfaxRealtimeAsync.
                 dealerCodes = dealerCodesOverride.Distinct().ToList();
 
                 _logger.LogInformation(
@@ -771,45 +1115,30 @@ public class DataSyncService
             }
             else
             {
-                // ── Original behavior: all dealers in DMS_Dealers,
-                // unioned with any configured Shadowfax codes not yet
-                // present locally ──────────────────────────────────
-                var dealerCodesFromDb = await db.DmsDealers
+                // FIX: general/full LOR sync path — no longer unioned with
+                // Shadowfax dealer codes. Just uses every dealer already in
+                // DMS_Dealers, same as every other report type.
+                dealerCodes = await db.DmsDealers
                     .Where(d => d.DealerCode != null)
                     .Select(d => d.DealerCode!)
                     .Distinct()
                     .ToListAsync();
 
-                var shadowfaxCodes = GetConfiguredShadowfaxDealerCodes();
-
-                dealerCodes = dealerCodesFromDb
-                    .Union(shadowfaxCodes, StringComparer.OrdinalIgnoreCase)
-                    .Distinct()
-                    .ToList();
-
-                if (shadowfaxCodes.Except(dealerCodesFromDb, StringComparer.OrdinalIgnoreCase).Any())
-                {
-                    _logger.LogInformation(
-                        "LOR sync: {n} configured Shadowfax dealer code(s) not yet in DMS_Dealers, syncing them anyway: {codes}",
-                        shadowfaxCodes.Except(dealerCodesFromDb, StringComparer.OrdinalIgnoreCase).Count(),
-                        string.Join(", ", shadowfaxCodes.Except(dealerCodesFromDb, StringComparer.OrdinalIgnoreCase)));
-                }
-
                 if (!dealerCodes.Any())
                 {
                     _logger.LogWarning(
-                        "LOR sync: no dealers found in DMS_Dealers or ShadowfaxSettings:DealerCodes. Run POST /api/sync/dealers first.");
+                        "LOR sync: no dealers found in DMS_Dealers. Run POST /api/sync/dealers first.");
                     log.Status       = "Failed";
-                    log.ErrorMessage = "No dealers in DMS_Dealers or configured Shadowfax codes. Run dealer sync first.";
+                    log.ErrorMessage = "No dealers in DMS_Dealers. Run dealer sync first.";
                     log.CompletedAt  = DateTime.UtcNow;
                     await db.SaveChangesAsync();
                     return result;
                 }
 
                 _logger.LogInformation(
-                    "LOR sync {from} → {to}: {n} dealers ({dbCount} from DB, {sfxCount} configured Shadowfax)",
+                    "LOR sync {from} → {to}: {n} dealers",
                     startDate.ToString("dd-MM-yyyy"), endDate.ToString("dd-MM-yyyy"),
-                    dealerCodes.Count, dealerCodesFromDb.Count, shadowfaxCodes.Count);
+                    dealerCodes.Count);
             }
 
             foreach (var dealerCode in dealerCodes)
@@ -894,20 +1223,9 @@ public class DataSyncService
         return result;
     }
 
-    // Thin wrapper — keeps SyncHostedService compatible
     public Task<SyncResult> SyncLineOrderReportForDateAsync(DateTime date)
         => SyncLineOrderReportAsync(date, date);
-    
 
-    // ─────────────────────────────────────────────────────────
-    // SHADOWFAX REALTIME SYNC — fast, restricted-scope LOR pull
-    //
-    // Only hits the small, curated set of Shadowfax dealer codes
-    // from ShadowfaxSettings:DealerCodes (currently the Magnemite
-    // Moto LLP dealers), over a short recent window. Safe to run
-    // every few minutes since it's just a handful of dealers,
-    // unlike the full LOR sync which iterates every dealer.
-    // ─────────────────────────────────────────────────────────
     public async Task<SyncResult> SyncShadowfaxRealtimeAsync(CancellationToken ct = default)
     {
         var shadowfaxCodes = GetConfiguredShadowfaxDealerCodes();
@@ -930,12 +1248,11 @@ public class DataSyncService
         return await SyncLineOrderReportAsync(from, today, ct, dealerCodesOverride: shadowfaxCodes);
     }
 
-    // Full historical backfill — one wide range call per dealer
     public async Task<SyncResult> BackfillLineOrderReportAsync(
         DateTime? fromDate = null, DateTime? toDate = null,
         CancellationToken ct = default)
     {
-        var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2022-01-01";
+        var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2020-01-01"; // was 2020-09-12
         var start = fromDate ?? DateTime.Parse(startDateStr);
         var end   = toDate   ?? DateTime.UtcNow.Date;
 
@@ -1228,7 +1545,7 @@ public class DataSyncService
         e.LocationCity = n.LocationCity; e.LocationStatus = n.LocationStatus;
         e.DealerName = n.DealerName; e.Zone = n.Zone; e.AreaOffice = n.AreaOffice;
         e.MfgYear = n.MfgYear; e.BrandName = n.BrandName; e.ModelCode = n.ModelCode;
-        e.ColorCode = n.ColorCode; e.RegNo = n.RegNo; e.MotorNo = n.MotorNo;
+        e.ColorCode = n.ColorCode;e.ChassisNo = n.ChassisNo;e.RegNo = n.RegNo; e.MotorNo = n.MotorNo;
         e.BatteryId = n.BatteryId; e.BatteryNo = n.BatteryNo;
         e.EcuSerialNo = n.EcuSerialNo; e.EcuImEi = n.EcuImEi; e.EcuBalMac = n.EcuBalMac;
         e.ImmoblizerNo = n.ImmoblizerNo; e.BikeSimId = n.BikeSimId;
@@ -1305,10 +1622,6 @@ public class DataSyncService
         e.Mrp = n.Mrp; e.DealerType = n.DealerType;
         e.UpdatedAt = DateTime.UtcNow;
     }
-
-    // ─────────────────────────────────────────────────────────
-    // SHARED PARSE HELPERS
-    // ─────────────────────────────────────────────────────────
 
     private static DateOnly? ParseDate(string? val)
     {

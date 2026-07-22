@@ -34,6 +34,7 @@ public partial class AppDbContext : DbContext
     public DbSet<DmsVehicleDispatch>  DmsVehicleDispatches  { get; set; }
     public DbSet<DmsCallCentreDealer> DmsCallCentreDealers  { get; set; }
     public DbSet<DmsLineOrderReport> DmsLineOrderReports { get; set; }
+    public DbSet<DmsShadowfaxChassisMaster> DmsShadowfaxChassisMasters { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -70,6 +71,12 @@ public partial class AppDbContext : DbContext
             entity.Property(e => e.LastFetchedAt).HasDefaultValueSql("(getutcdate())");
             entity.Property(e => e.PinCode).HasMaxLength(20);
             entity.Property(e => e.UpdatedAt).HasDefaultValueSql("(getutcdate())");
+            entity.Property(e => e.Email).HasMaxLength(300);
+            entity.Property(e => e.CityTier).HasMaxLength(20);
+            entity.Property(e => e.Source).HasMaxLength(50);
+            entity.Property(e => e.PreviousStatus).HasMaxLength(50);
+            entity.Property(e => e.ModifiedBy).HasMaxLength(200);
+            entity.Property(e => e.Remarks).HasMaxLength(1000);
         });
 
         modelBuilder.Entity<DmsPincodeMaster>(entity =>
@@ -409,6 +416,9 @@ public partial class AppDbContext : DbContext
             entity.HasIndex(v => v.ChassisNo);
 
             entity.HasIndex(v => v.LocationCode);
+
+            // NEW — fixes "No store type was specified for decimal property FinAmount"
+            entity.Property(v => v.FinAmount).HasColumnType("decimal(18, 2)");
         });
 
         modelBuilder.Entity<DmsCallCentreDealer>(entity =>
@@ -475,6 +485,43 @@ public partial class AppDbContext : DbContext
 
             entity.Property(e => e.CreatedAt).HasDefaultValueSql("(getutcdate())");
             entity.Property(e => e.UpdatedAt).HasDefaultValueSql("(getutcdate())");
+        });
+
+        modelBuilder.Entity<DmsShadowfaxChassisMaster>(entity =>
+        {
+            entity.ToTable("DMS_ShadowfaxChassisMaster");
+
+            entity.HasKey(e => e.Id)
+                .HasName("PK_DMS_ShadowfaxChassisMaster");
+
+            entity.HasIndex(e => e.ChassisNo)
+                .IsUnique()
+                .HasDatabaseName("UQ_ShadowfaxChassis");
+
+            entity.Property(e => e.VehicleId)
+                .HasMaxLength(50);
+
+            entity.Property(e => e.Model)
+                .HasMaxLength(200);
+
+            entity.Property(e => e.RegistrationNumber)
+                .HasMaxLength(50);
+
+            entity.Property(e => e.ChassisNo)
+                .HasMaxLength(100)
+                .IsRequired();
+
+            entity.Property(e => e.City)
+                .HasMaxLength(50);
+
+            entity.Property(e => e.VehicleStatus)
+                .HasMaxLength(50);
+
+            entity.Property(e => e.CreatedAt)
+                .HasDefaultValueSql("(getutcdate())");
+
+            entity.Property(e => e.UpdatedAt)
+                .HasDefaultValueSql("(getutcdate())");
         });
 
         OnModelCreatingPartial(modelBuilder);

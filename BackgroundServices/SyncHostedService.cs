@@ -1,4 +1,6 @@
+using AutoGeniusSync.Data;
 using AutoGeniusSync.Services;
+using Microsoft.EntityFrameworkCore;
 
 namespace AutoGeniusSync.BackgroundServices;
 
@@ -15,7 +17,7 @@ public class SyncHostedService : BackgroundService
     private DateTime _lastVehicleDispatches = DateTime.MinValue;
     private DateTime _lastLineOrderReport   = DateTime.MinValue;
     private DateTime _lastReconcile         = DateTime.MinValue;
-    private DateTime _lastShadowfaxRealtime = DateTime.MinValue;   // NEW
+    private DateTime _lastShadowfaxRealtime = DateTime.MinValue;
 
     public SyncHostedService(
         IServiceScopeFactory scopeFactory,
@@ -38,17 +40,63 @@ public class SyncHostedService : BackgroundService
             await RunDealerSyncAsync(ct);
             await RunCallCentreDealerSyncAsync(ct);
 
-            await RunBackfillAsync(ct);
-            await RunVehicleSalesBackfillAsync(ct);
-            await RunVehicleDispatchesBackfillAsync(ct);
+            // ─────────────────────────────────────────────────
+            // FIX: only run the full historical backfills if none
+            // of them have EVER completed successfully before.
+            // Previously this block ran unconditionally on every
+            // single app restart — and the DMS_SyncLog history showed
+            // dozens of overlapping, concurrent backfill runs against
+            // the same date ranges, causing timeouts and contention
+            // that (before the ErpApiService throw-fix) got silently
+            // recorded as "Success, 0 records" instead of failures.
+            // ─────────────────────────────────────────────────
+            using (var scope = _scopeFactory.CreateScope())
+            {
+                var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
-            await Task.Delay(TimeSpan.FromSeconds(30), ct);
-            await RunLineOrderBackfillAsync(ct);
+                bool serviceHistoryDone = await db.DmsSyncLogs.AnyAsync(l =>
+                    l.SyncType == "BackfillHistorical" && l.Status == "Success", ct);
+                bool vehicleSalesDone = await db.DmsSyncLogs.AnyAsync(l =>
+                    l.SyncType == "BackfillVehicleSales" && l.Status == "Success", ct);
+                bool vehicleDispatchesDone = await db.DmsSyncLogs.AnyAsync(l =>
+                    l.SyncType == "BackfillVehicleDispatches" && l.Status == "Success", ct);
+                bool lorDone = await db.DmsSyncLogs.AnyAsync(l =>
+                    l.SyncType == "LineOrderReport" && l.Status == "Success", ct);
+
+                // FIX: run all four historical backfills CONCURRENTLY instead of
+                // sequentially — each opens its own DB scope/connection already,
+                // and the pool (Max Pool Size=200) has plenty of headroom. This
+                // cuts wall-clock backfill time roughly 4x since the ERP calls
+                // for DJR/VSR/VDR/LOR are independent of each other.
+                var backfillTasks = new List<Task>();
+
+                if (!serviceHistoryDone)
+                    backfillTasks.Add(RunBackfillAsync(ct));
+                else
+                    _logger.LogInformation("Service history backfill already completed previously — skipping.");
+
+                if (!vehicleSalesDone)
+                    backfillTasks.Add(RunVehicleSalesBackfillAsync(ct));
+                else
+                    _logger.LogInformation("Vehicle sales backfill already completed previously — skipping.");
+
+                if (!vehicleDispatchesDone)
+                    backfillTasks.Add(RunVehicleDispatchesBackfillAsync(ct));
+                else
+                    _logger.LogInformation("Vehicle dispatches backfill already completed previously — skipping.");
+
+                if (!lorDone)
+                    backfillTasks.Add(RunLineOrderBackfillAsync(ct));
+                else
+                    _logger.LogInformation("LOR backfill already completed previously — skipping.");
+
+                if (backfillTasks.Any())
+                    await Task.WhenAll(backfillTasks);
+            }
 
             await Task.Delay(TimeSpan.FromSeconds(30), ct);
             await RunReconcileAsync(ct, lookbackDays: 730);
 
-            // NEW — kick off Shadowfax realtime sync immediately on startup too
             await RunShadowfaxRealtimeSyncAsync(ct);
 
         }, ct);
@@ -63,7 +111,7 @@ public class SyncHostedService : BackgroundService
         var vehicleDispatchMin     = _config.GetValue<int>("SyncSettings:VehicleDispatchIntervalMinutes", intervalMinutes);
         var lineOrderMin           = _config.GetValue<int>("SyncSettings:LineOrderIntervalMinutes",       intervalMinutes);
         var reconcileMin           = _config.GetValue<int>("SyncSettings:ReconcileIntervalMinutes",       1440);
-        var shadowfaxRealtimeMin   = _config.GetValue<int>("ShadowfaxSettings:RealtimeIntervalMinutes",   5);  // NEW
+        var shadowfaxRealtimeMin   = _config.GetValue<int>("ShadowfaxSettings:RealtimeIntervalMinutes",   5);
 
         while (!ct.IsCancellationRequested)
         {
@@ -112,7 +160,6 @@ public class SyncHostedService : BackgroundService
                 tasks.Add(RunReconcileAsync(ct, lookbackDays: 90));
             }
 
-            // NEW — fast, restricted-scope Shadowfax sync (every few minutes)
             if ((now - _lastShadowfaxRealtime).TotalMinutes >= shadowfaxRealtimeMin)
             {
                 _lastShadowfaxRealtime = now;
@@ -126,8 +173,6 @@ public class SyncHostedService : BackgroundService
             await Task.Delay(TimeSpan.FromMinutes(1), ct);
         }
     }
-
-    // ── Backfills ─────────────────────────────────────────────
 
     private async Task RunLineOrderBackfillAsync(CancellationToken ct)
     {
@@ -185,8 +230,6 @@ public class SyncHostedService : BackgroundService
         catch (Exception ex) { _logger.LogError(ex, "[Backfill] Vehicle dispatches error"); }
     }
 
-    // ── Realtime syncs ────────────────────────────────────────
-
     private async Task RunDealerSyncAsync(CancellationToken ct)
     {
         try
@@ -227,16 +270,14 @@ public class SyncHostedService : BackgroundService
         {
             var today     = DateTime.UtcNow.Date;
             var yesterday = today.AddDays(-1);
-            _logger.LogInformation("[Sync] Service history: {y} and {t}",
+            _logger.LogInformation("[Sync] Service history (range): {y} → {t}",
                 yesterday.ToShortDateString(), today.ToShortDateString());
 
             using var scope = _scopeFactory.CreateScope();
             var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
-            var r1 = await svc.SyncServiceHistoryForDateAsync(yesterday);
-            var r2 = await svc.SyncServiceHistoryForDateAsync(today);
-            _logger.LogInformation(
-                "[Sync] Service history — yesterday: {y_ins}ins/{y_upd}upd | today: {t_ins}ins/{t_upd}upd",
-                r1.RecordsInserted, r1.RecordsUpdated, r2.RecordsInserted, r2.RecordsUpdated);
+            var r = await svc.SyncServiceHistoryForRangeAsync(yesterday, today);
+            _logger.LogInformation("[Sync] Service history range: {fet} fetched, {ins} inserted, {upd} updated",
+                r.RecordsFetched, r.RecordsInserted, r.RecordsUpdated);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
@@ -250,16 +291,14 @@ public class SyncHostedService : BackgroundService
         {
             var today     = DateTime.UtcNow.Date;
             var yesterday = today.AddDays(-1);
-            _logger.LogInformation("[Sync] Vehicle sales: {y} and {t}",
+            _logger.LogInformation("[Sync] Vehicle sales (range): {y} → {t}",
                 yesterday.ToShortDateString(), today.ToShortDateString());
 
             using var scope = _scopeFactory.CreateScope();
             var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
-            var r1 = await svc.SyncVehicleSalesForDateAsync(yesterday);
-            var r2 = await svc.SyncVehicleSalesForDateAsync(today);
-            _logger.LogInformation(
-                "[Sync] VSR — yesterday: {y_ins}ins/{y_upd}upd | today: {t_ins}ins/{t_upd}upd",
-                r1.RecordsInserted, r1.RecordsUpdated, r2.RecordsInserted, r2.RecordsUpdated);
+            var r = await svc.SyncVehicleSalesForRangeAsync(yesterday, today);
+            _logger.LogInformation("[Sync] VSR range: {fet} fetched, {ins} inserted, {upd} updated",
+                r.RecordsFetched, r.RecordsInserted, r.RecordsUpdated);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
@@ -273,16 +312,14 @@ public class SyncHostedService : BackgroundService
         {
             var today     = DateTime.UtcNow.Date;
             var yesterday = today.AddDays(-1);
-            _logger.LogInformation("[Sync] Vehicle dispatches: {y} and {t}",
+            _logger.LogInformation("[Sync] Vehicle dispatches (range): {y} → {t}",
                 yesterday.ToShortDateString(), today.ToShortDateString());
 
             using var scope = _scopeFactory.CreateScope();
             var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
-            var r1 = await svc.SyncVehicleDispatchesForDateAsync(yesterday);
-            var r2 = await svc.SyncVehicleDispatchesForDateAsync(today);
-            _logger.LogInformation(
-                "[Sync] VDR — yesterday: {y_ins}ins/{y_upd}upd | today: {t_ins}ins/{t_upd}upd",
-                r1.RecordsInserted, r1.RecordsUpdated, r2.RecordsInserted, r2.RecordsUpdated);
+            var r = await svc.SyncVehicleDispatchesForRangeAsync(yesterday, today);
+            _logger.LogInformation("[Sync] VDR range: {fet} fetched, {ins} inserted, {upd} updated",
+                r.RecordsFetched, r.RecordsInserted, r.RecordsUpdated);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
@@ -328,7 +365,6 @@ public class SyncHostedService : BackgroundService
         catch (Exception ex) { _logger.LogError(ex, "[Sync] Reconcile error"); }
     }
 
-    // ── NEW: fast Shadowfax-only LOR sync ─────────────────────
     private async Task RunShadowfaxRealtimeSyncAsync(CancellationToken ct)
     {
         try

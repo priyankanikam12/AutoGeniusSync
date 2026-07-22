@@ -110,8 +110,13 @@ public class ServiceHistoryController : ControllerBase
         [FromQuery] int page = 1,
         [FromQuery] int pageSize = 100)
     {
+        var shadowfaxChassis = await _db.DmsShadowfaxChassisMasters
+            .Select(x => x.ChassisNo!)
+            .ToListAsync();
+        var chassisSet = new HashSet<string>(shadowfaxChassis);
+
         var query = _db.DmsServiceHistories
-            .Where(x => !x.IsRowTotal)
+            .Where(x => !x.IsRowTotal && x.ChassisNo != null && chassisSet.Contains(x.ChassisNo))
             .AsQueryable();
 
         if (!string.IsNullOrEmpty(chassisNo))

@@ -145,6 +145,33 @@ public class SyncController : ControllerBase
         return Ok(result);
     }
 
+    // POST /api/sync/service-history/debug-parse-range?from=2020-09-12&to=2021-09-12
+    // Surfaces the EXACT JSON parse failure (if any) for a DJR range —
+    // this is what DeserializeTolerant silently swallows in the real sync path.
+    [HttpPost("service-history/debug-parse-range")]
+    public async Task<IActionResult> DebugParseRangeDjr([FromQuery] DateTime from, [FromQuery] DateTime to, [FromServices] ErpApiService erpApi)
+    {
+        var token = await erpApi.GetValidTokenAsync();
+        var raw   = await erpApi.FetchRawDjrRangeAsync(from, to, token);
+        return Ok(erpApi.DebugParseRawJson<DjrValue>(raw));
+    }
+
+    [HttpPost("vsr/debug-parse-range")]
+    public async Task<IActionResult> DebugParseRangeVsr([FromQuery] DateTime from, [FromQuery] DateTime to, [FromServices] ErpApiService erpApi)
+    {
+        var token = await erpApi.GetValidTokenAsync();
+        var raw   = await erpApi.FetchRawVsrRangeAsync(from, to, token);
+        return Ok(erpApi.DebugParseRawJson<VsrValue>(raw));
+    }
+
+    [HttpPost("vdr/debug-parse-range")]
+    public async Task<IActionResult> DebugParseRangeVdr([FromQuery] DateTime from, [FromQuery] DateTime to, [FromServices] ErpApiService erpApi)
+    {
+        var token = await erpApi.GetValidTokenAsync();
+        var raw   = await erpApi.FetchRawVdrRangeAsync(from, to, token);
+        return Ok(erpApi.DebugParseRawJson<VdrValue>(raw));
+    }
+
     // ── POST /api/sync/service-history/range ────────────────
     [HttpPost("service-history/range")]
     public async Task<IActionResult> SyncRange([FromBody] DateRangeRequest req)
@@ -153,24 +180,15 @@ public class SyncController : ControllerBase
             !DateTime.TryParse(req.To,   out var to))
             return BadRequest(new { error = "Use yyyy-MM-dd format for both dates." });
 
-        if ((to - from).TotalDays > 365)
-            return BadRequest(new { error = "Max range is 365 days per request." });
-
-        _ = Task.Run(() => _sync.BackfillHistoricalDataAsync(from, to));
-        return Accepted(new
-        {
-            message = $"Backfill started for {from:dd-MM-yyyy} to {to:dd-MM-yyyy}",
-            from    = from.ToString("dd-MM-yyyy"),
-            to      = to.ToString("dd-MM-yyyy")
-        });
+        var result = await _sync.SyncServiceHistoryForRangeAsync(from, to);
+        return Ok(result);
     }
 
-    // ── POST /api/sync/backfill ──────────────────────────────
     [HttpPost("backfill")]
-    public IActionResult StartBackfill()
+    public IActionResult StartBackfill([FromQuery] bool forceResync = false)
     {
-        _ = Task.Run(() => _sync.BackfillHistoricalDataAsync());
-        return Accepted(new { message = "Full historical backfill started. Check /api/sync/status." });
+        _ = Task.Run(() => _sync.BackfillHistoricalDataAsync(forceResync: forceResync));
+        return Accepted(new { message = $"Full historical backfill started (range-based, forceResync={forceResync}). Check /api/sync/status." });
     }
 
     // ── POST /api/sync/refresh-token ────────────────────────
@@ -271,6 +289,17 @@ public class SyncController : ControllerBase
             result.RecordsUpdated,
             result.Error
         });
+    }
+
+    // POST /api/sync/service-history/debug-raw-range?from=2020-09-12&to=2021-09-12
+    [HttpPost("service-history/debug-raw-range")]
+    public async Task<IActionResult> DebugRawDjrRange(
+        [FromQuery] DateTime from, [FromQuery] DateTime to,
+        [FromServices] ErpApiService erpApi)
+    {
+        var token = await erpApi.GetValidTokenAsync();
+        var raw   = await erpApi.FetchRawDjrRangeAsync(from, to, token);
+        return Ok(new { Length = raw.Length, Preview = raw[..Math.Min(3000, raw.Length)] });
     }
 
     // ── POST /api/sync/shadowfax/realtime ────────────────────

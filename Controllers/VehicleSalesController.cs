@@ -129,18 +129,100 @@ public class VehicleSalesController : ControllerBase
             !DateTime.TryParse(req.To, out var to))
             return BadRequest(new { error = "Use yyyy-MM-dd for both dates." });
 
-        if ((to - from).TotalDays > 365)
-            return BadRequest(new { error = "Max range is 365 days." });
+        var result = await _sync.SyncVehicleSalesForRangeAsync(from, to);
+        return Ok(result);
+    }
 
-        _ = Task.Run(() => _sync.BackfillVehicleSalesAsync(from, to));
-        return Accepted(new { message = $"VSR backfill started: {from:dd-MM-yyyy} to {to:dd-MM-yyyy}" });
+    [HttpPost("backfill")]
+    public IActionResult StartBackfill([FromQuery] bool forceResync = false)
+    {
+        _ = Task.Run(() => _sync.BackfillVehicleSalesAsync(forceResync: forceResync));
+        return Accepted(new { message = $"Full VSR backfill started (range-based, forceResync={forceResync}). Check /api/sync/status." });
+    }
+
+    // POST /api/sync/vsr/debug?dealerCode=CUS0420&date=2026-06-09
+    [HttpPost("vsr/debug")]
+    public async Task<IActionResult> DebugVsr(
+        [FromQuery] string dealerCode,
+        [FromQuery] string date,
+        [FromServices] ErpApiService erpApi)
+    {
+        if (!DateTime.TryParse(date, out var parsed))
+            return BadRequest("Use yyyy-MM-dd");
+
+        var token   = await erpApi.GetValidTokenAsync();
+        var records = await erpApi.FetchVsrAsync(dealerCode, parsed, parsed, token);
+
+        return Ok(new
+        {
+            DealerCode   = dealerCode,
+            Date         = date,
+            TotalFetched = records.Count,
+            Sample       = records.Take(3).Select(r => new
+            {
+                r.DealerName,   // ← check if this is null
+                r.DealerCode,
+                r.InvoiceNo,
+                r.ChassisNo,
+                r.NetAmount
+            })
+        });
+    }
+
+    // POST /api/sync/vsr/debug-raw?dealerCode=CUS0420&date=2026-06-09
+    [HttpPost("vsr/debug-raw")]
+    public async Task<IActionResult> DebugVsrRaw(
+        [FromQuery] string dealerCode,
+        [FromQuery] string date,
+        [FromServices] ErpApiService erpApi)
+    {
+        if (!DateTime.TryParse(date, out var parsed))
+            return BadRequest("Use yyyy-MM-dd");
+
+        var token = await erpApi.GetValidTokenAsync();
+
+        // Raw fetch — bypass all deserialization
+        var url      = $"http://erpapi.autogeniuserp.com/V1/erpreport/vsr?ver=1.0";
+        var vendorId = 14;
+
+        var req = new
+        {
+            dealercode    = dealerCode,
+            vendorid      = vendorId,
+            startdate     = parsed.ToString("dd-MM-yyyy"),
+            enddate       = parsed.ToString("dd-MM-yyyy"),
+            subvendorcode = "",
+            dealerStatus  = "1",
+            aadharPanReq  = "0",
+            fameReq       = "2"
+        };
+
+        using var http    = new System.Net.Http.HttpClient();
+        using var request = new System.Net.Http.HttpRequestMessage(System.Net.Http.HttpMethod.Post, url)
+        {
+            Content = new System.Net.Http.StringContent(
+                Newtonsoft.Json.JsonConvert.SerializeObject(req),
+                System.Text.Encoding.UTF8,
+                "application/json")
+        };
+        request.Headers.TryAddWithoutValidation("Authorization", $"Token {token}");
+
+        var resp  = await http.SendAsync(request);
+        var bytes = await resp.Content.ReadAsByteArrayAsync();
+        var raw   = System.Text.Encoding.UTF8.GetString(bytes);
+
+        return Ok(new
+        {
+            Length  = raw.Length,
+            Preview = raw[..Math.Min(2000, raw.Length)]
+        });
     }
 
     // ── POST /api/vehiclesales/backfill ──────────────────────
-    [HttpPost("backfill")]
-    public IActionResult StartBackfill()
-    {
-        _ = Task.Run(() => _sync.BackfillVehicleSalesAsync());
-        return Accepted(new { message = "Full VSR backfill started. Check /api/sync/status." });
-    }
+    // [HttpPost("backfill")]
+    // public IActionResult StartBackfill()
+    // {
+    //     _ = Task.Run(() => _sync.BackfillVehicleSalesAsync());
+    //     return Accepted(new { message = "Full VSR backfill started. Check /api/sync/status." });
+    // }
 }

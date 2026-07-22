@@ -10,8 +10,6 @@ namespace AutoGeniusSync.DTOs
         public DateOnly? CompletionDate { get; set; }
         public string? RepairType { get; set; }
         public string? Status { get; set; }
-
-        // ── Fields that were missing ──────────────────────
         public string? DealerCode { get; set; }
         public string? DealerName { get; set; }
         public string? PartyName { get; set; }
