@@ -130,4 +130,6 @@ public partial class DmsServiceHistory
     // tries to write to it and it can never drift from InvoiceDate.
     [DatabaseGenerated(DatabaseGeneratedOption.Computed)]
     public string? JobStatus { get; set; }
+    public string? RowHash { get; set; }
+    public string? UniqueKey { get; set; }
 }

@@ -22,7 +22,6 @@ public class SyncController : ControllerBase
     }
 
     // ── GET /api/sync/status ─────────────────────────────────
-    // Controllers/SyncController.cs — replace GetStatus with this
     [HttpGet("status")]
     public async Task<IActionResult> GetStatus()
     {
@@ -32,8 +31,6 @@ public class SyncController : ControllerBase
             .AsNoTracking()
             .ToListAsync();
 
-        // NOLOCK via raw SQL — dashboard counts don't need to block on
-        // or be blocked by in-flight backfill writes to these tables.
         var totalServiceRecords = await GetApproxCountAsync("dbo.DMS_ServiceHistory");
         var totalDealers        = await GetApproxCountAsync("dbo.DMS_Dealers");
 
@@ -53,11 +50,6 @@ public class SyncController : ControllerBase
         });
     }
 
-    // Fast, non-blocking row count using sys.dm_db_partition_stats.
-    // This reads SQL Server's internal metadata (updated continuously by
-    // the engine) instead of scanning/locking the actual table — it never
-    // waits behind other transactions and returns in milliseconds even on
-    // huge tables under heavy write load.
     private async Task<long> GetApproxCountAsync(string tableName)
     {
         var conn = _db.Database.GetDbConnection();
@@ -65,12 +57,12 @@ public class SyncController : ControllerBase
             await conn.OpenAsync();
 
         using var cmd = conn.CreateCommand();
-        cmd.CommandTimeout = 10; // this must return fast — if it doesn't, something else is wrong
+        cmd.CommandTimeout = 10;
         cmd.CommandText = @"
             SELECT SUM(p.rows)
             FROM sys.partitions p
             WHERE p.object_id = OBJECT_ID(@tableName)
-            AND p.index_id IN (0, 1);"; // 0 = heap, 1 = clustered index
+            AND p.index_id IN (0, 1);";
 
         var param = cmd.CreateParameter();
         param.ParameterName = "@tableName";
@@ -81,12 +73,6 @@ public class SyncController : ControllerBase
         return result == DBNull.Value || result == null ? 0 : Convert.ToInt64(result);
     }
 
-    // ── POST /api/sync/service-history/debug-raw-djrn/{date} ───
-    /// <summary>
-    /// Returns raw DJRN JSON before deserialization, so we can confirm
-    /// whether its field names actually match DjrValue or need their own DTO.
-    /// date format: yyyy-MM-dd
-    /// </summary>
     [HttpPost("service-history/debug-raw-djrn/{date}")]
     public async Task<IActionResult> DebugRawDjrn(
         string date,
@@ -107,7 +93,6 @@ public class SyncController : ControllerBase
         });
     }
 
-    // ── POST /api/sync/dealers ───────────────────────────────
     [HttpPost("dealers")]
     public async Task<IActionResult> SyncDealers()
     {
@@ -116,7 +101,6 @@ public class SyncController : ControllerBase
         return Ok(result);
     }
 
-    // ── POST /api/sync/service-history/today ────────────────
     [HttpPost("service-history/today")]
     public async Task<IActionResult> SyncToday()
     {
@@ -124,7 +108,6 @@ public class SyncController : ControllerBase
         return Ok(result);
     }
 
-    // ── POST /api/sync/service-history/force-today ──────────
     [HttpPost("service-history/force-today")]
     public async Task<IActionResult> ForceSyncToday()
     {
@@ -133,8 +116,6 @@ public class SyncController : ControllerBase
         return Ok(result);
     }
 
-    // ── POST /api/sync/service-history/date/{date} ──────────
-    /// <summary>date format: yyyy-MM-dd e.g. 2024-06-01</summary>
     [HttpPost("service-history/date/{date}")]
     public async Task<IActionResult> SyncDate(string date)
     {
@@ -145,9 +126,6 @@ public class SyncController : ControllerBase
         return Ok(result);
     }
 
-    // POST /api/sync/service-history/debug-parse-range?from=2020-09-12&to=2021-09-12
-    // Surfaces the EXACT JSON parse failure (if any) for a DJR range —
-    // this is what DeserializeTolerant silently swallows in the real sync path.
     [HttpPost("service-history/debug-parse-range")]
     public async Task<IActionResult> DebugParseRangeDjr([FromQuery] DateTime from, [FromQuery] DateTime to, [FromServices] ErpApiService erpApi)
     {
@@ -172,7 +150,6 @@ public class SyncController : ControllerBase
         return Ok(erpApi.DebugParseRawJson<VdrValue>(raw));
     }
 
-    // ── POST /api/sync/service-history/range ────────────────
     [HttpPost("service-history/range")]
     public async Task<IActionResult> SyncRange([FromBody] DateRangeRequest req)
     {
@@ -191,7 +168,6 @@ public class SyncController : ControllerBase
         return Accepted(new { message = $"Full historical backfill started (range-based, forceResync={forceResync}). Check /api/sync/status." });
     }
 
-    // ── POST /api/sync/refresh-token ────────────────────────
     [HttpPost("refresh-token")]
     public async Task<IActionResult> RefreshToken([FromServices] ErpApiService erpApi)
     {
@@ -206,12 +182,6 @@ public class SyncController : ControllerBase
         }
     }
 
-    // ── POST /api/sync/service-history/debug/{date} ─────────
-    /// <summary>
-    /// Shows parsed field values after deserialization.
-    /// Use this to confirm DealerCode/JobNo are now populated after the SanitizeJson fix.
-    /// date format: yyyy-MM-dd
-    /// </summary>
     [HttpPost("service-history/debug/{date}")]
     public async Task<IActionResult> DebugDate(string date, [FromServices] ErpApiService erpApi)
     {
@@ -225,7 +195,6 @@ public class SyncController : ControllerBase
         var emptyJobNoCount  = jobs.Count(j => string.IsNullOrEmpty(j.JobNo));
         var bothEmptyCount   = jobs.Count(j => string.IsNullOrEmpty(j.DealerCode) && string.IsNullOrEmpty(j.JobNo));
 
-        // Show first 5 records with key fields so you can confirm mapping is working
         var sample = jobs.Take(5).Select(j => new
         {
             j.DealerCode,
@@ -246,13 +215,6 @@ public class SyncController : ControllerBase
         });
     }
 
-    // ── POST /api/sync/service-history/debug-raw/{date} ─────
-    /// <summary>
-    /// Returns the raw JSON string from the ERP API before any deserialization.
-    /// Use this if debug/{date} still shows empty fields — paste the output
-    /// here to see the actual property names the API is sending.
-    /// date format: yyyy-MM-dd
-    /// </summary>
     [HttpPost("service-history/debug-raw/{date}")]
     public async Task<IActionResult> DebugRaw(string date, [FromServices] ErpApiService erpApi)
     {
@@ -262,7 +224,6 @@ public class SyncController : ControllerBase
         var token   = await erpApi.GetValidTokenAsync();
         var rawJson = await erpApi.FetchRawDjrAsync(parsed, token);
 
-        // Return first 3000 chars — enough to see all property names in one record
         return Ok(new
         {
             Length       = rawJson.Length,
@@ -270,8 +231,6 @@ public class SyncController : ControllerBase
         });
     }
 
-    // POST /api/sync/lor/{date}
-    // Example: POST /api/sync/lor/2025-06-01
     [HttpPost("lor/{date}")]
     public async Task<IActionResult> TriggerLorSync(string date)
     {
@@ -291,7 +250,6 @@ public class SyncController : ControllerBase
         });
     }
 
-    // POST /api/sync/service-history/debug-raw-range?from=2020-09-12&to=2021-09-12
     [HttpPost("service-history/debug-raw-range")]
     public async Task<IActionResult> DebugRawDjrRange(
         [FromQuery] DateTime from, [FromQuery] DateTime to,
@@ -302,11 +260,152 @@ public class SyncController : ControllerBase
         return Ok(new { Length = raw.Length, Preview = raw[..Math.Min(3000, raw.Length)] });
     }
 
-    // ── POST /api/sync/shadowfax/realtime ────────────────────
-    // Manually trigger the fast, restricted Shadowfax-only LOR sync
-    // (only the dealer codes in ShadowfaxSettings:DealerCodes,
-    // over the last ShadowfaxSettings:LookbackDays days). This also
-    // runs automatically every ShadowfaxSettings:RealtimeIntervalMinutes.
+    // ─────────────────────────────────────────────────────────
+    // POST /api/sync/service-history/trace-count?from=2021-01-01&to=2021-01-31
+    //
+    // FIX: updated to use the SAME 4-part composite key as
+    // DataSyncService — DealerCode + JobNo + JobDate + ChassisNo —
+    // instead of the old DealerCode|JobNo pair. Previously this trace
+    // endpoint reported dedup/insert-vs-update numbers based on a key
+    // that no longer matches what the real sync path actually uses,
+    // so its "duplicate" and "would insert/update" figures were
+    // misleading once DataSyncService moved to the 4-part UniqueKey.
+    //
+    // Full pipeline trace for DJR — shows exactly where record count
+    // changes between the raw ERP response and what actually lands in
+    // DMS_ServiceHistory, without doing any inserts/updates (read-only).
+    // Use this to pinpoint whether loss happens at:
+    //   1) ERP raw fetch (network/timeout/ERP-side truncation)
+    //   2) JSON parse/sanitize (malformed records dropped)
+    //   3) Dedup (JobNo == "Total" rows, blank DealerCode/JobNo, or
+    //      duplicate DealerCode+JobNo+JobDate+ChassisNo combinations
+    //      collapsing multiple rows within the same fetched batch)
+    //   4) DB save (would-be inserts, not actually executed here —
+    //      "update" no longer applies since UniqueKey duplicates are
+    //      skipped, not merged)
+    // ─────────────────────────────────────────────────────────
+    [HttpPost("service-history/trace-count")]
+    public async Task<IActionResult> TraceServiceHistoryCount(
+        [FromQuery] DateTime from,
+        [FromQuery] DateTime to,
+        [FromServices] ErpApiService erpApi,
+        [FromServices] AppDbContext db)
+    {
+        var token = await erpApi.GetValidTokenAsync();
+
+        // Stage 1: raw response length, before any parsing
+        var raw = await erpApi.FetchRawDjrRangeAsync(from, to, token);
+        var rawLength = raw.Length;
+
+        // Stage 2: parsed count via the SAME code path production uses
+        List<AutoGeniusSync.DTOs.DjrValue> parsed;
+        string? parseError = null;
+        try
+        {
+            parsed = await erpApi.FetchDjrRangeAsync(from, to, token);
+        }
+        catch (Exception ex)
+        {
+            parsed = new();
+            parseError = ex.Message;
+        }
+
+        var totalParsed = parsed.Count;
+
+        // Stage 3a: drop the ERP's own "Total" summary rows
+        var afterTotalFilter = parsed.Where(j => j.JobNo != "Total").ToList();
+        var droppedAsTotal = totalParsed - afterTotalFilter.Count;
+
+        // Stage 3b: drop rows missing any part of the composite key.
+        // FIX: JobDate is now part of the key, so a record missing a
+        // parseable JobDate can't be uniquely identified either — it's
+        // now included in the "blank key" drop count, same as a blank
+        // DealerCode or JobNo would be. ChassisNo is checked too, since
+        // it's the 4th part of the key.
+        static DateOnly? ResolveJobDate(DjrValue j) =>
+            DateOnly.TryParse(j.JobDate, out var d) ? d : (DateOnly?)null;
+
+        var afterBlankFilter = afterTotalFilter
+            .Where(j => !string.IsNullOrEmpty(j.DealerCode)
+                     && !string.IsNullOrEmpty(j.JobNo)
+                     && !string.IsNullOrEmpty(j.ChassisNo)
+                     && ResolveJobDate(j) != null)
+            .ToList();
+        var droppedAsBlank = afterTotalFilter.Count - afterBlankFilter.Count;
+
+        // Stage 3c: dedup by the SAME 4-part key DataSyncService uses —
+        // DealerCode|JobNo|JobDate|ChassisNo — last-one-wins within batch.
+        var groupedByKey = afterBlankFilter
+            .GroupBy(j => BuildTraceKey(j.DealerCode, j.JobNo, ResolveJobDate(j), j.ChassisNo))
+            .ToList();
+
+        var dedupedJobs = groupedByKey.Select(g => g.Last()).ToList();
+        var droppedAsDuplicateKey = afterBlankFilter.Count - dedupedJobs.Count;
+
+        // Stage 4: how many of these composite keys ALREADY exist in DB.
+        // FIX: no more "would update" — an existing key means the record
+        // is an exact-combination duplicate and gets SKIPPED, not merged.
+        // Only genuinely new combinations count toward "would insert."
+        var candidateKeys = groupedByKey
+            .Select(g => BuildTraceKey(
+                dedupedJobs.First(j => BuildTraceKey(j.DealerCode, j.JobNo, ResolveJobDate(j), j.ChassisNo) == g.Key).DealerCode,
+                dedupedJobs.First(j => BuildTraceKey(j.DealerCode, j.JobNo, ResolveJobDate(j), j.ChassisNo) == g.Key).JobNo,
+                ResolveJobDate(dedupedJobs.First(j => BuildTraceKey(j.DealerCode, j.JobNo, ResolveJobDate(j), j.ChassisNo) == g.Key)),
+                dedupedJobs.First(j => BuildTraceKey(j.DealerCode, j.JobNo, ResolveJobDate(j), j.ChassisNo) == g.Key).ChassisNo))
+            .ToHashSet();
+
+        var existingKeys = await db.DmsServiceHistories
+            .Where(x => x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
+            .Select(x => x.UniqueKey!)
+            .ToListAsync();
+
+        var alreadyInDb = existingKeys.Distinct().Count();
+        var wouldInsert = dedupedJobs.Count - alreadyInDb;
+
+        var duplicateKeySamples = groupedByKey
+            .Where(g => g.Count() > 1)
+            .Take(10)
+            .Select(g => new
+            {
+                Key = g.Key,
+                CountInResponse = g.Count(),
+                JobDates = g.Select(x => x.JobDate).Distinct()
+            });
+
+        return Ok(new
+        {
+            DateRange = new { From = from.ToString("yyyy-MM-dd"), To = to.ToString("yyyy-MM-dd") },
+
+            Stage1_RawResponse = new { RawLength = rawLength },
+
+            Stage2_Parsed = new { TotalParsedFromErp = totalParsed, ParseError = parseError },
+
+            Stage3_Filtering = new
+            {
+                TotalParsed             = totalParsed,
+                DroppedAsRowTotal       = droppedAsTotal,
+                AfterRowTotalFilter     = afterTotalFilter.Count,
+                DroppedAsBlankKey       = droppedAsBlank,
+                AfterBlankKeyFilter     = afterBlankFilter.Count,
+                DroppedAsDuplicateKey   = droppedAsDuplicateKey,
+                FinalDedupedCount       = dedupedJobs.Count
+            },
+
+            Stage4_DbComparison = new
+            {
+                AlreadyInDbAsExactDuplicate = alreadyInDb,
+                WouldInsert                 = wouldInsert,
+                NetNewRecordsForDb          = wouldInsert
+            },
+
+            DuplicateKeySamples = duplicateKeySamples
+        });
+    }
+
+    // Mirrors DataSyncService.BuildUniqueKey exactly — keep these in
+    // sync if the key definition ever changes again.
+    private static string BuildTraceKey(string? dealerCode, string? jobNo, DateOnly? date, string? chassisNo)
+    => $"{dealerCode?.Trim().ToUpperInvariant()}{jobNo?.Trim().ToUpperInvariant()}{date?.ToString("yyyy-MM-dd")}{chassisNo?.Trim().ToUpperInvariant()}";
     [HttpPost("shadowfax/realtime")]
     public async Task<IActionResult> TriggerShadowfaxRealtime()
     {
@@ -322,11 +421,13 @@ public class SyncController : ControllerBase
         });
     }
 
-    // ── POST /api/sync/reconcile?lookbackDays=90 ─────────────
-    // Manually trigger the open-jobs reconciliation sweep.
-    // Use a large lookbackDays (e.g. 730) once, right after deploying
-    // the index fix, to catch historical open jobs that already
-    // closed on the ERP side but never got refreshed locally.
+    [HttpPost("dealers/bapl")]
+    public async Task<IActionResult> SyncDealersFromBapl()
+    {
+        var result = await _sync.SyncDealersFromBaplAsync();
+        return Ok(result);
+    }
+
     [HttpPost("reconcile")]
     public async Task<IActionResult> Reconcile([FromQuery] int lookbackDays = 90)
     {
@@ -342,14 +443,12 @@ public class SyncController : ControllerBase
         });
     }
 
-    // POST /api/sync/lor/backfill?from=2022-01-01&to=2026-06-09
     [HttpPost("lor/backfill")]
     public async Task<IActionResult> TriggerLorBackfill(
         [FromQuery] DateTime? from = null,
         [FromQuery] DateTime? to = null)
     {
         _logger.LogInformation("Manual LOR backfill {from} → {to}", from, to);
-        // Run in background — this can take a while across many dealers
         _ = Task.Run(() => _sync.BackfillLineOrderReportAsync(from, to));
         return Accepted(new
         {
@@ -357,7 +456,6 @@ public class SyncController : ControllerBase
         });
     }
 
-    // POST /api/sync/lor/range?from=2026-01-01&to=2026-06-09
     [HttpPost("lor/range")]
     public async Task<IActionResult> TriggerLorRange(
         [FromQuery] DateTime from,
@@ -374,7 +472,6 @@ public class SyncController : ControllerBase
         });
     }
 
-    // POST /api/sync/lor/debug?dealerCode=CUS0087&date=2026-04-01
     [HttpPost("lor/debug")]
     public async Task<IActionResult> DebugLor(
         [FromQuery] string dealerCode,
@@ -406,7 +503,6 @@ public class SyncController : ControllerBase
         });
     }
 
-    // In SyncController.cs — add this endpoint
     [HttpPost("lor/debug-raw")]
     public async Task<IActionResult> DebugLorRaw(
         [FromQuery] string dealerCode,

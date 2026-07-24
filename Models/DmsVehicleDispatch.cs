@@ -63,4 +63,6 @@ public partial class DmsVehicleDispatch
     public string? Vcu { get; set; }
     public DateTime? CreatedAt { get; set; }
     public DateTime? UpdatedAt { get; set; }
+    public string? RowHash { get; set; }
+    public string? UniqueKey { get; set; }
 }

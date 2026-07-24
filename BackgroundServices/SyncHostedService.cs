@@ -40,16 +40,6 @@ public class SyncHostedService : BackgroundService
             await RunDealerSyncAsync(ct);
             await RunCallCentreDealerSyncAsync(ct);
 
-            // ─────────────────────────────────────────────────
-            // FIX: only run the full historical backfills if none
-            // of them have EVER completed successfully before.
-            // Previously this block ran unconditionally on every
-            // single app restart — and the DMS_SyncLog history showed
-            // dozens of overlapping, concurrent backfill runs against
-            // the same date ranges, causing timeouts and contention
-            // that (before the ErpApiService throw-fix) got silently
-            // recorded as "Success, 0 records" instead of failures.
-            // ─────────────────────────────────────────────────
             using (var scope = _scopeFactory.CreateScope())
             {
                 var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -63,35 +53,35 @@ public class SyncHostedService : BackgroundService
                 bool lorDone = await db.DmsSyncLogs.AnyAsync(l =>
                     l.SyncType == "LineOrderReport" && l.Status == "Success", ct);
 
-                // FIX: run all four historical backfills CONCURRENTLY instead of
-                // sequentially — each opens its own DB scope/connection already,
-                // and the pool (Max Pool Size=200) has plenty of headroom. This
-                // cuts wall-clock backfill time roughly 4x since the ERP calls
-                // for DJR/VSR/VDR/LOR are independent of each other.
-                var backfillTasks = new List<Task>();
+                // ─────────────────────────────────────────────
+                // FIX: SEQUENTIAL, not concurrent. Running DJR/VSR/VDR
+                // backfills at the same time was firing simultaneous
+                // wide-range requests at the ERP, overwhelming it and
+                // causing all three to time out at 180s together
+                // (confirmed by DMS_SyncLog showing failures starting
+                // within the same second). This trades some wall-clock
+                // time for reliability.
+                // ─────────────────────────────────────────────
 
                 if (!serviceHistoryDone)
-                    backfillTasks.Add(RunBackfillAsync(ct));
+                    await RunBackfillAsync(ct);
                 else
                     _logger.LogInformation("Service history backfill already completed previously — skipping.");
 
                 if (!vehicleSalesDone)
-                    backfillTasks.Add(RunVehicleSalesBackfillAsync(ct));
+                    await RunVehicleSalesBackfillAsync(ct);
                 else
                     _logger.LogInformation("Vehicle sales backfill already completed previously — skipping.");
 
                 if (!vehicleDispatchesDone)
-                    backfillTasks.Add(RunVehicleDispatchesBackfillAsync(ct));
+                    await RunVehicleDispatchesBackfillAsync(ct);
                 else
                     _logger.LogInformation("Vehicle dispatches backfill already completed previously — skipping.");
 
                 if (!lorDone)
-                    backfillTasks.Add(RunLineOrderBackfillAsync(ct));
+                    await RunLineOrderBackfillAsync(ct);
                 else
                     _logger.LogInformation("LOR backfill already completed previously — skipping.");
-
-                if (backfillTasks.Any())
-                    await Task.WhenAll(backfillTasks);
             }
 
             await Task.Delay(TimeSpan.FromSeconds(30), ct);
@@ -102,7 +92,6 @@ public class SyncHostedService : BackgroundService
         }, ct);
 
         var intervalMinutes = _config.GetValue<int>("SyncSettings:RealtimeSyncIntervalMinutes", 30);
-        _logger.LogInformation("Realtime sync interval: every {min} minutes", intervalMinutes);
 
         var dealerIntervalMin      = _config.GetValue<int>("SyncSettings:DealerIntervalMinutes",          1440);
         var callCentreIntervalMin  = _config.GetValue<int>("SyncSettings:CallCentreIntervalMinutes",      1440);
@@ -169,7 +158,6 @@ public class SyncHostedService : BackgroundService
             if (tasks.Any())
                 await Task.WhenAll(tasks);
 
-            _logger.LogDebug("Sync loop sleeping 1 minute...");
             await Task.Delay(TimeSpan.FromMinutes(1), ct);
         }
     }
@@ -178,11 +166,10 @@ public class SyncHostedService : BackgroundService
     {
         try
         {
-            _logger.LogInformation("[Backfill] LOR starting...");
             using var scope = _scopeFactory.CreateScope();
             var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
             var r = await svc.BackfillLineOrderReportAsync(ct: ct);
-            _logger.LogInformation("[Backfill] LOR done: {ins} inserted", r.RecordsInserted);
+            _logger.LogInformation("[Backfill] LOR done: {ins} inserted, {upd} updated", r.RecordsInserted, r.RecordsUpdated);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { _logger.LogError(ex, "[Backfill] LOR error"); }
@@ -192,11 +179,10 @@ public class SyncHostedService : BackgroundService
     {
         try
         {
-            _logger.LogInformation("[Backfill] Service history starting...");
             using var scope = _scopeFactory.CreateScope();
             var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
             var r = await svc.BackfillHistoricalDataAsync(ct: ct);
-            _logger.LogInformation("[Backfill] Service history done: {ins} inserted", r.RecordsInserted);
+            _logger.LogInformation("[Backfill] Service history done: {ins} inserted, {upd} updated", r.RecordsInserted, r.RecordsUpdated);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { _logger.LogError(ex, "[Backfill] Service history error"); }
@@ -206,11 +192,10 @@ public class SyncHostedService : BackgroundService
     {
         try
         {
-            _logger.LogInformation("[Backfill] Vehicle sales starting...");
             using var scope = _scopeFactory.CreateScope();
             var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
             var r = await svc.BackfillVehicleSalesAsync(ct: ct);
-            _logger.LogInformation("[Backfill] Vehicle sales done: {ins} inserted", r.RecordsInserted);
+            _logger.LogInformation("[Backfill] Vehicle sales done: {ins} inserted, {upd} updated", r.RecordsInserted, r.RecordsUpdated);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { _logger.LogError(ex, "[Backfill] Vehicle sales error"); }
@@ -220,11 +205,10 @@ public class SyncHostedService : BackgroundService
     {
         try
         {
-            _logger.LogInformation("[Backfill] Vehicle dispatches starting...");
             using var scope = _scopeFactory.CreateScope();
             var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
             var r = await svc.BackfillVehicleDispatchesAsync(ct: ct);
-            _logger.LogInformation("[Backfill] Vehicle dispatches done: {ins} inserted", r.RecordsInserted);
+            _logger.LogInformation("[Backfill] Vehicle dispatches done: {ins} inserted, {upd} updated", r.RecordsInserted, r.RecordsUpdated);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { _logger.LogError(ex, "[Backfill] Vehicle dispatches error"); }
@@ -234,12 +218,10 @@ public class SyncHostedService : BackgroundService
     {
         try
         {
-            _logger.LogInformation("[Sync] Dealer sync starting...");
             using var scope = _scopeFactory.CreateScope();
             var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
             var r = await svc.SyncAllDealersAsync();
-            _logger.LogInformation("[Sync] Dealer: {ins} inserted, {upd} updated",
-                r.RecordsInserted, r.RecordsUpdated);
+            _logger.LogInformation("[Sync] Dealer: {ins} inserted, {upd} updated", r.RecordsInserted, r.RecordsUpdated);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
@@ -251,12 +233,10 @@ public class SyncHostedService : BackgroundService
     {
         try
         {
-            _logger.LogInformation("[Sync] CallCentre dealer sync starting...");
             using var scope = _scopeFactory.CreateScope();
             var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
             var r = await svc.SyncCallCentreDealersAsync();
-            _logger.LogInformation("[Sync] CallCentre dealers: {ins} inserted, {upd} updated",
-                r.RecordsInserted, r.RecordsUpdated);
+            _logger.LogInformation("[Sync] CallCentre dealers: {ins} inserted, {upd} updated", r.RecordsInserted, r.RecordsUpdated);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
@@ -270,9 +250,6 @@ public class SyncHostedService : BackgroundService
         {
             var today     = DateTime.UtcNow.Date;
             var yesterday = today.AddDays(-1);
-            _logger.LogInformation("[Sync] Service history (range): {y} → {t}",
-                yesterday.ToShortDateString(), today.ToShortDateString());
-
             using var scope = _scopeFactory.CreateScope();
             var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
             var r = await svc.SyncServiceHistoryForRangeAsync(yesterday, today);
@@ -291,9 +268,6 @@ public class SyncHostedService : BackgroundService
         {
             var today     = DateTime.UtcNow.Date;
             var yesterday = today.AddDays(-1);
-            _logger.LogInformation("[Sync] Vehicle sales (range): {y} → {t}",
-                yesterday.ToShortDateString(), today.ToShortDateString());
-
             using var scope = _scopeFactory.CreateScope();
             var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
             var r = await svc.SyncVehicleSalesForRangeAsync(yesterday, today);
@@ -312,9 +286,6 @@ public class SyncHostedService : BackgroundService
         {
             var today     = DateTime.UtcNow.Date;
             var yesterday = today.AddDays(-1);
-            _logger.LogInformation("[Sync] Vehicle dispatches (range): {y} → {t}",
-                yesterday.ToShortDateString(), today.ToShortDateString());
-
             using var scope = _scopeFactory.CreateScope();
             var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
             var r = await svc.SyncVehicleDispatchesForRangeAsync(yesterday, today);
@@ -333,16 +304,10 @@ public class SyncHostedService : BackgroundService
         {
             var today = DateTime.UtcNow.Date;
             var from  = today.AddDays(-30);
-
-            _logger.LogInformation("[Sync] LOR: {from} → {today}",
-                from.ToShortDateString(), today.ToShortDateString());
-
             using var scope = _scopeFactory.CreateScope();
             var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
             var r = await svc.SyncLineOrderReportAsync(from, today, ct);
-
-            _logger.LogInformation("[Sync] LOR: {ins} inserted, {upd} updated",
-                r.RecordsInserted, r.RecordsUpdated);
+            _logger.LogInformation("[Sync] LOR: {ins} inserted, {upd} updated", r.RecordsInserted, r.RecordsUpdated);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
@@ -354,12 +319,10 @@ public class SyncHostedService : BackgroundService
     {
         try
         {
-            _logger.LogInformation("[Sync] Reconcile open jobs starting (lookback {d}d)...", lookbackDays);
             using var scope = _scopeFactory.CreateScope();
             var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
             var r = await svc.ReconcileOpenJobsAsync(lookbackDays, ct);
-            _logger.LogInformation("[Sync] Reconcile done: {upd} updated, {ins} inserted",
-                r.RecordsUpdated, r.RecordsInserted);
+            _logger.LogInformation("[Sync] Reconcile done: {upd} updated, {ins} inserted", r.RecordsUpdated, r.RecordsInserted);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { _logger.LogError(ex, "[Sync] Reconcile error"); }
@@ -372,9 +335,7 @@ public class SyncHostedService : BackgroundService
             using var scope = _scopeFactory.CreateScope();
             var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
             var r = await svc.SyncShadowfaxRealtimeAsync(ct);
-            _logger.LogInformation(
-                "[Sync] Shadowfax realtime: {ins} inserted, {upd} updated",
-                r.RecordsInserted, r.RecordsUpdated);
+            _logger.LogInformation("[Sync] Shadowfax realtime: {ins} inserted, {upd} updated", r.RecordsInserted, r.RecordsUpdated);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) when (!ct.IsCancellationRequested)

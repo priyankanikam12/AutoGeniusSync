@@ -17,6 +17,22 @@ public class ErpApiService
     private readonly string _baseUrl;
     private readonly int _delayMs;
 
+    // ─────────────────────────────────────────────────────────
+    // FIX: application-wide throttle — only ONE ERP HTTP call executes
+    // at a time, regardless of how many sync methods, background tasks,
+    // or manually-triggered controller endpoints try to call the ERP
+    // concurrently (startup backfill sequence, curl-triggered backfills,
+    // periodic daily syncs, etc.). This is the root fix for the HTTP 503
+    // "service unavailable" and clustered 180s timeouts seen when
+    // multiple heavy full-range queries hit the ERP at the same time —
+    // a per-method sequential fix inside one caller (e.g.
+    // SyncHostedService) can't prevent this, since separate
+    // independently-triggered background tasks are not coordinated
+    // with each other at all. This semaphore is static so it is shared
+    // across every instance/scope of this service in the process.
+    // ─────────────────────────────────────────────────────────
+    private static readonly SemaphoreSlim _erpCallThrottle = new(1, 1);
+
     public ErpApiService(
         IHttpClientFactory httpFactory,
         IConfiguration config,
@@ -461,105 +477,126 @@ public class ErpApiService
     // ─────────────────────────────────────────────────────────
     // SHARED: POST with retry
     //
-    // FIX (critical): this used to swallow every failure — network
-    // errors, HTTP errors, and JSON parse errors alike — and return
-    // an empty list after logging a warning. That made a genuinely
-    // failed fetch indistinguishable from "the ERP really had zero
-    // records for this range," and the caller's SyncResult ended up
-    // marked Status=Success with RecordsFetched=0.
+    // FIX (critical, earlier): swallowed failures now throw instead of
+    // returning an empty list — see DeserializeTolerant.
     //
-    // Now: any exhausted-retry condition THROWS. The caller's own
-    // try/catch (already present in every Sync*ForRangeAsync method)
-    // will catch it, set log.Status="Failed", and store the real
-    // error message — so failures are now visible in DMS_SyncLog
-    // instead of silently masquerading as empty-but-successful runs.
+    // FIX (this pass): wrapped the ENTIRE method body in the global
+    // _erpCallThrottle semaphore so only one ERP HTTP call executes at
+    // a time across the whole app, no matter which sync method or
+    // background task/controller endpoint triggered it. Also added a
+    // longer, 503-specific backoff — an HTTP 503 means the ERP itself
+    // is telling us it's overloaded, so retrying quickly is likely to
+    // hit the same wall; back off harder (30s * attempt) than a normal
+    // failure (10s * attempt).
     // ─────────────────────────────────────────────────────────
 
     private async Task<List<T>> PostWithRetryAsync<T>(
         string url, object requestBody, string token, int maxRetries = 3)
     {
-        var timeoutSeconds = _config.GetValue<int>("AutoGeniusERP:HttpTimeoutSeconds", 120);
-        Exception? lastException = null;
-
-        for (int attempt = 1; attempt <= maxRetries; attempt++)
+        await _erpCallThrottle.WaitAsync();
+        try
         {
-            try
+            var timeoutSeconds = _config.GetValue<int>("AutoGeniusERP:HttpTimeoutSeconds", 120);
+            Exception? lastException = null;
+
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
             {
-                using var http    = _httpFactory.CreateClient("ErpApi");
-                using var request = BuildPostRequest(url, requestBody, token);
-                using var cts     = new CancellationTokenSource(
-                                        TimeSpan.FromSeconds(timeoutSeconds));
-
-                _logger.LogInformation(
-                    "Attempt {attempt}/{max} → POST {url} (timeout: {t}s)",
-                    attempt, maxRetries, url, timeoutSeconds);
-
-                var resp = await http.SendAsync(request, cts.Token);
-
-                var rawBytes = await resp.Content.ReadAsByteArrayAsync();
-                var body     = StripBomAndDecode(rawBytes);
-
-                if (!resp.IsSuccessStatusCode)
+                try
                 {
-                    _logger.LogWarning(
-                        "Attempt {attempt}/{max} got HTTP {code} from {url}",
-                        attempt, maxRetries, (int)resp.StatusCode, url);
+                    using var http    = _httpFactory.CreateClient("ErpApi");
+                    using var request = BuildPostRequest(url, requestBody, token);
+                    using var cts     = new CancellationTokenSource(
+                                            TimeSpan.FromSeconds(timeoutSeconds));
 
+                    _logger.LogInformation(
+                        "Attempt {attempt}/{max} → POST {url} (timeout: {t}s)",
+                        attempt, maxRetries, url, timeoutSeconds);
+
+                    var resp = await http.SendAsync(request, cts.Token);
+
+                    var rawBytes = await resp.Content.ReadAsByteArrayAsync();
+                    var body     = StripBomAndDecode(rawBytes);
+
+                    if (!resp.IsSuccessStatusCode)
+                    {
+                        _logger.LogWarning(
+                            "Attempt {attempt}/{max} got HTTP {code} from {url}",
+                            attempt, maxRetries, (int)resp.StatusCode, url);
+
+                        lastException = new Exception(
+                            $"HTTP {(int)resp.StatusCode}: " +
+                            $"{body[..Math.Min(200, body.Length)]}");
+
+                        if (attempt < maxRetries)
+                        {
+                            // FIX: back off harder specifically on 503 —
+                            // the ERP is explicitly telling us it's overloaded.
+                            var delaySeconds = (int)resp.StatusCode == 503
+                                ? attempt * 30
+                                : attempt * 10;
+
+                            _logger.LogWarning(
+                                "Backing off {delay}s before retry (status {code})",
+                                delaySeconds, (int)resp.StatusCode);
+
+                            await Task.Delay(TimeSpan.FromSeconds(delaySeconds));
+                            continue;
+                        }
+                        break;
+                    }
+
+                    return DeserializeTolerant<T>(body, url, attempt, maxRetries);
+                }
+                catch (OperationCanceledException)
+                {
                     lastException = new Exception(
-                        $"HTTP {(int)resp.StatusCode}: " +
-                        $"{body[..Math.Min(200, body.Length)]}");
+                        $"Request timed out after {timeoutSeconds}s");
+
+                    _logger.LogWarning(
+                        "Attempt {attempt}/{max} timed out for {url}. {rem} attempt(s) left.",
+                        attempt, maxRetries, url, maxRetries - attempt);
 
                     if (attempt < maxRetries)
-                    {
                         await Task.Delay(TimeSpan.FromSeconds(attempt * 10));
-                        continue;
-                    }
-                    break;
                 }
+                catch (HttpRequestException ex)
+                {
+                    lastException = ex;
+                    _logger.LogWarning(
+                        "Attempt {attempt}/{max} network error for {url}: {msg}",
+                        attempt, maxRetries, url, ex.Message);
 
-                return DeserializeTolerant<T>(body, url, attempt, maxRetries);
+                    if (attempt < maxRetries)
+                        await Task.Delay(TimeSpan.FromSeconds(attempt * 10));
+                }
+                catch (JsonException)
+                {
+                    // Bubble parse failures straight up — no point retrying
+                    // identical malformed content from the same request.
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex,
+                        "Attempt {attempt}/{max} unexpected error for {url}",
+                        attempt, maxRetries, url);
+                    throw;
+                }
             }
-            catch (OperationCanceledException)
-            {
-                lastException = new Exception(
-                    $"Request timed out after {timeoutSeconds}s");
 
-                _logger.LogWarning(
-                    "Attempt {attempt}/{max} timed out for {url}. {rem} attempt(s) left.",
-                    attempt, maxRetries, url, maxRetries - attempt);
-
-                if (attempt < maxRetries)
-                    await Task.Delay(TimeSpan.FromSeconds(attempt * 10));
-            }
-            catch (HttpRequestException ex)
-            {
-                lastException = ex;
-                _logger.LogWarning(
-                    "Attempt {attempt}/{max} network error for {url}: {msg}",
-                    attempt, maxRetries, url, ex.Message);
-
-                if (attempt < maxRetries)
-                    await Task.Delay(TimeSpan.FromSeconds(attempt * 10));
-            }
-            catch (JsonException)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex,
-                    "Attempt {attempt}/{max} unexpected error for {url}",
-                    attempt, maxRetries, url);
-                throw;
-            }
+            // FIX: throw instead of "return new()". A genuine empty-but-valid
+            // API response (Valid=true, Value=[]) already returns cleanly from
+            // DeserializeTolerant above and never reaches this line — so
+            // reaching here means every attempt genuinely failed.
+            throw new Exception(
+                $"All {maxRetries} attempts failed for {url}. Last error: {lastException?.Message}");
         }
-
-        // FIX: throw instead of "return new()". A genuine empty-but-valid
-        // API response (Valid=true, Value=[]) already returns cleanly from
-        // DeserializeTolerant above and never reaches this line — so
-        // reaching here means every attempt genuinely failed.
-        throw new Exception(
-            $"All {maxRetries} attempts failed for {url}. Last error: {lastException?.Message}");
+        finally
+        {
+            // FIX: always release, even on exception, so the next queued
+            // ERP call (from any other sync method or endpoint) can proceed.
+            _erpCallThrottle.Release();
+        }
     }
 
     // ─────────────────────────────────────────────────────────
@@ -583,6 +620,18 @@ public class ErpApiService
     private static string SanitizeJson(string raw)
     {
         if (string.IsNullOrWhiteSpace(raw)) return raw;
+
+        // ── Pass -1: Fix invalid JSON escape sequences (e.g. \H) ──────────
+        // FIX: the ERP occasionally emits a raw backslash followed by a
+        // character that isn't a valid JSON escape (only " \ / b f n r t u
+        // are valid) — usually inside the "Description" field (e.g. a path,
+        // dealer name, or note containing a literal backslash). This was
+        // killing the ENTIRE response with "Bad JSON escape sequence: \H"
+        // even when the rest of the payload (potentially tens of thousands
+        // of good records) was perfectly fine. Must run BEFORE
+        // FixUnescapedQuotes below, since an already-broken escape could
+        // otherwise be misread as a quote terminator.
+        raw = FixInvalidEscapes(raw);
 
         // ── Pass 0: Fix embedded/unescaped quotes inside string VALUES ────
         // FIX: the ERP sometimes emits values containing a raw " character,
@@ -654,6 +703,63 @@ public class ErpApiService
         raw = raw.Replace("IndividualAH Battery", "IndividualAHBattery");
 
         return raw;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // FIX: repair invalid JSON escape sequences like \H, \S, etc. by
+    // escaping the stray backslash itself, so a single malformed field
+    // doesn't invalidate the whole payload.
+    // ─────────────────────────────────────────────────────────
+    private static string FixInvalidEscapes(string raw)
+    {
+        var sb = new System.Text.StringBuilder(raw.Length + 32);
+        bool inString = false;
+
+        for (int i = 0; i < raw.Length; i++)
+        {
+            char c = raw[i];
+
+            if (!inString)
+            {
+                sb.Append(c);
+                if (c == '"') inString = true;
+                continue;
+            }
+
+            if (c == '"')
+            {
+                inString = false;
+                sb.Append(c);
+                continue;
+            }
+
+            if (c == '\\' && i + 1 < raw.Length)
+            {
+                char next = raw[i + 1];
+                bool isValidEscape =
+                    next == '"' || next == '\\' || next == '/' ||
+                    next == 'b' || next == 'f' || next == 'n' ||
+                    next == 'r' || next == 't' || next == 'u';
+
+                if (isValidEscape)
+                {
+                    sb.Append(c);
+                    sb.Append(next);
+                    i++; // consume both characters
+                }
+                else
+                {
+                    // Invalid escape (e.g. \H) — treat the backslash as
+                    // literal by escaping it, so \H becomes \\H.
+                    sb.Append("\\\\");
+                }
+                continue;
+            }
+
+            sb.Append(c);
+        }
+
+        return sb.ToString();
     }
 
     // ─────────────────────────────────────────────────────────
