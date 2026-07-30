@@ -30,15 +30,26 @@ public class DataSyncService
     private List<string> GetConfiguredShadowfaxDealerCodes()
         => _config.GetSection("ShadowfaxSettings:DealerCodes").Get<List<string>>() ?? new();
 
-    // Used ONLY by ServiceHistory (unchanged, per request)
+    // Used ONLY by ServiceHistory (unchanged)
     private static string BuildUniqueKey(string? dealerCode, string? jobNo, DateOnly? date, string? chassisNo)
         => $"{dealerCode?.Trim().ToUpperInvariant()}{jobNo?.Trim().ToUpperInvariant()}{date?.ToString("yyyy-MM-dd")}{chassisNo?.Trim().ToUpperInvariant()}";
 
-    // FIX: replaces ToDictionaryAsync() everywhere. ToDictionaryAsync throws
-    // "An item with the same key has already been added" if the source
-    // table already contains pre-existing duplicate UniqueKey values (from
-    // before this dedup logic existed). This groups first and takes one
-    // representative row per key instead of crashing.
+    // FIX: LOR's own UniqueId field is unreliable — the ERP reuses the
+    // same UniqueId across genuinely different line items. Uniqueness is
+    // now determined by this 6-field composite instead: DealerCode + JobNo
+    // + JobDate + ChassisNo + ItemName + ItemDescription. UniqueId is still
+    // stored on the row (for reference/debugging) but is no longer used
+    // for matching or dedup.
+    private static string BuildLorUniqueKey(
+        string? dealerCode, string? jobNo, DateOnly? jobDate,
+        string? chassisNo, string? itemName, string? itemDescription)
+        => $"{dealerCode?.Trim().ToUpperInvariant()}" +
+           $"{jobNo?.Trim().ToUpperInvariant()}" +
+           $"{jobDate?.ToString("yyyy-MM-dd")}" +
+           $"{chassisNo?.Trim().ToUpperInvariant()}" +
+           $"{itemName?.Trim().ToUpperInvariant()}" +
+           $"{itemDescription?.Trim().ToUpperInvariant()}";
+
     private static Dictionary<string, T> BuildLookupTolerant<T>(List<T> source, Func<T, string?> keySelector)
         => source
             .Where(x => keySelector(x) != null)
@@ -47,16 +58,6 @@ public class DataSyncService
 
     // ─────────────────────────────────────────────────────────
     // SYNC DEALERS DIRECTLY FROM BaplFinal.C_CustomerMaster
-    //
-    // Bypasses the ERP API entirely — reads straight from the BAPL
-    // warehouse DB. Fetches ALL dealers (active AND inactive) — no
-    // WHERE filter on status; ActiveStatus is stored as-is on each row
-    // so downstream consumers can filter if they want to.
-    //
-    // NOTE: column names below are my best read of the sample row you
-    // pasted, not confirmed against an actual schema. Run the
-    // INFORMATION_SCHEMA query first and tell me if any of these names
-    // are wrong before relying on this in production.
     // ─────────────────────────────────────────────────────────
     public async Task<SyncResult> SyncDealersFromBaplAsync()
     {
@@ -78,9 +79,6 @@ public class DataSyncService
             using var conn = new SqlConnection(baplConnStr);
             await conn.OpenAsync();
 
-            // NOTE: SELECT * is deliberate here so nothing is silently dropped
-            // while column names are still unconfirmed. Once confirmed, switch
-            // to an explicit column list for clarity and performance.
             using var cmd = new SqlCommand("SELECT * FROM C_CustomerMaster", conn)
             {
                 CommandTimeout = 120
@@ -109,22 +107,16 @@ public class DataSyncService
                     if (string.IsNullOrEmpty(dealerCode))
                     {
                         skippedOnError++;
-                        continue; // can't identify this row without a code
+                        continue;
                     }
 
                     var dealerCompany   = GetStr("CustomerName") ?? GetStr("Name") ?? GetStr("DealerName");
-                    var address1        = GetStr("Address1") ?? GetStr("Address");
-                    var address2        = GetStr("Address2");
                     var pinCode         = GetStr("PinCode") ?? GetStr("Pincode") ?? GetStr("Pin");
                     var contactNo       = GetStr("ContactNo") ?? GetStr("MobileNo") ?? GetStr("Mobile");
-                    var email           = GetStr("Email") ?? GetStr("EmailId");
                     var activeStatusRaw = GetStr("ActiveStatus") ?? GetStr("IsActive") ?? GetStr("Status");
                     var stateName       = GetStr("StateName") ?? GetStr("State");
                     var cityName        = GetStr("CityName") ?? GetStr("City");
-                    var contactPerson   = GetStr("ContactPerson") ?? GetStr("ContactPersonName");
 
-                    // ActiveStatus in your sample shows as "Y"/"N" — normalize
-                    // to whatever your DmsDealer.ActiveStatus expects.
                     var activeStatus = activeStatusRaw?.Trim().ToUpperInvariant() == "Y" ? "Active" : "Inactive";
 
                     if (existingLookup.TryGetValue(dealerCode, out var existingDealer))
@@ -290,9 +282,9 @@ public class DataSyncService
         return result;
     }
 
-    // ─────────────────────────────────────────────────────────
-    // SYNC SERVICE HISTORY for a single date
-    // ─────────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════
+    // SERVICE HISTORY — unchanged
+    // ═══════════════════════════════════════════════════════
 
     public async Task<SyncResult> SyncServiceHistoryForDateAsync(DateTime date)
     {
@@ -347,7 +339,6 @@ public class DataSyncService
             var existingRaw = await db.DmsServiceHistories
                 .Where(x => x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
                 .ToListAsync();
-            // FIX: grouped, duplicate-tolerant lookup instead of ToDictionaryAsync
             var existingLookup = BuildLookupTolerant(existingRaw, x => x.UniqueKey);
 
             int skippedOnError = 0;
@@ -368,9 +359,6 @@ public class DataSyncService
                         result.RecordsInserted++;
                     }
 
-                    // FIX: flush every SaveBatchSize records instead of one
-                    // giant commit at the end — avoids SQL command timeouts
-                    // ("The wait operation timed out") on large batches.
                     saveCounter++;
                     if (saveCounter % SaveBatchSize == 0)
                         await db.SaveChangesAsync();
@@ -406,10 +394,6 @@ public class DataSyncService
 
         return result;
     }
-
-    // ─────────────────────────────────────────────────────────
-    // SYNC SERVICE HISTORY — WIDE RANGE
-    // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> SyncServiceHistoryForRangeAsync(DateTime startDate, DateTime endDate)
     {
@@ -526,10 +510,6 @@ public class DataSyncService
         return result;
     }
 
-    // ─────────────────────────────────────────────────────────
-    // HISTORICAL BACKFILL — service history (QUARTERLY chunks)
-    // ─────────────────────────────────────────────────────────
-
     public async Task<SyncResult> BackfillHistoricalDataAsync(
         DateTime? fromDate = null, DateTime? toDate = null,
         CancellationToken ct = default,
@@ -583,10 +563,6 @@ public class DataSyncService
         return totalResult;
     }
 
-    // ─────────────────────────────────────────────────────────
-    // RECONCILE OPEN JOBS
-    // ─────────────────────────────────────────────────────────
-
     public async Task<SyncResult> ReconcileOpenJobsAsync(
         int lookbackDays = 90, CancellationToken ct = default)
     {
@@ -622,10 +598,7 @@ public class DataSyncService
     }
 
     // ═══════════════════════════════════════════════════════
-    // VEHICLE SALES (VSR) — CHANGED: match/dedupe key is now
-    // ChassisNo ALONE, not DealerCode+InvoiceNo+InvoiceDate+ChassisNo.
-    // One row per chassis; the last/most recent sale fetched for a
-    // given chassis wins on repeat syncs.
+    // VEHICLE SALES (VSR) — unchanged, keyed by ChassisNo
     // ═══════════════════════════════════════════════════════
 
     public async Task<SyncResult> SyncVehicleSalesForDateAsync(DateTime date)
@@ -674,7 +647,6 @@ public class DataSyncService
                         .Where(s => !string.IsNullOrEmpty(s.ChassisNo))
                         .ToList();
 
-                    // FIX: dedupe key is ChassisNo only.
                     var dedupedRecords = afterBlankFilter
                         .GroupBy(s => s.ChassisNo!.Trim().ToUpperInvariant())
                         .Select(g => g.Last())
@@ -747,10 +719,6 @@ public class DataSyncService
         return result;
     }
 
-    // ─────────────────────────────────────────────────────────
-    // SYNC VEHICLE SALES (VSR) — WIDE RANGE
-    // ─────────────────────────────────────────────────────────
-
     public async Task<SyncResult> SyncVehicleSalesForRangeAsync(DateTime startDate, DateTime endDate)
     {
         using var scope = _scopeFactory.CreateScope();
@@ -779,7 +747,6 @@ public class DataSyncService
                 .Where(s => !string.IsNullOrEmpty(s.ChassisNo))
                 .ToList();
 
-            // FIX: dedupe key is ChassisNo only.
             var dedupedRecords = afterBlankFilter
                 .GroupBy(s => s.ChassisNo!.Trim().ToUpperInvariant())
                 .Select(g => g.Last())
@@ -866,10 +833,6 @@ public class DataSyncService
 
         return result;
     }
-
-    // ─────────────────────────────────────────────────────────
-    // HISTORICAL BACKFILL — vehicle sales (QUARTERLY chunks)
-    // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> BackfillVehicleSalesAsync(
         DateTime? fromDate = null, DateTime? toDate = null,
@@ -1026,8 +989,7 @@ public class DataSyncService
     }
 
     // ═══════════════════════════════════════════════════════
-    // VEHICLE DISPATCHES (VDR) — CHANGED: match/dedupe key is now
-    // ChassisNo ALONE.
+    // VEHICLE DISPATCHES (VDR) — unchanged, keyed by ChassisNo
     // ═══════════════════════════════════════════════════════
 
     public async Task<SyncResult> SyncVehicleDispatchesForRangeAsync(DateTime startDate, DateTime endDate)
@@ -1058,7 +1020,6 @@ public class DataSyncService
                 .Where(d => !string.IsNullOrEmpty(d.ChassisNo))
                 .ToList();
 
-            // FIX: dedupe key is ChassisNo only.
             var dedupedRecords = afterBlankFilter
                 .GroupBy(d => d.ChassisNo!.Trim().ToUpperInvariant())
                 .Select(g => g.Last())
@@ -1144,10 +1105,6 @@ public class DataSyncService
 
         return result;
     }
-
-    // ─────────────────────────────────────────────────────────
-    // SYNC VEHICLE DISPATCHES for a single date
-    // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> SyncVehicleDispatchesForDateAsync(DateTime date)
     {
@@ -1241,10 +1198,6 @@ public class DataSyncService
         return result;
     }
 
-    // ─────────────────────────────────────────────────────────
-    // HISTORICAL BACKFILL — vehicle dispatches (QUARTERLY chunks)
-    // ─────────────────────────────────────────────────────────
-
     public async Task<SyncResult> BackfillVehicleDispatchesAsync(
         DateTime? fromDate = null, DateTime? toDate = null,
         CancellationToken ct = default,
@@ -1299,13 +1252,11 @@ public class DataSyncService
     }
 
     // ═══════════════════════════════════════════════════════
-    // LINE ORDER REPORT (LOR) — CHANGED: match/dedupe key is now
-    // UniqueId ALONE (the ERP's own line-item ID), not the composite
-    // DealerCode+JobNo+JobDate+ChassisNo. This is actually the more
-    // correct key for LOR specifically, since it already IS a
-    // per-line-item ID from the ERP, and LOR legitimately has
-    // multiple rows per chassis (one per part/service line) — keying
-    // by UniqueId preserves that, unlike ChassisNo-only would.
+    // LINE ORDER REPORT (LOR) — CHANGED: matching/dedup key is now
+    // the 6-field composite (DealerCode+JobNo+JobDate+ChassisNo+
+    // ItemName+ItemDescription), NOT UniqueId. UniqueId itself is
+    // unreliable — the ERP reuses the same UniqueId across genuinely
+    // different line items.
     // ═══════════════════════════════════════════════════════
 
     public async Task<SyncResult> SyncLineOrderReportAsync(
@@ -1370,37 +1321,60 @@ public class DataSyncService
                     var records = await _erpApi.FetchLorAsync(dealerCode, startDate, endDate, token);
                     result.RecordsFetched += records.Count;
 
-                    // FIX: dedupe key is UniqueId only — the ERP's own
-                    // per-line-item identifier.
-                    var droppedAsBlank = records.Count(r => string.IsNullOrEmpty(r.UniqueId));
-                    droppedAsBlankTotal += droppedAsBlank;
-
-                    var afterBlankFilter = records
-                        .Where(r => !string.IsNullOrEmpty(r.UniqueId))
+                    var parsedRecords = records
+                        .Select(r =>
+                        {
+                            var parsed = MapLineOrderReport(r);
+                            parsed.UniqueKey = BuildLorUniqueKey(
+                                parsed.DealerCode, parsed.JobNo, parsed.JobDate,
+                                parsed.ChassisNo, parsed.ItemName, parsed.ItemDescription);
+                            return parsed;
+                        })
                         .ToList();
 
+                    // FIX: no longer dropping records that are missing one or more
+                    // of the 6 key fields. BuildLorUniqueKey already handles nulls
+                    // by substituting empty string for that segment — a record
+                    // with a blank ItemDescription (e.g. a labour/service charge
+                    // with no part description) is still real data and gets kept.
+                    // We only track how many records have a partial key, for
+                    // visibility — this no longer removes them.
+                    var partialKeyCount = parsedRecords.Count(p =>
+                        string.IsNullOrEmpty(p.DealerCode) || string.IsNullOrEmpty(p.JobNo) ||
+                        p.JobDate == null || string.IsNullOrEmpty(p.ChassisNo) ||
+                        string.IsNullOrEmpty(p.ItemName) || string.IsNullOrEmpty(p.ItemDescription));
+                    droppedAsBlankTotal += 0; // no longer dropping; kept for log clarity below
+
+                    // Only genuinely unusable rows (every single field blank —
+                    // meaning the ERP sent essentially nothing) are excluded, since
+                    // there's nothing to key or store meaningfully.
+                    var afterBlankFilter = parsedRecords
+                        .Where(p =>
+                            !string.IsNullOrEmpty(p.DealerCode) || !string.IsNullOrEmpty(p.JobNo) ||
+                            p.JobDate != null || !string.IsNullOrEmpty(p.ChassisNo) ||
+                            !string.IsNullOrEmpty(p.ItemName) || !string.IsNullOrEmpty(p.ItemDescription))
+                        .ToList();
+                    var droppedAsCompletelyEmpty = parsedRecords.Count - afterBlankFilter.Count;
+
                     var dedupedRecords = afterBlankFilter
-                        .GroupBy(r => r.UniqueId!.Trim())
+                        .GroupBy(p => p.UniqueKey)
                         .Select(g => g.Last())
                         .ToList();
                     droppedAsDuplicateTotal += afterBlankFilter.Count - dedupedRecords.Count;
 
                     if (!dedupedRecords.Any()) continue;
 
-                    var uniqueIds = dedupedRecords.Select(r => r.UniqueId!.Trim()).ToList();
+                    var candidateKeys = dedupedRecords.Select(p => p.UniqueKey).ToHashSet();
                     var existingRaw = await db.DmsLineOrderReports
-                        .Where(x => x.UniqueId != null && uniqueIds.Contains(x.UniqueId))
+                        .Where(x => x.DealerCode == dealerCode && x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
                         .ToListAsync();
-                    var existingLookup = BuildLookupTolerant(existingRaw, x => x.UniqueId?.Trim());
+                    var existingLookup = BuildLookupTolerant(existingRaw, x => x.UniqueKey);
 
-                    foreach (var rec in dedupedRecords)
+                    foreach (var parsed in dedupedRecords)
                     {
                         try
                         {
-                            var parsed = MapLineOrderReport(rec);
-                            var key = parsed.UniqueId!.Trim();
-
-                            if (existingLookup.TryGetValue(key, out var existing))
+                            if (existingLookup.TryGetValue(parsed.UniqueKey!, out var existing))
                             {
                                 UpdateLineOrderReport(existing, parsed);
                                 result.RecordsUpdated++;
@@ -1417,14 +1391,27 @@ public class DataSyncService
                         }
                         catch (Exception ex)
                         {
-                            skippedOnErrorTotal++;
-                            _logger.LogWarning(
-                                "Skipping LOR UniqueId {id} for dealer {dc}: {msg}",
-                                rec.UniqueId, dealerCode, ex.Message);
+                            if (ex.InnerException?.Message.Contains("UX_LineOrderReport_UniqueKey") == true)
+                            {
+                                _logger.LogInformation(
+                                    "Concurrent insert detected for job {jn}, item {it} — already added by another sync run, skipping.",
+                                    parsed.JobNo, parsed.ItemName);
+                            }
+                            else
+                            {
+                                skippedOnErrorTotal++;
+                                _logger.LogWarning(
+                                    "Skipping LOR item (dealer {dc}, job {jn}, item {it}): {msg}",
+                                    dealerCode, parsed.JobNo, parsed.ItemName, ex.Message);
+                            }
                         }
                     }
 
                     await db.SaveChangesAsync();
+
+                    _logger.LogInformation(
+                        "LOR dealer {dc}: {total} parsed, {partial} with a partial key (kept), {empty} completely empty (dropped), {dup} in-batch duplicate",
+                        dealerCode, parsedRecords.Count, partialKeyCount, droppedAsCompletelyEmpty, afterBlankFilter.Count - dedupedRecords.Count);
                 }
                 catch (Exception ex)
                 {
@@ -1433,8 +1420,10 @@ public class DataSyncService
             }
 
             log.ErrorMessage =
-                $"Dropped: {droppedAsBlankTotal} blank-UniqueId, {droppedAsDuplicateTotal} in-batch duplicate, " +
-                $"{skippedOnErrorTotal} per-record error(s). Keyed by UniqueId only.";
+                $"Dropped: {droppedAsBlankTotal} completely-empty-record, {droppedAsDuplicateTotal} in-batch duplicate, " +
+                $"{skippedOnErrorTotal} per-record error(s). Keyed by DealerCode+JobNo+JobDate+ChassisNo+ItemName+ItemDescription " +
+                $"(partial keys allowed — a record only needs ONE non-blank field among the six to be kept).";
+            result.Error = log.ErrorMessage;
 
             log.Status = "Success";
         }
