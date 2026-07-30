@@ -52,6 +52,149 @@ public class ShadowfaxController : ControllerBase
     }
 
     // ─────────────────────────────────────────────────────
+    // GET /api/shadowfax/service-history
+    // Filter: DealerCode in configured Shadowfax dealer list
+    //         AND PartyName starts with "shadowfax" (case-insensitive)
+    // ─────────────────────────────────────────────────────
+    [HttpGet("service-history")]
+    public async Task<IActionResult> GetServiceHistory(
+        [FromQuery] string? chassisNo = null,
+        [FromQuery] string? jobNo = null,
+        [FromQuery] DateTime? from = null,
+        [FromQuery] DateTime? to = null,
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 100)
+    {
+        var dealerCodes = GetShadowfaxDealerCodes();
+
+        var query = _db.DmsServiceHistories
+            .Where(x => x.DealerCode != null && dealerCodes.Contains(x.DealerCode)
+                    && x.PartyName != null && EF.Functions.Like(x.PartyName, "shadowfax%"))
+            .AsQueryable();
+
+        if (!string.IsNullOrEmpty(chassisNo))
+            query = query.Where(x => x.ChassisNo != null && x.ChassisNo.Contains(chassisNo));
+
+        if (!string.IsNullOrEmpty(jobNo))
+            query = query.Where(x => x.JobNo == jobNo);
+
+        if (from.HasValue)
+        {
+            var fromDate = DateOnly.FromDateTime(from.Value);
+            query = query.Where(x => x.JobDate >= fromDate);
+        }
+
+        if (to.HasValue)
+        {
+            var toDate = DateOnly.FromDateTime(to.Value);
+            query = query.Where(x => x.JobDate <= toDate);
+        }
+
+        var total = await query.CountAsync();
+
+        var records = await query
+            .OrderByDescending(x => x.JobDate)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .Select(x => new
+            {
+                x.DealerCode,
+                x.JobNo,
+                x.JobDate,
+                x.ChassisNo,
+                x.RegNo,
+                x.Model,
+                x.BrandName,
+                x.PartyName,
+                x.MobileNumber,
+                x.DocNo,
+                x.DocType,
+                x.DocDate,
+                x.InvoiceDate,
+                x.JobType,
+                x.NetTotal,
+                x.EstimatedJobExpenses,
+                x.Parts,
+                x.Labour
+            })
+            .ToListAsync();
+
+        return Ok(new { Total = total, Page = page, PageSize = pageSize, Records = records });
+    }
+
+    // ─────────────────────────────────────────────────────
+    // GET /api/shadowfax/vehicle-sales
+    // Filter: DealerCode in configured Shadowfax dealer list
+    //         AND SoldTo starts with "shadowfax" (case-insensitive)
+    // NOTE: DmsVehicleSale has no confirmed "PartyName" field — SoldTo
+    // is used as the closest stand-in for the customer/party name check.
+    // Confirm this is the correct field before relying on this in prod.
+    // ─────────────────────────────────────────────────────
+    [HttpGet("vehicle-sales")]
+    public async Task<IActionResult> GetVehicleSales(
+        [FromQuery] string? chassisNo = null,
+        [FromQuery] string? invoiceNo = null,
+        [FromQuery] DateTime? from = null,
+        [FromQuery] DateTime? to = null,
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 100)
+    {
+        var dealerCodes = GetShadowfaxDealerCodes();
+
+        var query = _db.DmsVehicleSales
+            .Where(x => x.DealerCode != null && dealerCodes.Contains(x.DealerCode)
+                    && x.SoldTo != null && EF.Functions.Like(x.SoldTo, "shadowfax%"))
+            .AsQueryable();
+
+        if (!string.IsNullOrEmpty(chassisNo))
+            query = query.Where(x => x.ChassisNo != null && x.ChassisNo.Contains(chassisNo));
+
+        if (!string.IsNullOrEmpty(invoiceNo))
+            query = query.Where(x => x.InvoiceNo == invoiceNo);
+
+        if (from.HasValue)
+        {
+            var fromDate = DateOnly.FromDateTime(from.Value);
+            query = query.Where(x => x.InvoiceDate >= fromDate);
+        }
+
+        if (to.HasValue)
+        {
+            var toDate = DateOnly.FromDateTime(to.Value);
+            query = query.Where(x => x.InvoiceDate <= toDate);
+        }
+
+        var total = await query.CountAsync();
+
+        var records = await query
+            .OrderByDescending(x => x.InvoiceDate)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .Select(x => new
+            {
+                x.DealerCode,
+                x.DealerName,
+                x.InvoiceNo,
+                x.InvoiceDate,
+                x.ChassisNo,
+                x.ItemModel,
+                x.VehicleType,
+                x.SoldTo,
+                x.CusMob,
+                x.PartyEmail,
+                x.City,
+                x.State,
+                x.NetAmount,
+                x.ItemRate,
+                x.FinancedBy,
+                x.FinAmount
+            })
+            .ToListAsync();
+
+        return Ok(new { Total = total, Page = page, PageSize = pageSize, Records = records });
+    }
+
+    // ─────────────────────────────────────────────────────
     // GET /api/shadowfax/vehicles
     // One row per job, aggregated across all its line items.
     // ─────────────────────────────────────────────────────

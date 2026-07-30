@@ -30,6 +30,7 @@ public class DataSyncService
     private List<string> GetConfiguredShadowfaxDealerCodes()
         => _config.GetSection("ShadowfaxSettings:DealerCodes").Get<List<string>>() ?? new();
 
+    // Used ONLY by ServiceHistory (unchanged, per request)
     private static string BuildUniqueKey(string? dealerCode, string? jobNo, DateOnly? date, string? chassisNo)
         => $"{dealerCode?.Trim().ToUpperInvariant()}{jobNo?.Trim().ToUpperInvariant()}{date?.ToString("yyyy-MM-dd")}{chassisNo?.Trim().ToUpperInvariant()}";
 
@@ -196,9 +197,9 @@ public class DataSyncService
         return false;
     }
 
-    // ─────────────────────────────────────────────────────────
-    // SYNC ALL DEALERS from pincode list
-    // ─────────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════
+    // DEALERS — unchanged
+    // ═══════════════════════════════════════════════════════
 
     public async Task<SyncResult> SyncAllDealersAsync()
     {
@@ -225,8 +226,6 @@ public class DataSyncService
 
             var pincodes = dbPincodes.Any() ? dbPincodes : configPincodes;
             pincodes = pincodes.Distinct().ToList();
-
-            _logger.LogInformation("Syncing dealers for {count} pincodes", pincodes.Count);
 
             int processed = 0;
 
@@ -554,7 +553,7 @@ public class DataSyncService
             var chunkStart = start;
             while (chunkStart <= end && !ct.IsCancellationRequested)
             {
-                var chunkEnd = chunkStart.AddMonths(3).AddDays(-1);
+                var chunkEnd = chunkStart.AddMonths(1).AddDays(-1);
                 if (chunkEnd > end) chunkEnd = end;
 
                 var r = await SyncServiceHistoryForRangeAsync(chunkStart, chunkEnd);
@@ -622,9 +621,12 @@ public class DataSyncService
         return totalResult;
     }
 
-    // ─────────────────────────────────────────────────────────
-    // SYNC VEHICLE SALES (VSR) for a single date
-    // ─────────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════
+    // VEHICLE SALES (VSR) — CHANGED: match/dedupe key is now
+    // ChassisNo ALONE, not DealerCode+InvoiceNo+InvoiceDate+ChassisNo.
+    // One row per chassis; the last/most recent sale fetched for a
+    // given chassis wins on repeat syncs.
+    // ═══════════════════════════════════════════════════════
 
     public async Task<SyncResult> SyncVehicleSalesForDateAsync(DateTime date)
     {
@@ -665,39 +667,34 @@ public class DataSyncService
                     var sales = await _erpApi.FetchVsrAsync(dealerCode, date, date, token);
                     result.RecordsFetched += sales.Count;
 
-                    var droppedAsBlank = sales.Count(s => string.IsNullOrEmpty(s.InvoiceNo));
+                    var droppedAsBlank = sales.Count(s => string.IsNullOrEmpty(s.ChassisNo));
                     droppedAsBlankTotal += droppedAsBlank;
 
                     var afterBlankFilter = sales
-                        .Where(s => !string.IsNullOrEmpty(s.InvoiceNo))
+                        .Where(s => !string.IsNullOrEmpty(s.ChassisNo))
                         .ToList();
 
-                    var parsedRecords = afterBlankFilter
-                        .Select(s =>
-                        {
-                            var parsed = ParseVehicleSale(s);
-                            parsed.UniqueKey = BuildUniqueKey(parsed.DealerCode, parsed.InvoiceNo, parsed.InvoiceDate, parsed.ChassisNo);
-                            return parsed;
-                        })
-                        .ToList();
-
-                    var dedupedRecords = parsedRecords
-                        .GroupBy(p => p.UniqueKey)
+                    // FIX: dedupe key is ChassisNo only.
+                    var dedupedRecords = afterBlankFilter
+                        .GroupBy(s => s.ChassisNo!.Trim().ToUpperInvariant())
                         .Select(g => g.Last())
                         .ToList();
-                    droppedAsDuplicateTotal += parsedRecords.Count - dedupedRecords.Count;
+                    droppedAsDuplicateTotal += afterBlankFilter.Count - dedupedRecords.Count;
 
-                    var candidateKeys = dedupedRecords.Select(p => p.UniqueKey).ToHashSet();
+                    var chassisKeys = dedupedRecords.Select(s => s.ChassisNo!.Trim().ToUpperInvariant()).ToHashSet();
                     var existingRaw = await db.DmsVehicleSales
-                        .Where(x => x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
+                        .Where(x => x.ChassisNo != null && chassisKeys.Contains(x.ChassisNo!.Trim().ToUpper()))
                         .ToListAsync();
-                    var existingLookup = BuildLookupTolerant(existingRaw, x => x.UniqueKey);
+                    var existingLookup = BuildLookupTolerant(existingRaw, x => x.ChassisNo?.Trim().ToUpperInvariant());
 
-                    foreach (var parsed in dedupedRecords)
+                    foreach (var sale in dedupedRecords)
                     {
                         try
                         {
-                            if (existingLookup.TryGetValue(parsed.UniqueKey!, out var existing))
+                            var parsed = ParseVehicleSale(sale);
+                            var key = parsed.ChassisNo!.Trim().ToUpperInvariant();
+
+                            if (existingLookup.TryGetValue(key, out var existing))
                             {
                                 UpdateVehicleSale(existing, parsed);
                                 result.RecordsUpdated++;
@@ -715,8 +712,8 @@ public class DataSyncService
                         catch (Exception ex)
                         {
                             skippedOnErrorTotal++;
-                            _logger.LogWarning("Skipping invoice {no} for {dc}: {msg}",
-                                parsed.InvoiceNo, dealerCode, ex.Message);
+                            _logger.LogWarning("Skipping sale (chassis {ch}) for {dc}: {msg}",
+                                sale.ChassisNo, dealerCode, ex.Message);
                         }
                     }
                     await db.SaveChangesAsync();
@@ -728,8 +725,8 @@ public class DataSyncService
             }
 
             log.ErrorMessage =
-                $"Dropped: {droppedAsBlankTotal} blank-invoice, {droppedAsDuplicateTotal} in-batch duplicate, " +
-                $"{skippedOnErrorTotal} per-record error(s).";
+                $"Dropped: {droppedAsBlankTotal} blank-chassis, {droppedAsDuplicateTotal} in-batch duplicate, " +
+                $"{skippedOnErrorTotal} per-record error(s). Keyed by ChassisNo only.";
 
             log.Status = "Success";
         }
@@ -777,48 +774,54 @@ public class DataSyncService
             var sales = await _erpApi.FetchVsrAsync("", startDate, endDate, token);
             result.RecordsFetched = sales.Count;
 
-            var droppedAsBlank = sales.Count(s =>
-                string.IsNullOrEmpty(s.InvoiceNo) || string.IsNullOrEmpty(s.DealerCode));
+            var droppedAsBlank = sales.Count(s => string.IsNullOrEmpty(s.ChassisNo));
             var afterBlankFilter = sales
-                .Where(s => !string.IsNullOrEmpty(s.InvoiceNo) && !string.IsNullOrEmpty(s.DealerCode))
+                .Where(s => !string.IsNullOrEmpty(s.ChassisNo))
                 .ToList();
 
-            var parsedRecords = afterBlankFilter
-                .Select(s =>
-                {
-                    var parsed = ParseVehicleSale(s);
-                    parsed.UniqueKey = BuildUniqueKey(parsed.DealerCode, parsed.InvoiceNo, parsed.InvoiceDate, parsed.ChassisNo);
-                    return parsed;
-                })
-                .ToList();
-
-            var dedupedRecords = parsedRecords
-                .GroupBy(p => p.UniqueKey)
+            // FIX: dedupe key is ChassisNo only.
+            var dedupedRecords = afterBlankFilter
+                .GroupBy(s => s.ChassisNo!.Trim().ToUpperInvariant())
                 .Select(g => g.Last())
                 .ToList();
-            var droppedAsDuplicate = parsedRecords.Count - dedupedRecords.Count;
+            var droppedAsDuplicate = afterBlankFilter.Count - dedupedRecords.Count;
 
             _logger.LogInformation(
-                "VSR range {from} → {to}: {raw} raw → {dropBlank} dropped (blank key) → " +
-                "{dropDup} dropped (in-batch dup) → {final} to process",
+                "VSR range {from} → {to}: {raw} raw → {dropBlank} dropped (blank chassis) → " +
+                "{dropDup} dropped (in-batch dup, keyed by ChassisNo) → {final} to process",
                 startDate.ToString("dd-MM-yyyy"), endDate.ToString("dd-MM-yyyy"),
                 sales.Count, droppedAsBlank, droppedAsDuplicate, dedupedRecords.Count);
 
-            var candidateKeys = dedupedRecords.Select(p => p.UniqueKey).ToHashSet();
-            var existingRaw = await db.DmsVehicleSales
-                .Where(x => x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
-                .ToListAsync();
-            var existingLookup = BuildLookupTolerant(existingRaw, x => x.UniqueKey);
+            var chassisKeys = dedupedRecords.Select(s => s.ChassisNo!.Trim().ToUpperInvariant()).ToHashSet();
+            var existingLookup = new Dictionary<string, DmsVehicleSale>();
+            foreach (var chunk in chassisKeys.Chunk(500))
+            {
+                var chunkSet = chunk.ToHashSet();
+                var rows = await db.DmsVehicleSales
+                    .Where(x => x.ChassisNo != null && chunkSet.Contains(x.ChassisNo!.Trim().ToUpper()))
+                    .AsNoTracking()
+                    .ToListAsync();
+                foreach (var row in rows)
+                {
+                    var key = row.ChassisNo?.Trim().ToUpperInvariant();
+                    if (key != null && !existingLookup.ContainsKey(key))
+                        existingLookup[key] = row;
+                }
+            }
 
             int skippedOnError = 0;
             int saveCounter = 0;
 
-            foreach (var parsed in dedupedRecords)
+            foreach (var sale in dedupedRecords)
             {
                 try
                 {
-                    if (existingLookup.TryGetValue(parsed.UniqueKey!, out var existing))
+                    var parsed = ParseVehicleSale(sale);
+                    var key = parsed.ChassisNo!.Trim().ToUpperInvariant();
+
+                    if (existingLookup.TryGetValue(key, out var existing))
                     {
+                        db.Attach(existing);
                         UpdateVehicleSale(existing, parsed);
                         result.RecordsUpdated++;
                     }
@@ -835,14 +838,13 @@ public class DataSyncService
                 catch (Exception ex)
                 {
                     skippedOnError++;
-                    _logger.LogWarning("Skipping invoice {no} for {dc}: {msg}",
-                        parsed.InvoiceNo, parsed.DealerCode, ex.Message);
+                    _logger.LogWarning("Skipping sale (chassis {ch}): {msg}", sale.ChassisNo, ex.Message);
                 }
             }
 
             log.ErrorMessage =
-                $"Dropped: {droppedAsBlank} blank-key, {droppedAsDuplicate} in-batch duplicate, " +
-                $"{skippedOnError} per-record error(s).";
+                $"Dropped: {droppedAsBlank} blank-chassis, {droppedAsDuplicate} in-batch duplicate, " +
+                $"{skippedOnError} per-record error(s). Keyed by ChassisNo only.";
 
             await db.SaveChangesAsync();
             log.Status = "Success";
@@ -892,7 +894,7 @@ public class DataSyncService
             var chunkStart = start;
             while (chunkStart <= end && !ct.IsCancellationRequested)
             {
-                var chunkEnd = chunkStart.AddMonths(3).AddDays(-1);
+                var chunkEnd = chunkStart.AddMonths(1).AddDays(-1);
                 if (chunkEnd > end) chunkEnd = end;
 
                 var r = await SyncVehicleSalesForRangeAsync(chunkStart, chunkEnd);
@@ -922,9 +924,9 @@ public class DataSyncService
         return totalResult;
     }
 
-    // ─────────────────────────────────────────────────────────
-    // SYNC CALL CENTRE DEALERS
-    // ─────────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════
+    // CALL CENTRE DEALERS — unchanged
+    // ═══════════════════════════════════════════════════════
 
     public async Task<SyncResult> SyncCallCentreDealersAsync()
     {
@@ -1023,9 +1025,10 @@ public class DataSyncService
         return result;
     }
 
-    // ─────────────────────────────────────────────────────────
-    // SYNC VEHICLE DISPATCHES — WIDE RANGE
-    // ─────────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════
+    // VEHICLE DISPATCHES (VDR) — CHANGED: match/dedupe key is now
+    // ChassisNo ALONE.
+    // ═══════════════════════════════════════════════════════
 
     public async Task<SyncResult> SyncVehicleDispatchesForRangeAsync(DateTime startDate, DateTime endDate)
     {
@@ -1050,47 +1053,54 @@ public class DataSyncService
             var dispatches = await _erpApi.FetchVdrAsync(startDate, endDate, token);
             result.RecordsFetched = dispatches.Count;
 
-            var droppedAsBlank = dispatches.Count(d => string.IsNullOrEmpty(d.InvoiceNo));
+            var droppedAsBlank = dispatches.Count(d => string.IsNullOrEmpty(d.ChassisNo));
             var afterBlankFilter = dispatches
-                .Where(d => !string.IsNullOrEmpty(d.InvoiceNo))
+                .Where(d => !string.IsNullOrEmpty(d.ChassisNo))
                 .ToList();
 
-            var parsedRecords = afterBlankFilter
-                .Select(d =>
-                {
-                    var parsed = MapVehicleDispatch(d);
-                    parsed.UniqueKey = BuildUniqueKey(parsed.DealerName, parsed.InvoiceNo, parsed.SaleDate, parsed.ChassisNo);
-                    return parsed;
-                })
-                .ToList();
-
-            var dedupedRecords = parsedRecords
-                .GroupBy(p => p.UniqueKey)
+            // FIX: dedupe key is ChassisNo only.
+            var dedupedRecords = afterBlankFilter
+                .GroupBy(d => d.ChassisNo!.Trim().ToUpperInvariant())
                 .Select(g => g.Last())
                 .ToList();
-            var droppedAsDuplicate = parsedRecords.Count - dedupedRecords.Count;
+            var droppedAsDuplicate = afterBlankFilter.Count - dedupedRecords.Count;
 
             _logger.LogInformation(
-                "VDR range {from} → {to}: {raw} raw → {dropBlank} dropped (blank invoice) → " +
-                "{dropDup} dropped (in-batch dup) → {final} to process",
+                "VDR range {from} → {to}: {raw} raw → {dropBlank} dropped (blank chassis) → " +
+                "{dropDup} dropped (in-batch dup, keyed by ChassisNo) → {final} to process",
                 startDate.ToString("dd-MM-yyyy"), endDate.ToString("dd-MM-yyyy"),
                 dispatches.Count, droppedAsBlank, droppedAsDuplicate, dedupedRecords.Count);
 
-            var candidateKeys = dedupedRecords.Select(p => p.UniqueKey).ToHashSet();
-            var existingRaw = await db.DmsVehicleDispatches
-                .Where(x => x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
-                .ToListAsync();
-            var existingLookup = BuildLookupTolerant(existingRaw, x => x.UniqueKey);
+            var chassisKeys = dedupedRecords.Select(d => d.ChassisNo!.Trim().ToUpperInvariant()).ToHashSet();
+            var existingLookup = new Dictionary<string, DmsVehicleDispatch>();
+            foreach (var chunk in chassisKeys.Chunk(500))
+            {
+                var chunkSet = chunk.ToHashSet();
+                var rows = await db.DmsVehicleDispatches
+                    .Where(x => x.ChassisNo != null && chunkSet.Contains(x.ChassisNo!.Trim().ToUpper()))
+                    .AsNoTracking()
+                    .ToListAsync();
+                foreach (var row in rows)
+                {
+                    var key = row.ChassisNo?.Trim().ToUpperInvariant();
+                    if (key != null && !existingLookup.ContainsKey(key))
+                        existingLookup[key] = row;
+                }
+            }
 
             int skippedOnError = 0;
             int saveCounter = 0;
 
-            foreach (var parsed in dedupedRecords)
+            foreach (var d in dedupedRecords)
             {
                 try
                 {
-                    if (existingLookup.TryGetValue(parsed.UniqueKey!, out var existing))
+                    var parsed = MapVehicleDispatch(d);
+                    var key = parsed.ChassisNo!.Trim().ToUpperInvariant();
+
+                    if (existingLookup.TryGetValue(key, out var existing))
                     {
+                        db.Attach(existing);
                         UpdateVehicleDispatch(existing, parsed);
                         result.RecordsUpdated++;
                     }
@@ -1107,13 +1117,13 @@ public class DataSyncService
                 catch (Exception ex)
                 {
                     skippedOnError++;
-                    _logger.LogWarning("Skipping dispatch {inv}/{ch}: {msg}", parsed.InvoiceNo, parsed.ChassisNo, ex.Message);
+                    _logger.LogWarning("Skipping dispatch (chassis {ch}): {msg}", d.ChassisNo, ex.Message);
                 }
             }
 
             log.ErrorMessage =
-                $"Dropped: {droppedAsBlank} blank-invoice, {droppedAsDuplicate} in-batch duplicate, " +
-                $"{skippedOnError} per-record error(s).";
+                $"Dropped: {droppedAsBlank} blank-chassis, {droppedAsDuplicate} in-batch duplicate, " +
+                $"{skippedOnError} per-record error(s). Keyed by ChassisNo only.";
 
             await db.SaveChangesAsync();
             log.Status = "Success";
@@ -1162,40 +1172,33 @@ public class DataSyncService
             var dispatches = await _erpApi.FetchVdrAsync(date, date, token);
             result.RecordsFetched = dispatches.Count;
 
-            var droppedAsBlank = dispatches.Count(d => string.IsNullOrEmpty(d.InvoiceNo));
+            var droppedAsBlank = dispatches.Count(d => string.IsNullOrEmpty(d.ChassisNo));
             var afterBlankFilter = dispatches
-                .Where(d => !string.IsNullOrEmpty(d.InvoiceNo))
+                .Where(d => !string.IsNullOrEmpty(d.ChassisNo))
                 .ToList();
 
-            var parsedRecords = afterBlankFilter
-                .Select(d =>
-                {
-                    var parsed = MapVehicleDispatch(d);
-                    parsed.UniqueKey = BuildUniqueKey(parsed.DealerName, parsed.InvoiceNo, parsed.SaleDate, parsed.ChassisNo);
-                    return parsed;
-                })
-                .ToList();
-
-            var dedupedRecords = parsedRecords
-                .GroupBy(p => p.UniqueKey)
+            var dedupedRecords = afterBlankFilter
+                .GroupBy(d => d.ChassisNo!.Trim().ToUpperInvariant())
                 .Select(g => g.Last())
                 .ToList();
-            var droppedAsDuplicate = parsedRecords.Count - dedupedRecords.Count;
+            var droppedAsDuplicate = afterBlankFilter.Count - dedupedRecords.Count;
 
-            var candidateKeys = dedupedRecords.Select(p => p.UniqueKey).ToHashSet();
+            var chassisKeys = dedupedRecords.Select(d => d.ChassisNo!.Trim().ToUpperInvariant()).ToHashSet();
             var existingRaw = await db.DmsVehicleDispatches
-                .Where(x => x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
+                .Where(x => x.ChassisNo != null && chassisKeys.Contains(x.ChassisNo!.Trim().ToUpper()))
                 .ToListAsync();
-            var existingLookup = BuildLookupTolerant(existingRaw, x => x.UniqueKey);
+            var existingLookup = BuildLookupTolerant(existingRaw, x => x.ChassisNo?.Trim().ToUpperInvariant());
 
             int skippedOnError = 0;
-            int saveCounter = 0;
 
-            foreach (var parsed in dedupedRecords)
+            foreach (var d in dedupedRecords)
             {
                 try
                 {
-                    if (existingLookup.TryGetValue(parsed.UniqueKey!, out var existing))
+                    var parsed = MapVehicleDispatch(d);
+                    var key = parsed.ChassisNo!.Trim().ToUpperInvariant();
+
+                    if (existingLookup.TryGetValue(key, out var existing))
                     {
                         UpdateVehicleDispatch(existing, parsed);
                         result.RecordsUpdated++;
@@ -1205,22 +1208,18 @@ public class DataSyncService
                         db.DmsVehicleDispatches.Add(parsed);
                         result.RecordsInserted++;
                     }
-
-                    saveCounter++;
-                    if (saveCounter % SaveBatchSize == 0)
-                        await db.SaveChangesAsync();
                 }
                 catch (Exception ex)
                 {
                     skippedOnError++;
-                    _logger.LogWarning("Skipping dispatch {inv}/{ch}: {msg}",
-                        parsed.InvoiceNo, parsed.ChassisNo, ex.Message);
+                    _logger.LogWarning("Skipping dispatch (chassis {ch}): {msg}",
+                        d.ChassisNo, ex.Message);
                 }
             }
 
             log.ErrorMessage =
-                $"Dropped: {droppedAsBlank} blank-invoice, {droppedAsDuplicate} in-batch duplicate, " +
-                $"{skippedOnError} per-record error(s).";
+                $"Dropped: {droppedAsBlank} blank-chassis, {droppedAsDuplicate} in-batch duplicate, " +
+                $"{skippedOnError} per-record error(s). Keyed by ChassisNo only.";
 
             await db.SaveChangesAsync();
             log.Status = "Success";
@@ -1269,7 +1268,7 @@ public class DataSyncService
             var chunkStart = start;
             while (chunkStart <= end && !ct.IsCancellationRequested)
             {
-                var chunkEnd = chunkStart.AddMonths(3).AddDays(-1);
+                var chunkEnd = chunkStart.AddMonths(1).AddDays(-1);
                 if (chunkEnd > end) chunkEnd = end;
 
                 var r = await SyncVehicleDispatchesForRangeAsync(chunkStart, chunkEnd);
@@ -1299,9 +1298,15 @@ public class DataSyncService
         return totalResult;
     }
 
-    // ─────────────────────────────────────────────────────────
-    // SYNC LINE ORDER REPORT (LOR)
-    // ─────────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════
+    // LINE ORDER REPORT (LOR) — CHANGED: match/dedupe key is now
+    // UniqueId ALONE (the ERP's own line-item ID), not the composite
+    // DealerCode+JobNo+JobDate+ChassisNo. This is actually the more
+    // correct key for LOR specifically, since it already IS a
+    // per-line-item ID from the ERP, and LOR legitimately has
+    // multiple rows per chassis (one per part/service line) — keying
+    // by UniqueId preserves that, unlike ChassisNo-only would.
+    // ═══════════════════════════════════════════════════════
 
     public async Task<SyncResult> SyncLineOrderReportAsync(
         DateTime startDate, DateTime endDate,
@@ -1365,42 +1370,37 @@ public class DataSyncService
                     var records = await _erpApi.FetchLorAsync(dealerCode, startDate, endDate, token);
                     result.RecordsFetched += records.Count;
 
-                    var droppedAsBlank = records.Count(r =>
-                        string.IsNullOrEmpty(r.DealerCode) || string.IsNullOrEmpty(r.JobNo));
+                    // FIX: dedupe key is UniqueId only — the ERP's own
+                    // per-line-item identifier.
+                    var droppedAsBlank = records.Count(r => string.IsNullOrEmpty(r.UniqueId));
                     droppedAsBlankTotal += droppedAsBlank;
 
                     var afterBlankFilter = records
-                        .Where(r => !string.IsNullOrEmpty(r.DealerCode) && !string.IsNullOrEmpty(r.JobNo))
+                        .Where(r => !string.IsNullOrEmpty(r.UniqueId))
                         .ToList();
 
-                    var parsedRecords = afterBlankFilter
-                        .Select(r =>
-                        {
-                            var parsed = MapLineOrderReport(r);
-                            parsed.UniqueKey = BuildUniqueKey(parsed.DealerCode, parsed.JobNo, parsed.JobDate, parsed.ChassisNo);
-                            return parsed;
-                        })
-                        .ToList();
-
-                    var dedupedRecords = parsedRecords
-                        .GroupBy(p => p.UniqueKey)
+                    var dedupedRecords = afterBlankFilter
+                        .GroupBy(r => r.UniqueId!.Trim())
                         .Select(g => g.Last())
                         .ToList();
-                    droppedAsDuplicateTotal += parsedRecords.Count - dedupedRecords.Count;
+                    droppedAsDuplicateTotal += afterBlankFilter.Count - dedupedRecords.Count;
 
                     if (!dedupedRecords.Any()) continue;
 
-                    var candidateKeys = dedupedRecords.Select(p => p.UniqueKey).ToHashSet();
+                    var uniqueIds = dedupedRecords.Select(r => r.UniqueId!.Trim()).ToList();
                     var existingRaw = await db.DmsLineOrderReports
-                        .Where(x => x.DealerCode == dealerCode && x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
+                        .Where(x => x.UniqueId != null && uniqueIds.Contains(x.UniqueId))
                         .ToListAsync();
-                    var existingLookup = BuildLookupTolerant(existingRaw, x => x.UniqueKey);
+                    var existingLookup = BuildLookupTolerant(existingRaw, x => x.UniqueId?.Trim());
 
-                    foreach (var parsed in dedupedRecords)
+                    foreach (var rec in dedupedRecords)
                     {
                         try
                         {
-                            if (existingLookup.TryGetValue(parsed.UniqueKey!, out var existing))
+                            var parsed = MapLineOrderReport(rec);
+                            var key = parsed.UniqueId!.Trim();
+
+                            if (existingLookup.TryGetValue(key, out var existing))
                             {
                                 UpdateLineOrderReport(existing, parsed);
                                 result.RecordsUpdated++;
@@ -1418,8 +1418,9 @@ public class DataSyncService
                         catch (Exception ex)
                         {
                             skippedOnErrorTotal++;
-                            _logger.LogWarning("Skipping LOR job {jn} for dealer {dc}: {msg}",
-                                parsed.JobNo, dealerCode, ex.Message);
+                            _logger.LogWarning(
+                                "Skipping LOR UniqueId {id} for dealer {dc}: {msg}",
+                                rec.UniqueId, dealerCode, ex.Message);
                         }
                     }
 
@@ -1432,8 +1433,8 @@ public class DataSyncService
             }
 
             log.ErrorMessage =
-                $"Dropped: {droppedAsBlankTotal} blank-key, {droppedAsDuplicateTotal} in-batch duplicate, " +
-                $"{skippedOnErrorTotal} per-record error(s).";
+                $"Dropped: {droppedAsBlankTotal} blank-UniqueId, {droppedAsDuplicateTotal} in-batch duplicate, " +
+                $"{skippedOnErrorTotal} per-record error(s). Keyed by UniqueId only.";
 
             log.Status = "Success";
         }
@@ -1481,9 +1482,9 @@ public class DataSyncService
         return await SyncLineOrderReportAsync(start, end, ct);
     }
 
-    // ─────────────────────────────────────────────────────────
-    // MAPPING HELPERS
-    // ─────────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════
+    // MAPPING HELPERS — unchanged
+    // ═══════════════════════════════════════════════════════
 
     private static DmsDealer MapDealer(DealerValue d) => new()
     {
@@ -1580,12 +1581,13 @@ public class DataSyncService
 
     private static void UpdateVehicleSale(DmsVehicleSale e, DmsVehicleSale n)
     {
-        e.DealerName = n.DealerName; e.InvoiceDate = n.InvoiceDate; e.Location = n.Location;
+        e.DealerName = n.DealerName; e.DealerCode = n.DealerCode; e.InvoiceNo = n.InvoiceNo;
+        e.InvoiceDate = n.InvoiceDate; e.Location = n.Location;
         e.LocCode = n.LocCode; e.LocationCity = n.LocationCity; e.CustDob = n.CustDob;
         e.Gender = n.Gender; e.SoldTo = n.SoldTo; e.AccountType = n.AccountType;
         e.PartyEmail = n.PartyEmail; e.CusMob = n.CusMob; e.Address1 = n.Address1;
         e.Address2 = n.Address2; e.City = n.City; e.State = n.State; e.ExecutiveName = n.ExecutiveName;
-        e.Pin = n.Pin; e.ChassisNo = n.ChassisNo; e.MotorNo = n.MotorNo; e.Remarks = n.Remarks;
+        e.Pin = n.Pin; e.MotorNo = n.MotorNo; e.Remarks = n.Remarks;
         e.ItemModel = n.ItemModel; e.Oemmodel = n.Oemmodel; e.ColorCode = n.ColorCode;
         e.VehicleType = n.VehicleType; e.VehicleGroup = n.VehicleGroup; e.Hsnsaccode = n.Hsnsaccode;
         e.SaleType = n.SaleType; e.FinancedBy = n.FinancedBy; e.FinAmount = n.FinAmount;
@@ -1627,7 +1629,7 @@ public class DataSyncService
 
     private static void UpdateVehicleDispatch(DmsVehicleDispatch e, DmsVehicleDispatch n)
     {
-        e.SaleDate = n.SaleDate; e.InvoiceDate = n.InvoiceDate; e.Location = n.Location;
+        e.SaleDate = n.SaleDate; e.InvoiceNo = n.InvoiceNo; e.InvoiceDate = n.InvoiceDate; e.Location = n.Location;
         e.LocationCode = n.LocationCode; e.LocationCity = n.LocationCity; e.LocationStatus = n.LocationStatus;
         e.DealerName = n.DealerName; e.Zone = n.Zone; e.AreaOffice = n.AreaOffice; e.MfgYear = n.MfgYear;
         e.BrandName = n.BrandName; e.ModelCode = n.ModelCode; e.ColorCode = n.ColorCode;
@@ -1662,6 +1664,7 @@ public class DataSyncService
 
     private static void UpdateLineOrderReport(DmsLineOrderReport e, DmsLineOrderReport n)
     {
+        e.DealerName = n.DealerName; e.DealerCode = n.DealerCode;
         e.DocDate = n.DocDate; e.DocNo = n.DocNo; e.DocType = n.DocType; e.JobDate = n.JobDate;
         e.JobNo = n.JobNo; e.BrandName = n.BrandName; e.Model = n.Model; e.JobCardType = n.JobCardType;
         e.PaymentMode = n.PaymentMode; e.PartyName = n.PartyName; e.PartyMobile = n.PartyMobile;
