@@ -428,20 +428,27 @@ public class SyncController : ControllerBase
         return Ok(result);
     }
 
-    [HttpPost("reconcile")]
-    public async Task<IActionResult> Reconcile([FromQuery] int lookbackDays = 90)
+    [HttpPost("nightly-reload")]
+    public async Task<IActionResult> TriggerNightlyReload()
     {
-        _logger.LogInformation("Manual reconcile triggered, lookback {d} days", lookbackDays);
-        var result = await _sync.ReconcileOpenJobsAsync(lookbackDays);
-        return Ok(new
-        {
-            result.SyncType,
-            result.RecordsFetched,
-            result.RecordsInserted,
-            result.RecordsUpdated,
-            result.Error
-        });
+        _ = Task.Run(() => _sync.RunNightlyFullReloadAsync());
+        return Accepted(new { message = "Nightly full reload started manually. Check /api/sync/status." });
     }
+
+    // [HttpPost("reconcile")]
+    // public async Task<IActionResult> Reconcile([FromQuery] int lookbackDays = 90)
+    // {
+    //     _logger.LogInformation("Manual reconcile triggered, lookback {d} days", lookbackDays);
+    //     var result = await _sync.ReconcileOpenJobsAsync(lookbackDays);
+    //     return Ok(new
+    //     {
+    //         result.SyncType,
+    //         result.RecordsFetched,
+    //         result.RecordsInserted,
+    //         result.RecordsUpdated,
+    //         result.Error
+    //     });
+    // }
 
     [HttpPost("lor/backfill")]
     public async Task<IActionResult> TriggerLorBackfill(

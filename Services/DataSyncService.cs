@@ -30,16 +30,9 @@ public class DataSyncService
     private List<string> GetConfiguredShadowfaxDealerCodes()
         => _config.GetSection("ShadowfaxSettings:DealerCodes").Get<List<string>>() ?? new();
 
-    // Used ONLY by ServiceHistory (unchanged)
     private static string BuildUniqueKey(string? dealerCode, string? jobNo, DateOnly? date, string? chassisNo)
         => $"{dealerCode?.Trim().ToUpperInvariant()}{jobNo?.Trim().ToUpperInvariant()}{date?.ToString("yyyy-MM-dd")}{chassisNo?.Trim().ToUpperInvariant()}";
 
-    // FIX: LOR's own UniqueId field is unreliable — the ERP reuses the
-    // same UniqueId across genuinely different line items. Uniqueness is
-    // now determined by this 6-field composite instead: DealerCode + JobNo
-    // + JobDate + ChassisNo + ItemName + ItemDescription. UniqueId is still
-    // stored on the row (for reference/debugging) but is no longer used
-    // for matching or dedup.
     private static string BuildLorUniqueKey(
         string? dealerCode, string? jobNo, DateOnly? jobDate,
         string? chassisNo, string? itemName, string? itemDescription)
@@ -50,148 +43,10 @@ public class DataSyncService
            $"{itemName?.Trim().ToUpperInvariant()}" +
            $"{itemDescription?.Trim().ToUpperInvariant()}";
 
-    private static Dictionary<string, T> BuildLookupTolerant<T>(List<T> source, Func<T, string?> keySelector)
-        => source
-            .Where(x => keySelector(x) != null)
-            .GroupBy(x => keySelector(x)!)
-            .ToDictionary(g => g.Key, g => g.First());
-
     // ─────────────────────────────────────────────────────────
-    // SYNC DEALERS DIRECTLY FROM BaplFinal.C_CustomerMaster
+    // DEALERS (ERP pincode-based) — INSERT ONLY. Existing DealerCode
+    // match = skip, not update.
     // ─────────────────────────────────────────────────────────
-    public async Task<SyncResult> SyncDealersFromBaplAsync()
-    {
-        using var scope = _scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-        var log = new DmsSyncLog { SyncType = "DealersFromBapl", StartedAt = DateTime.UtcNow, Status = "Running" };
-        db.DmsSyncLogs.Add(log);
-        await db.SaveChangesAsync();
-
-        var result = new SyncResult { SyncType = "DealersFromBapl" };
-        int skippedOnError = 0;
-
-        try
-        {
-            var baplConnStr = _config.GetConnectionString("BaplConnection")
-                ?? throw new Exception("BaplConnection connection string is not configured.");
-
-            using var conn = new SqlConnection(baplConnStr);
-            await conn.OpenAsync();
-
-            using var cmd = new SqlCommand("SELECT * FROM C_CustomerMaster", conn)
-            {
-                CommandTimeout = 120
-            };
-
-            using var reader = await cmd.ExecuteReaderAsync();
-
-            var existingDealers = await db.DmsDealers.ToListAsync();
-            var existingLookup = existingDealers
-                .Where(d => d.DealerCode != null)
-                .GroupBy(d => d.DealerCode!)
-                .ToDictionary(g => g.Key, g => g.First());
-
-            int saveCounter = 0;
-
-            while (await reader.ReadAsync())
-            {
-                try
-                {
-                    result.RecordsFetched++;
-
-                    string? GetStr(string col) =>
-                        HasColumn(reader, col) && reader[col] != DBNull.Value ? reader[col].ToString() : null;
-
-                    var dealerCode = GetStr("DealerCode") ?? GetStr("CustomerCode") ?? GetStr("Code");
-                    if (string.IsNullOrEmpty(dealerCode))
-                    {
-                        skippedOnError++;
-                        continue;
-                    }
-
-                    var dealerCompany   = GetStr("CustomerName") ?? GetStr("Name") ?? GetStr("DealerName");
-                    var pinCode         = GetStr("PinCode") ?? GetStr("Pincode") ?? GetStr("Pin");
-                    var contactNo       = GetStr("ContactNo") ?? GetStr("MobileNo") ?? GetStr("Mobile");
-                    var activeStatusRaw = GetStr("ActiveStatus") ?? GetStr("IsActive") ?? GetStr("Status");
-                    var stateName       = GetStr("StateName") ?? GetStr("State");
-                    var cityName        = GetStr("CityName") ?? GetStr("City");
-
-                    var activeStatus = activeStatusRaw?.Trim().ToUpperInvariant() == "Y" ? "Active" : "Inactive";
-
-                    if (existingLookup.TryGetValue(dealerCode, out var existingDealer))
-                    {
-                        existingDealer.DealerCompany   = dealerCompany;
-                        existingDealer.ContactNo       = contactNo;
-                        existingDealer.PinCode         = pinCode;
-                        existingDealer.DealerStateName = stateName;
-                        existingDealer.DealerCityName  = cityName;
-                        existingDealer.ActiveStatus    = activeStatus;
-                        existingDealer.LastFetchedAt   = DateTime.UtcNow;
-                        existingDealer.UpdatedAt       = DateTime.UtcNow;
-                        result.RecordsUpdated++;
-                    }
-                    else
-                    {
-                        db.DmsDealers.Add(new DmsDealer
-                        {
-                            DealerCode         = dealerCode,
-                            DealerCompany      = dealerCompany,
-                            ContactNo          = contactNo,
-                            PinCode            = pinCode,
-                            DealerStateName    = stateName,
-                            DealerCityName     = cityName,
-                            ActiveStatus       = activeStatus,
-                            LastFetchedAt      = DateTime.UtcNow,
-                            CreatedAt          = DateTime.UtcNow,
-                            UpdatedAt          = DateTime.UtcNow
-                        });
-                        result.RecordsInserted++;
-                    }
-
-                    saveCounter++;
-                    if (saveCounter % SaveBatchSize == 0)
-                        await db.SaveChangesAsync();
-                }
-                catch (Exception ex)
-                {
-                    skippedOnError++;
-                    _logger.LogWarning("Skipping BAPL dealer row: {msg}", ex.Message);
-                }
-            }
-
-            log.ErrorMessage = $"{skippedOnError} row(s) skipped due to per-record errors.";
-            await db.SaveChangesAsync();
-            log.Status = "Success";
-        }
-        catch (Exception ex)
-        {
-            log.Status       = "Failed";
-            log.ErrorMessage = ex.InnerException?.Message ?? ex.Message;
-            result.Error     = log.ErrorMessage;
-            _logger.LogError(ex, "BAPL dealer sync failed");
-        }
-
-        log.CompletedAt     = DateTime.UtcNow;
-        log.RecordsFetched  = result.RecordsFetched;
-        log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated  = result.RecordsUpdated;
-        await db.SaveChangesAsync();
-
-        return result;
-    }
-
-    private static bool HasColumn(SqlDataReader reader, string columnName)
-    {
-        for (int i = 0; i < reader.FieldCount; i++)
-            if (reader.GetName(i).Equals(columnName, StringComparison.OrdinalIgnoreCase))
-                return true;
-        return false;
-    }
-
-    // ═══════════════════════════════════════════════════════
-    // DEALERS — unchanged
-    // ═══════════════════════════════════════════════════════
 
     public async Task<SyncResult> SyncAllDealersAsync()
     {
@@ -220,6 +75,8 @@ public class DataSyncService
             pincodes = pincodes.Distinct().ToList();
 
             int processed = 0;
+            int skippedAsExisting = 0;
+            var seenInThisRun = new HashSet<string>();
 
             foreach (var pin in pincodes)
             {
@@ -232,6 +89,14 @@ public class DataSyncService
                     {
                         if (string.IsNullOrEmpty(d.DealerCode)) continue;
 
+                        var key = d.DealerCode.Trim().ToUpperInvariant();
+
+                        if (seenInThisRun.Contains(key))
+                        {
+                            skippedAsExisting++;
+                            continue;
+                        }
+
                         var existing = await db.DmsDealers
                             .FirstOrDefaultAsync(x => x.DealerCode == d.DealerCode);
 
@@ -239,11 +104,11 @@ public class DataSyncService
                         {
                             db.DmsDealers.Add(MapDealer(d));
                             result.RecordsInserted++;
+                            seenInThisRun.Add(key);
                         }
                         else
                         {
-                            UpdateDealer(existing, d);
-                            result.RecordsUpdated++;
+                            skippedAsExisting++;
                         }
                     }
                     await db.SaveChangesAsync();
@@ -258,11 +123,12 @@ public class DataSyncService
                 {
                     log.RecordsFetched  = result.RecordsFetched;
                     log.RecordsInserted = result.RecordsInserted;
-                    log.RecordsUpdated  = result.RecordsUpdated;
+                    log.RecordsUpdated  = 0;
                     await db.SaveChangesAsync();
                 }
             }
 
+            log.ErrorMessage = $"{skippedAsExisting} skipped (already exist, insert-only mode).";
             log.Status = "Success";
         }
         catch (Exception ex)
@@ -276,15 +142,146 @@ public class DataSyncService
         log.CompletedAt     = DateTime.UtcNow;
         log.RecordsFetched  = result.RecordsFetched;
         log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated  = result.RecordsUpdated;
+        log.RecordsUpdated  = 0;
         await db.SaveChangesAsync();
 
         return result;
     }
 
-    // ═══════════════════════════════════════════════════════
-    // SERVICE HISTORY — unchanged
-    // ═══════════════════════════════════════════════════════
+    // ─────────────────────────────────────────────────────────
+    // DEALERS (BAPL source) — INSERT ONLY.
+    // ─────────────────────────────────────────────────────────
+
+    public async Task<SyncResult> SyncDealersFromBaplAsync()
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var log = new DmsSyncLog { SyncType = "DealersFromBapl", StartedAt = DateTime.UtcNow, Status = "Running" };
+        db.DmsSyncLogs.Add(log);
+        await db.SaveChangesAsync();
+
+        var result = new SyncResult { SyncType = "DealersFromBapl" };
+        int skippedOnError = 0;
+        int skippedAsExisting = 0;
+
+        try
+        {
+            var baplConnStr = _config.GetConnectionString("BaplConnection")
+                ?? throw new Exception("BaplConnection connection string is not configured.");
+
+            using var conn = new SqlConnection(baplConnStr);
+            await conn.OpenAsync();
+
+            using var cmd = new SqlCommand("SELECT * FROM C_CustomerMaster", conn)
+            {
+                CommandTimeout = 120
+            };
+
+            using var reader = await cmd.ExecuteReaderAsync();
+
+            var existingCodes = (await db.DmsDealers
+                .Where(d => d.DealerCode != null)
+                .Select(d => d.DealerCode!)
+                .ToListAsync())
+                .Select(c => c.Trim().ToUpperInvariant())
+                .ToHashSet();
+
+            int saveCounter = 0;
+
+            while (await reader.ReadAsync())
+            {
+                try
+                {
+                    result.RecordsFetched++;
+
+                    string? GetStr(string col) =>
+                        HasColumn(reader, col) && reader[col] != DBNull.Value ? reader[col].ToString() : null;
+
+                    var dealerCode = GetStr("DealerCode") ?? GetStr("CustomerCode") ?? GetStr("Code");
+                    if (string.IsNullOrEmpty(dealerCode))
+                    {
+                        skippedOnError++;
+                        continue;
+                    }
+
+                    var key = dealerCode.Trim().ToUpperInvariant();
+
+                    // FIX: INSERT ONLY — skip if already present.
+                    if (existingCodes.Contains(key))
+                    {
+                        skippedAsExisting++;
+                        continue;
+                    }
+
+                    var dealerCompany   = GetStr("CustomerName") ?? GetStr("Name") ?? GetStr("DealerName");
+                    var pinCode         = GetStr("PinCode") ?? GetStr("Pincode") ?? GetStr("Pin");
+                    var contactNo       = GetStr("ContactNo") ?? GetStr("MobileNo") ?? GetStr("Mobile");
+                    var activeStatusRaw = GetStr("ActiveStatus") ?? GetStr("IsActive") ?? GetStr("Status");
+                    var stateName       = GetStr("StateName") ?? GetStr("State");
+                    var cityName        = GetStr("CityName") ?? GetStr("City");
+
+                    var activeStatus = activeStatusRaw?.Trim().ToUpperInvariant() == "Y" ? "Active" : "Inactive";
+
+                    db.DmsDealers.Add(new DmsDealer
+                    {
+                        DealerCode         = dealerCode,
+                        DealerCompany      = dealerCompany,
+                        ContactNo          = contactNo,
+                        PinCode            = pinCode,
+                        DealerStateName    = stateName,
+                        DealerCityName     = cityName,
+                        ActiveStatus       = activeStatus,
+                        LastFetchedAt      = DateTime.UtcNow,
+                        CreatedAt          = DateTime.UtcNow,
+                        UpdatedAt          = DateTime.UtcNow
+                    });
+                    result.RecordsInserted++;
+                    existingCodes.Add(key);
+
+                    saveCounter++;
+                    if (saveCounter % SaveBatchSize == 0)
+                        await db.SaveChangesAsync();
+                }
+                catch (Exception ex)
+                {
+                    skippedOnError++;
+                    _logger.LogWarning("Skipping BAPL dealer row: {msg}", ex.Message);
+                }
+            }
+
+            log.ErrorMessage = $"{skippedAsExisting} skipped (already exist), {skippedOnError} per-record error(s). INSERT-ONLY mode.";
+            await db.SaveChangesAsync();
+            log.Status = "Success";
+        }
+        catch (Exception ex)
+        {
+            log.Status       = "Failed";
+            log.ErrorMessage = ex.InnerException?.Message ?? ex.Message;
+            result.Error     = log.ErrorMessage;
+            _logger.LogError(ex, "BAPL dealer sync failed");
+        }
+
+        log.CompletedAt     = DateTime.UtcNow;
+        log.RecordsFetched  = result.RecordsFetched;
+        log.RecordsInserted = result.RecordsInserted;
+        log.RecordsUpdated  = 0;
+        await db.SaveChangesAsync();
+
+        return result;
+    }
+
+    private static bool HasColumn(SqlDataReader reader, string columnName)
+    {
+        for (int i = 0; i < reader.FieldCount; i++)
+            if (reader.GetName(i).Equals(columnName, StringComparison.OrdinalIgnoreCase))
+                return true;
+        return false;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // SERVICE HISTORY (single date) — INSERT ONLY
+    // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> SyncServiceHistoryForDateAsync(DateTime date)
     {
@@ -309,11 +306,7 @@ public class DataSyncService
             var jobs  = await _erpApi.FetchDjrAsync(date, token, "");
             result.RecordsFetched = jobs.Count;
 
-            var droppedAsTotal = jobs.Count(j => j.JobNo == "Total");
             var afterTotalFilter = jobs.Where(j => j.JobNo != "Total").ToList();
-
-            var droppedAsBlankKey = afterTotalFilter.Count(j =>
-                string.IsNullOrEmpty(j.DealerCode) || string.IsNullOrEmpty(j.JobNo));
             var afterBlankFilter = afterTotalFilter
                 .Where(j => !string.IsNullOrEmpty(j.DealerCode) && !string.IsNullOrEmpty(j.JobNo))
                 .ToList();
@@ -333,35 +326,30 @@ public class DataSyncService
                 .GroupBy(p => p.UniqueKey)
                 .Select(g => g.Last())
                 .ToList();
-            var droppedAsDuplicateInBatch = parsedRecords.Count - dedupedRecords.Count;
 
             var candidateKeys = dedupedRecords.Select(p => p.UniqueKey).ToHashSet();
-            var existingRaw = await db.DmsServiceHistories
+            var existingKeySet = (await db.DmsServiceHistories
                 .Where(x => x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
-                .ToListAsync();
-            var existingLookup = BuildLookupTolerant(existingRaw, x => x.UniqueKey);
+                .Select(x => x.UniqueKey!)
+                .ToListAsync()).ToHashSet();
 
+            int skippedAsExisting = 0;
             int skippedOnError = 0;
-            int saveCounter = 0;
 
             foreach (var parsed in dedupedRecords)
             {
                 try
                 {
-                    if (existingLookup.TryGetValue(parsed.UniqueKey!, out var existing))
+                    // FIX: INSERT ONLY — skip if already exists.
+                    if (existingKeySet.Contains(parsed.UniqueKey!))
                     {
-                        UpdateServiceHistory(existing, parsed);
-                        result.RecordsUpdated++;
-                    }
-                    else
-                    {
-                        db.DmsServiceHistories.Add(parsed);
-                        result.RecordsInserted++;
+                        skippedAsExisting++;
+                        continue;
                     }
 
-                    saveCounter++;
-                    if (saveCounter % SaveBatchSize == 0)
-                        await db.SaveChangesAsync();
+                    db.DmsServiceHistories.Add(parsed);
+                    result.RecordsInserted++;
+                    existingKeySet.Add(parsed.UniqueKey!);
                 }
                 catch (Exception ex)
                 {
@@ -371,9 +359,7 @@ public class DataSyncService
                 }
             }
 
-            log.ErrorMessage =
-                $"Dropped: {droppedAsTotal} Total-row, {droppedAsBlankKey} blank-key, " +
-                $"{droppedAsDuplicateInBatch} in-batch duplicate, {skippedOnError} per-record error(s).";
+            log.ErrorMessage = $"{skippedAsExisting} skipped (already exist), {skippedOnError} per-record error(s). INSERT-ONLY mode.";
 
             await db.SaveChangesAsync();
             log.Status = "Success";
@@ -389,11 +375,15 @@ public class DataSyncService
         log.CompletedAt     = DateTime.UtcNow;
         log.RecordsFetched  = result.RecordsFetched;
         log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated  = result.RecordsUpdated;
+        log.RecordsUpdated  = 0;
         await db.SaveChangesAsync();
 
         return result;
     }
+
+    // ─────────────────────────────────────────────────────────
+    // SERVICE HISTORY (range) — INSERT ONLY
+    // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> SyncServiceHistoryForRangeAsync(DateTime startDate, DateTime endDate)
     {
@@ -444,18 +434,14 @@ public class DataSyncService
                 .ToList();
             var droppedAsDuplicateInBatch = parsedRecords.Count - dedupedRecords.Count;
 
-            _logger.LogInformation(
-                "DJR range {from} → {to}: {raw} raw → {dropTotal} dropped (Total) → " +
-                "{dropBlank} dropped (blank key) → {dropDup} dropped (in-batch dup) → {final} to process",
-                startDate.ToString("dd-MM-yyyy"), endDate.ToString("dd-MM-yyyy"),
-                jobs.Count, droppedAsTotal, droppedAsBlankKey, droppedAsDuplicateInBatch, dedupedRecords.Count);
-
             var candidateKeys = dedupedRecords.Select(p => p.UniqueKey).ToHashSet();
-            var existingRaw = await db.DmsServiceHistories
+            var existingKeys = await db.DmsServiceHistories
                 .Where(x => x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
+                .Select(x => x.UniqueKey!)
                 .ToListAsync();
-            var existingLookup = BuildLookupTolerant(existingRaw, x => x.UniqueKey);
+            var existingKeySet = existingKeys.ToHashSet();
 
+            int skippedAsExisting = 0;
             int skippedOnError = 0;
             int saveCounter = 0;
 
@@ -463,16 +449,15 @@ public class DataSyncService
             {
                 try
                 {
-                    if (existingLookup.TryGetValue(parsed.UniqueKey!, out var existing))
+                    if (existingKeySet.Contains(parsed.UniqueKey!))
                     {
-                        UpdateServiceHistory(existing, parsed);
-                        result.RecordsUpdated++;
+                        skippedAsExisting++;
+                        continue;
                     }
-                    else
-                    {
-                        db.DmsServiceHistories.Add(parsed);
-                        result.RecordsInserted++;
-                    }
+
+                    db.DmsServiceHistories.Add(parsed);
+                    result.RecordsInserted++;
+                    existingKeySet.Add(parsed.UniqueKey!);
 
                     saveCounter++;
                     if (saveCounter % SaveBatchSize == 0)
@@ -487,7 +472,8 @@ public class DataSyncService
 
             log.ErrorMessage =
                 $"Dropped: {droppedAsTotal} Total-row, {droppedAsBlankKey} blank-key, " +
-                $"{droppedAsDuplicateInBatch} in-batch duplicate, {skippedOnError} per-record error(s).";
+                $"{droppedAsDuplicateInBatch} in-batch duplicate, {skippedAsExisting} skipped (already exist), " +
+                $"{skippedOnError} per-record error(s). INSERT-ONLY mode.";
 
             await db.SaveChangesAsync();
             log.Status = "Success";
@@ -504,7 +490,7 @@ public class DataSyncService
         log.CompletedAt     = DateTime.UtcNow;
         log.RecordsFetched  = result.RecordsFetched;
         log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated  = result.RecordsUpdated;
+        log.RecordsUpdated  = 0;
         await db.SaveChangesAsync();
 
         return result;
@@ -539,7 +525,6 @@ public class DataSyncService
                 var r = await SyncServiceHistoryForRangeAsync(chunkStart, chunkEnd);
                 totalResult.RecordsFetched  += r.RecordsFetched;
                 totalResult.RecordsInserted += r.RecordsInserted;
-                totalResult.RecordsUpdated  += r.RecordsUpdated;
 
                 chunkStart = chunkEnd.AddDays(1);
             }
@@ -557,49 +542,15 @@ public class DataSyncService
         topLog.CompletedAt = DateTime.UtcNow;
         topLog.RecordsFetched  = totalResult.RecordsFetched;
         topLog.RecordsInserted = totalResult.RecordsInserted;
-        topLog.RecordsUpdated  = totalResult.RecordsUpdated;
+        topLog.RecordsUpdated  = 0;
         await db.SaveChangesAsync();
 
         return totalResult;
     }
 
-    public async Task<SyncResult> ReconcileOpenJobsAsync(
-        int lookbackDays = 90, CancellationToken ct = default)
-    {
-        using var scope = _scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-        var cutoff = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(-lookbackDays));
-
-        var staleDates = await db.DmsServiceHistories
-            .Where(x => x.InvoiceDate == null && x.JobDate != null && x.JobDate >= cutoff && !x.IsRowTotal)
-            .Select(x => x.JobDate!.Value)
-            .Distinct()
-            .ToListAsync(ct);
-
-        var totalResult = new SyncResult { SyncType = "ReconcileOpenJobs" };
-
-        foreach (var date in staleDates)
-        {
-            if (ct.IsCancellationRequested) break;
-            try
-            {
-                var r = await SyncServiceHistoryForDateAsync(date.ToDateTime(TimeOnly.MinValue));
-                totalResult.RecordsUpdated  += r.RecordsUpdated;
-                totalResult.RecordsInserted += r.RecordsInserted;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning("Reconcile failed for {date}: {msg}", date, ex.Message);
-            }
-        }
-
-        return totalResult;
-    }
-
-    // ═══════════════════════════════════════════════════════
-    // VEHICLE SALES (VSR) — unchanged, keyed by ChassisNo
-    // ═══════════════════════════════════════════════════════
+    // ─────────────────────────────────────────────────────────
+    // VEHICLE SALES (single date) — INSERT ONLY
+    // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> SyncVehicleSalesForDateAsync(DateTime date)
     {
@@ -628,10 +579,8 @@ public class DataSyncService
                 .Distinct()
                 .ToListAsync();
 
-            int droppedAsBlankTotal = 0;
-            int droppedAsDuplicateTotal = 0;
-            int skippedOnErrorTotal = 0;
-            int saveCounter = 0;
+            int skippedAsExisting = 0;
+            int skippedOnError = 0;
 
             foreach (var dealerCode in dealerCodes)
             {
@@ -639,9 +588,6 @@ public class DataSyncService
                 {
                     var sales = await _erpApi.FetchVsrAsync(dealerCode, date, date, token);
                     result.RecordsFetched += sales.Count;
-
-                    var droppedAsBlank = sales.Count(s => string.IsNullOrEmpty(s.ChassisNo));
-                    droppedAsBlankTotal += droppedAsBlank;
 
                     var afterBlankFilter = sales
                         .Where(s => !string.IsNullOrEmpty(s.ChassisNo))
@@ -651,13 +597,14 @@ public class DataSyncService
                         .GroupBy(s => s.ChassisNo!.Trim().ToUpperInvariant())
                         .Select(g => g.Last())
                         .ToList();
-                    droppedAsDuplicateTotal += afterBlankFilter.Count - dedupedRecords.Count;
 
                     var chassisKeys = dedupedRecords.Select(s => s.ChassisNo!.Trim().ToUpperInvariant()).ToHashSet();
-                    var existingRaw = await db.DmsVehicleSales
+                    var existingKeySet = (await db.DmsVehicleSales
                         .Where(x => x.ChassisNo != null && chassisKeys.Contains(x.ChassisNo!.Trim().ToUpper()))
-                        .ToListAsync();
-                    var existingLookup = BuildLookupTolerant(existingRaw, x => x.ChassisNo?.Trim().ToUpperInvariant());
+                        .Select(x => x.ChassisNo!)
+                        .ToListAsync())
+                        .Select(c => c.Trim().ToUpperInvariant())
+                        .ToHashSet();
 
                     foreach (var sale in dedupedRecords)
                     {
@@ -666,24 +613,19 @@ public class DataSyncService
                             var parsed = ParseVehicleSale(sale);
                             var key = parsed.ChassisNo!.Trim().ToUpperInvariant();
 
-                            if (existingLookup.TryGetValue(key, out var existing))
+                            if (existingKeySet.Contains(key))
                             {
-                                UpdateVehicleSale(existing, parsed);
-                                result.RecordsUpdated++;
-                            }
-                            else
-                            {
-                                db.DmsVehicleSales.Add(parsed);
-                                result.RecordsInserted++;
+                                skippedAsExisting++;
+                                continue;
                             }
 
-                            saveCounter++;
-                            if (saveCounter % SaveBatchSize == 0)
-                                await db.SaveChangesAsync();
+                            db.DmsVehicleSales.Add(parsed);
+                            result.RecordsInserted++;
+                            existingKeySet.Add(key);
                         }
                         catch (Exception ex)
                         {
-                            skippedOnErrorTotal++;
+                            skippedOnError++;
                             _logger.LogWarning("Skipping sale (chassis {ch}) for {dc}: {msg}",
                                 sale.ChassisNo, dealerCode, ex.Message);
                         }
@@ -696,9 +638,7 @@ public class DataSyncService
                 }
             }
 
-            log.ErrorMessage =
-                $"Dropped: {droppedAsBlankTotal} blank-chassis, {droppedAsDuplicateTotal} in-batch duplicate, " +
-                $"{skippedOnErrorTotal} per-record error(s). Keyed by ChassisNo only.";
+            log.ErrorMessage = $"{skippedAsExisting} skipped (already exist), {skippedOnError} per-record error(s). INSERT-ONLY mode.";
 
             log.Status = "Success";
         }
@@ -713,11 +653,15 @@ public class DataSyncService
         log.CompletedAt     = DateTime.UtcNow;
         log.RecordsFetched  = result.RecordsFetched;
         log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated  = result.RecordsUpdated;
+        log.RecordsUpdated  = 0;
         await db.SaveChangesAsync();
 
         return result;
     }
+
+    // ─────────────────────────────────────────────────────────
+    // VEHICLE SALES (range) — INSERT ONLY
+    // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> SyncVehicleSalesForRangeAsync(DateTime startDate, DateTime endDate)
     {
@@ -753,29 +697,19 @@ public class DataSyncService
                 .ToList();
             var droppedAsDuplicate = afterBlankFilter.Count - dedupedRecords.Count;
 
-            _logger.LogInformation(
-                "VSR range {from} → {to}: {raw} raw → {dropBlank} dropped (blank chassis) → " +
-                "{dropDup} dropped (in-batch dup, keyed by ChassisNo) → {final} to process",
-                startDate.ToString("dd-MM-yyyy"), endDate.ToString("dd-MM-yyyy"),
-                sales.Count, droppedAsBlank, droppedAsDuplicate, dedupedRecords.Count);
-
             var chassisKeys = dedupedRecords.Select(s => s.ChassisNo!.Trim().ToUpperInvariant()).ToHashSet();
-            var existingLookup = new Dictionary<string, DmsVehicleSale>();
+            var existingKeys = new HashSet<string>();
             foreach (var chunk in chassisKeys.Chunk(500))
             {
                 var chunkSet = chunk.ToHashSet();
                 var rows = await db.DmsVehicleSales
                     .Where(x => x.ChassisNo != null && chunkSet.Contains(x.ChassisNo!.Trim().ToUpper()))
-                    .AsNoTracking()
+                    .Select(x => x.ChassisNo!)
                     .ToListAsync();
-                foreach (var row in rows)
-                {
-                    var key = row.ChassisNo?.Trim().ToUpperInvariant();
-                    if (key != null && !existingLookup.ContainsKey(key))
-                        existingLookup[key] = row;
-                }
+                foreach (var r in rows) existingKeys.Add(r.Trim().ToUpperInvariant());
             }
 
+            int skippedAsExisting = 0;
             int skippedOnError = 0;
             int saveCounter = 0;
 
@@ -786,17 +720,15 @@ public class DataSyncService
                     var parsed = ParseVehicleSale(sale);
                     var key = parsed.ChassisNo!.Trim().ToUpperInvariant();
 
-                    if (existingLookup.TryGetValue(key, out var existing))
+                    if (existingKeys.Contains(key))
                     {
-                        db.Attach(existing);
-                        UpdateVehicleSale(existing, parsed);
-                        result.RecordsUpdated++;
+                        skippedAsExisting++;
+                        continue;
                     }
-                    else
-                    {
-                        db.DmsVehicleSales.Add(parsed);
-                        result.RecordsInserted++;
-                    }
+
+                    db.DmsVehicleSales.Add(parsed);
+                    result.RecordsInserted++;
+                    existingKeys.Add(key);
 
                     saveCounter++;
                     if (saveCounter % SaveBatchSize == 0)
@@ -811,7 +743,7 @@ public class DataSyncService
 
             log.ErrorMessage =
                 $"Dropped: {droppedAsBlank} blank-chassis, {droppedAsDuplicate} in-batch duplicate, " +
-                $"{skippedOnError} per-record error(s). Keyed by ChassisNo only.";
+                $"{skippedAsExisting} skipped (already exist), {skippedOnError} per-record error(s). INSERT-ONLY mode.";
 
             await db.SaveChangesAsync();
             log.Status = "Success";
@@ -828,7 +760,7 @@ public class DataSyncService
         log.CompletedAt     = DateTime.UtcNow;
         log.RecordsFetched  = result.RecordsFetched;
         log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated  = result.RecordsUpdated;
+        log.RecordsUpdated  = 0;
         await db.SaveChangesAsync();
 
         return result;
@@ -863,7 +795,6 @@ public class DataSyncService
                 var r = await SyncVehicleSalesForRangeAsync(chunkStart, chunkEnd);
                 totalResult.RecordsFetched  += r.RecordsFetched;
                 totalResult.RecordsInserted += r.RecordsInserted;
-                totalResult.RecordsUpdated  += r.RecordsUpdated;
 
                 chunkStart = chunkEnd.AddDays(1);
             }
@@ -881,15 +812,15 @@ public class DataSyncService
         topLog.CompletedAt = DateTime.UtcNow;
         topLog.RecordsFetched  = totalResult.RecordsFetched;
         topLog.RecordsInserted = totalResult.RecordsInserted;
-        topLog.RecordsUpdated  = totalResult.RecordsUpdated;
+        topLog.RecordsUpdated  = 0;
         await db.SaveChangesAsync();
 
         return totalResult;
     }
 
-    // ═══════════════════════════════════════════════════════
-    // CALL CENTRE DEALERS — unchanged
-    // ═══════════════════════════════════════════════════════
+    // ─────────────────────────────────────────────────────────
+    // CALL CENTRE DEALERS — INSERT ONLY
+    // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> SyncCallCentreDealersAsync()
     {
@@ -917,6 +848,9 @@ public class DataSyncService
             var pincodes = dbPincodes.Any() ? dbPincodes : configPincodes;
             pincodes = pincodes.Distinct().ToList();
 
+            int skippedAsExisting = 0;
+            var seenInThisRun = new HashSet<string>();
+
             foreach (var pin in pincodes)
             {
                 try
@@ -927,6 +861,9 @@ public class DataSyncService
                     foreach (var d in dealers)
                     {
                         if (string.IsNullOrEmpty(d.DealerCode)) continue;
+                        var key = d.DealerCode.Trim().ToUpperInvariant();
+
+                        if (seenInThisRun.Contains(key)) { skippedAsExisting++; continue; }
 
                         var existing = await db.DmsCallCentreDealers
                             .FirstOrDefaultAsync(x => x.DealerCode == d.DealerCode);
@@ -947,18 +884,11 @@ public class DataSyncService
                                 UpdatedAt          = DateTime.UtcNow
                             });
                             result.RecordsInserted++;
+                            seenInThisRun.Add(key);
                         }
                         else
                         {
-                            existing.DealerCompany      = d.DealerCompany;
-                            existing.ContactNo          = d.ContactNo;
-                            existing.AlternateContactNo = d.AlternateContactNo;
-                            existing.DealerStateName    = d.DealerStateName;
-                            existing.PinCode            = d.PinCode ?? pin;
-                            existing.ActiveStatus       = d.ActiveStatus;
-                            existing.LastFetchedAt      = DateTime.UtcNow;
-                            existing.UpdatedAt          = DateTime.UtcNow;
-                            result.RecordsUpdated++;
+                            skippedAsExisting++;
                         }
                     }
                     await db.SaveChangesAsync();
@@ -969,6 +899,7 @@ public class DataSyncService
                 }
             }
 
+            log.ErrorMessage = $"{skippedAsExisting} skipped (already exist). INSERT-ONLY mode.";
             log.Status = "Success";
         }
         catch (Exception ex)
@@ -982,15 +913,15 @@ public class DataSyncService
         log.CompletedAt     = DateTime.UtcNow;
         log.RecordsFetched  = result.RecordsFetched;
         log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated  = result.RecordsUpdated;
+        log.RecordsUpdated  = 0;
         await db.SaveChangesAsync();
 
         return result;
     }
 
-    // ═══════════════════════════════════════════════════════
-    // VEHICLE DISPATCHES (VDR) — unchanged, keyed by ChassisNo
-    // ═══════════════════════════════════════════════════════
+    // ─────────────────────────────────────────────────────────
+    // VEHICLE DISPATCHES (range) — INSERT ONLY
+    // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> SyncVehicleDispatchesForRangeAsync(DateTime startDate, DateTime endDate)
     {
@@ -1026,29 +957,19 @@ public class DataSyncService
                 .ToList();
             var droppedAsDuplicate = afterBlankFilter.Count - dedupedRecords.Count;
 
-            _logger.LogInformation(
-                "VDR range {from} → {to}: {raw} raw → {dropBlank} dropped (blank chassis) → " +
-                "{dropDup} dropped (in-batch dup, keyed by ChassisNo) → {final} to process",
-                startDate.ToString("dd-MM-yyyy"), endDate.ToString("dd-MM-yyyy"),
-                dispatches.Count, droppedAsBlank, droppedAsDuplicate, dedupedRecords.Count);
-
             var chassisKeys = dedupedRecords.Select(d => d.ChassisNo!.Trim().ToUpperInvariant()).ToHashSet();
-            var existingLookup = new Dictionary<string, DmsVehicleDispatch>();
+            var existingKeys = new HashSet<string>();
             foreach (var chunk in chassisKeys.Chunk(500))
             {
                 var chunkSet = chunk.ToHashSet();
                 var rows = await db.DmsVehicleDispatches
                     .Where(x => x.ChassisNo != null && chunkSet.Contains(x.ChassisNo!.Trim().ToUpper()))
-                    .AsNoTracking()
+                    .Select(x => x.ChassisNo!)
                     .ToListAsync();
-                foreach (var row in rows)
-                {
-                    var key = row.ChassisNo?.Trim().ToUpperInvariant();
-                    if (key != null && !existingLookup.ContainsKey(key))
-                        existingLookup[key] = row;
-                }
+                foreach (var r in rows) existingKeys.Add(r.Trim().ToUpperInvariant());
             }
 
+            int skippedAsExisting = 0;
             int skippedOnError = 0;
             int saveCounter = 0;
 
@@ -1059,17 +980,15 @@ public class DataSyncService
                     var parsed = MapVehicleDispatch(d);
                     var key = parsed.ChassisNo!.Trim().ToUpperInvariant();
 
-                    if (existingLookup.TryGetValue(key, out var existing))
+                    if (existingKeys.Contains(key))
                     {
-                        db.Attach(existing);
-                        UpdateVehicleDispatch(existing, parsed);
-                        result.RecordsUpdated++;
+                        skippedAsExisting++;
+                        continue;
                     }
-                    else
-                    {
-                        db.DmsVehicleDispatches.Add(parsed);
-                        result.RecordsInserted++;
-                    }
+
+                    db.DmsVehicleDispatches.Add(parsed);
+                    result.RecordsInserted++;
+                    existingKeys.Add(key);
 
                     saveCounter++;
                     if (saveCounter % SaveBatchSize == 0)
@@ -1084,7 +1003,7 @@ public class DataSyncService
 
             log.ErrorMessage =
                 $"Dropped: {droppedAsBlank} blank-chassis, {droppedAsDuplicate} in-batch duplicate, " +
-                $"{skippedOnError} per-record error(s). Keyed by ChassisNo only.";
+                $"{skippedAsExisting} skipped (already exist), {skippedOnError} per-record error(s). INSERT-ONLY mode.";
 
             await db.SaveChangesAsync();
             log.Status = "Success";
@@ -1100,11 +1019,15 @@ public class DataSyncService
         log.CompletedAt     = DateTime.UtcNow;
         log.RecordsFetched  = result.RecordsFetched;
         log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated  = result.RecordsUpdated;
+        log.RecordsUpdated  = 0;
         await db.SaveChangesAsync();
 
         return result;
     }
+
+    // ─────────────────────────────────────────────────────────
+    // VEHICLE DISPATCHES (single date) — INSERT ONLY
+    // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> SyncVehicleDispatchesForDateAsync(DateTime date)
     {
@@ -1129,7 +1052,6 @@ public class DataSyncService
             var dispatches = await _erpApi.FetchVdrAsync(date, date, token);
             result.RecordsFetched = dispatches.Count;
 
-            var droppedAsBlank = dispatches.Count(d => string.IsNullOrEmpty(d.ChassisNo));
             var afterBlankFilter = dispatches
                 .Where(d => !string.IsNullOrEmpty(d.ChassisNo))
                 .ToList();
@@ -1138,14 +1060,16 @@ public class DataSyncService
                 .GroupBy(d => d.ChassisNo!.Trim().ToUpperInvariant())
                 .Select(g => g.Last())
                 .ToList();
-            var droppedAsDuplicate = afterBlankFilter.Count - dedupedRecords.Count;
 
             var chassisKeys = dedupedRecords.Select(d => d.ChassisNo!.Trim().ToUpperInvariant()).ToHashSet();
-            var existingRaw = await db.DmsVehicleDispatches
+            var existingKeySet = (await db.DmsVehicleDispatches
                 .Where(x => x.ChassisNo != null && chassisKeys.Contains(x.ChassisNo!.Trim().ToUpper()))
-                .ToListAsync();
-            var existingLookup = BuildLookupTolerant(existingRaw, x => x.ChassisNo?.Trim().ToUpperInvariant());
+                .Select(x => x.ChassisNo!)
+                .ToListAsync())
+                .Select(c => c.Trim().ToUpperInvariant())
+                .ToHashSet();
 
+            int skippedAsExisting = 0;
             int skippedOnError = 0;
 
             foreach (var d in dedupedRecords)
@@ -1155,16 +1079,15 @@ public class DataSyncService
                     var parsed = MapVehicleDispatch(d);
                     var key = parsed.ChassisNo!.Trim().ToUpperInvariant();
 
-                    if (existingLookup.TryGetValue(key, out var existing))
+                    if (existingKeySet.Contains(key))
                     {
-                        UpdateVehicleDispatch(existing, parsed);
-                        result.RecordsUpdated++;
+                        skippedAsExisting++;
+                        continue;
                     }
-                    else
-                    {
-                        db.DmsVehicleDispatches.Add(parsed);
-                        result.RecordsInserted++;
-                    }
+
+                    db.DmsVehicleDispatches.Add(parsed);
+                    result.RecordsInserted++;
+                    existingKeySet.Add(key);
                 }
                 catch (Exception ex)
                 {
@@ -1174,9 +1097,7 @@ public class DataSyncService
                 }
             }
 
-            log.ErrorMessage =
-                $"Dropped: {droppedAsBlank} blank-chassis, {droppedAsDuplicate} in-batch duplicate, " +
-                $"{skippedOnError} per-record error(s). Keyed by ChassisNo only.";
+            log.ErrorMessage = $"{skippedAsExisting} skipped (already exist), {skippedOnError} per-record error(s). INSERT-ONLY mode.";
 
             await db.SaveChangesAsync();
             log.Status = "Success";
@@ -1192,7 +1113,7 @@ public class DataSyncService
         log.CompletedAt     = DateTime.UtcNow;
         log.RecordsFetched  = result.RecordsFetched;
         log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated  = result.RecordsUpdated;
+        log.RecordsUpdated  = 0;
         await db.SaveChangesAsync();
 
         return result;
@@ -1227,7 +1148,6 @@ public class DataSyncService
                 var r = await SyncVehicleDispatchesForRangeAsync(chunkStart, chunkEnd);
                 totalResult.RecordsFetched  += r.RecordsFetched;
                 totalResult.RecordsInserted += r.RecordsInserted;
-                totalResult.RecordsUpdated  += r.RecordsUpdated;
 
                 chunkStart = chunkEnd.AddDays(1);
             }
@@ -1245,19 +1165,15 @@ public class DataSyncService
         topLog.CompletedAt = DateTime.UtcNow;
         topLog.RecordsFetched  = totalResult.RecordsFetched;
         topLog.RecordsInserted = totalResult.RecordsInserted;
-        topLog.RecordsUpdated  = totalResult.RecordsUpdated;
+        topLog.RecordsUpdated  = 0;
         await db.SaveChangesAsync();
 
         return totalResult;
     }
 
-    // ═══════════════════════════════════════════════════════
-    // LINE ORDER REPORT (LOR) — CHANGED: matching/dedup key is now
-    // the 6-field composite (DealerCode+JobNo+JobDate+ChassisNo+
-    // ItemName+ItemDescription), NOT UniqueId. UniqueId itself is
-    // unreliable — the ERP reuses the same UniqueId across genuinely
-    // different line items.
-    // ═══════════════════════════════════════════════════════
+    // ─────────────────────────────────────────────────────────
+    // LINE ORDER REPORT — INSERT ONLY (unchanged from your version)
+    // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> SyncLineOrderReportAsync(
         DateTime startDate, DateTime endDate,
@@ -1307,8 +1223,9 @@ public class DataSyncService
                 }
             }
 
-            int droppedAsBlankTotal = 0;
+            int droppedAsEmptyTotal = 0;
             int droppedAsDuplicateTotal = 0;
+            int skippedAsExistingTotal = 0;
             int skippedOnErrorTotal = 0;
             int saveCounter = 0;
 
@@ -1332,58 +1249,41 @@ public class DataSyncService
                         })
                         .ToList();
 
-                    // FIX: no longer dropping records that are missing one or more
-                    // of the 6 key fields. BuildLorUniqueKey already handles nulls
-                    // by substituting empty string for that segment — a record
-                    // with a blank ItemDescription (e.g. a labour/service charge
-                    // with no part description) is still real data and gets kept.
-                    // We only track how many records have a partial key, for
-                    // visibility — this no longer removes them.
-                    var partialKeyCount = parsedRecords.Count(p =>
-                        string.IsNullOrEmpty(p.DealerCode) || string.IsNullOrEmpty(p.JobNo) ||
-                        p.JobDate == null || string.IsNullOrEmpty(p.ChassisNo) ||
-                        string.IsNullOrEmpty(p.ItemName) || string.IsNullOrEmpty(p.ItemDescription));
-                    droppedAsBlankTotal += 0; // no longer dropping; kept for log clarity below
-
-                    // Only genuinely unusable rows (every single field blank —
-                    // meaning the ERP sent essentially nothing) are excluded, since
-                    // there's nothing to key or store meaningfully.
-                    var afterBlankFilter = parsedRecords
+                    var afterEmptyFilter = parsedRecords
                         .Where(p =>
                             !string.IsNullOrEmpty(p.DealerCode) || !string.IsNullOrEmpty(p.JobNo) ||
                             p.JobDate != null || !string.IsNullOrEmpty(p.ChassisNo) ||
                             !string.IsNullOrEmpty(p.ItemName) || !string.IsNullOrEmpty(p.ItemDescription))
                         .ToList();
-                    var droppedAsCompletelyEmpty = parsedRecords.Count - afterBlankFilter.Count;
+                    droppedAsEmptyTotal += parsedRecords.Count - afterEmptyFilter.Count;
 
-                    var dedupedRecords = afterBlankFilter
+                    var dedupedRecords = afterEmptyFilter
                         .GroupBy(p => p.UniqueKey)
                         .Select(g => g.Last())
                         .ToList();
-                    droppedAsDuplicateTotal += afterBlankFilter.Count - dedupedRecords.Count;
+                    droppedAsDuplicateTotal += afterEmptyFilter.Count - dedupedRecords.Count;
 
                     if (!dedupedRecords.Any()) continue;
 
                     var candidateKeys = dedupedRecords.Select(p => p.UniqueKey).ToHashSet();
-                    var existingRaw = await db.DmsLineOrderReports
+                    var existingKeys = (await db.DmsLineOrderReports
                         .Where(x => x.DealerCode == dealerCode && x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
-                        .ToListAsync();
-                    var existingLookup = BuildLookupTolerant(existingRaw, x => x.UniqueKey);
+                        .Select(x => x.UniqueKey!)
+                        .ToListAsync()).ToHashSet();
 
                     foreach (var parsed in dedupedRecords)
                     {
                         try
                         {
-                            if (existingLookup.TryGetValue(parsed.UniqueKey!, out var existing))
+                            if (existingKeys.Contains(parsed.UniqueKey!))
                             {
-                                UpdateLineOrderReport(existing, parsed);
-                                result.RecordsUpdated++;
+                                skippedAsExistingTotal++;
+                                continue;
                             }
-                            else
-                            {
-                                db.DmsLineOrderReports.Add(parsed);
-                                result.RecordsInserted++;
-                            }
+
+                            db.DmsLineOrderReports.Add(parsed);
+                            result.RecordsInserted++;
+                            existingKeys.Add(parsed.UniqueKey!);
 
                             saveCounter++;
                             if (saveCounter % SaveBatchSize == 0)
@@ -1394,7 +1294,7 @@ public class DataSyncService
                             if (ex.InnerException?.Message.Contains("UX_LineOrderReport_UniqueKey") == true)
                             {
                                 _logger.LogInformation(
-                                    "Concurrent insert detected for job {jn}, item {it} — already added by another sync run, skipping.",
+                                    "Concurrent insert detected for job {jn}, item {it} — already added, skipping.",
                                     parsed.JobNo, parsed.ItemName);
                             }
                             else
@@ -1408,10 +1308,6 @@ public class DataSyncService
                     }
 
                     await db.SaveChangesAsync();
-
-                    _logger.LogInformation(
-                        "LOR dealer {dc}: {total} parsed, {partial} with a partial key (kept), {empty} completely empty (dropped), {dup} in-batch duplicate",
-                        dealerCode, parsedRecords.Count, partialKeyCount, droppedAsCompletelyEmpty, afterBlankFilter.Count - dedupedRecords.Count);
                 }
                 catch (Exception ex)
                 {
@@ -1420,9 +1316,9 @@ public class DataSyncService
             }
 
             log.ErrorMessage =
-                $"Dropped: {droppedAsBlankTotal} completely-empty-record, {droppedAsDuplicateTotal} in-batch duplicate, " +
-                $"{skippedOnErrorTotal} per-record error(s). Keyed by DealerCode+JobNo+JobDate+ChassisNo+ItemName+ItemDescription " +
-                $"(partial keys allowed — a record only needs ONE non-blank field among the six to be kept).";
+                $"Dropped: {droppedAsEmptyTotal} completely-empty-record, {droppedAsDuplicateTotal} in-batch duplicate, " +
+                $"{skippedAsExistingTotal} skipped (already exist), {skippedOnErrorTotal} per-record error(s). " +
+                $"INSERT-ONLY mode.";
             result.Error = log.ErrorMessage;
 
             log.Status = "Success";
@@ -1438,7 +1334,7 @@ public class DataSyncService
         log.CompletedAt     = DateTime.UtcNow;
         log.RecordsFetched  = result.RecordsFetched;
         log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated  = result.RecordsUpdated;
+        log.RecordsUpdated  = 0;
         await db.SaveChangesAsync();
 
         return result;
@@ -1471,9 +1367,89 @@ public class DataSyncService
         return await SyncLineOrderReportAsync(start, end, ct);
     }
 
-    // ═══════════════════════════════════════════════════════
-    // MAPPING HELPERS — unchanged
-    // ═══════════════════════════════════════════════════════
+    // ─────────────────────────────────────────────────────────
+    // TRUNCATE ALL DATA TABLES
+    // ─────────────────────────────────────────────────────────
+    public async Task TruncateAllDataTablesAsync()
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var tables = new[]
+        {
+            "DMS_ServiceHistory",
+            "DMS_VehicleSales",
+            "DMS_VehicleDispatches",
+            "DMS_LineOrderReport",
+            "DMS_Dealers",
+            "DMS_CallCentreDealers"
+        };
+
+        foreach (var table in tables)
+        {
+            try
+            {
+                await db.Database.ExecuteSqlRawAsync($"TRUNCATE TABLE {table}");
+                _logger.LogInformation("Truncated {table}", table);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to truncate {table} — check for foreign key references", table);
+                throw;
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // NIGHTLY FULL RELOAD — truncate everything, then re-fetch
+    // 2020→today fresh, insert-only. Runs once daily at 00:00 IST.
+    // ─────────────────────────────────────────────────────────
+    public async Task<SyncResult> RunNightlyFullReloadAsync(CancellationToken ct = default)
+    {
+        var overallResult = new SyncResult { SyncType = "NightlyFullReload" };
+
+        _logger.LogInformation("Nightly full reload starting: truncating all tables...");
+        await TruncateAllDataTablesAsync();
+
+        _logger.LogInformation("Truncate complete. Re-fetching dealers...");
+        await SyncAllDealersAsync();
+        await SyncCallCentreDealersAsync();
+
+        var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2020-01-01";
+        var start = DateTime.Parse(startDateStr);
+        var end   = DateTime.UtcNow.Date;
+
+        _logger.LogInformation("Re-fetching ServiceHistory {from} → {to}...", start, end);
+        var djr = await BackfillHistoricalDataAsync(start, end, ct);
+        overallResult.RecordsFetched  += djr.RecordsFetched;
+        overallResult.RecordsInserted += djr.RecordsInserted;
+
+        _logger.LogInformation("Re-fetching VehicleSales {from} → {to}...", start, end);
+        var vsr = await BackfillVehicleSalesAsync(start, end, ct);
+        overallResult.RecordsFetched  += vsr.RecordsFetched;
+        overallResult.RecordsInserted += vsr.RecordsInserted;
+
+        _logger.LogInformation("Re-fetching VehicleDispatches {from} → {to}...", start, end);
+        var vdr = await BackfillVehicleDispatchesAsync(start, end, ct);
+        overallResult.RecordsFetched  += vdr.RecordsFetched;
+        overallResult.RecordsInserted += vdr.RecordsInserted;
+
+        _logger.LogInformation("Re-fetching LineOrderReport {from} → {to}...", start, end);
+        var lor = await BackfillLineOrderReportAsync(start, end, ct);
+        overallResult.RecordsFetched  += lor.RecordsFetched;
+        overallResult.RecordsInserted += lor.RecordsInserted;
+
+        _logger.LogInformation(
+            "Nightly full reload complete: {fet} fetched, {ins} inserted across all report types.",
+            overallResult.RecordsFetched, overallResult.RecordsInserted);
+
+        return overallResult;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // MAPPING HELPERS — unchanged (Update* helpers deleted, no
+    // longer called anywhere since everything is insert-only now)
+    // ─────────────────────────────────────────────────────────
 
     private static DmsDealer MapDealer(DealerValue d) => new()
     {
@@ -1482,14 +1458,6 @@ public class DataSyncService
         DealerCityName = d.DealerCityName, PinCode = d.PinCode, ActiveStatus = d.ActiveStatus,
         LastFetchedAt = DateTime.UtcNow, CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
     };
-
-    private static void UpdateDealer(DmsDealer e, DealerValue d)
-    {
-        e.DealerCompany = d.DealerCompany; e.ContactNo = d.ContactNo;
-        e.AlternateContactNo = d.AlternateContactNo; e.DealerStateName = d.DealerStateName;
-        e.DealerCityName = d.DealerCityName; e.PinCode = d.PinCode; e.ActiveStatus = d.ActiveStatus;
-        e.LastFetchedAt = DateTime.UtcNow; e.UpdatedAt = DateTime.UtcNow;
-    }
 
     private static DmsServiceHistory ParseServiceHistory(DjrValue j) => new()
     {
@@ -1516,29 +1484,6 @@ public class DataSyncService
         NetTotal = ParseDecimal(j.NetTotal), IsRowTotal = j.JobNo == "Total",
         CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
     };
-
-    private static void UpdateServiceHistory(DmsServiceHistory e, DmsServiceHistory n)
-    {
-        e.JobDate = n.JobDate; e.CompName = n.CompName; e.Location = n.Location; e.InTime = n.InTime;
-        e.CloseTime = n.CloseTime; e.JobCategory = n.JobCategory; e.Ffrpercentage = n.Ffrpercentage;
-        e.DocNo = n.DocNo; e.DocType = n.DocType; e.DocDate = n.DocDate; e.Model = n.Model;
-        e.BrandName = n.BrandName; e.RegNo = n.RegNo; e.VehicleType = n.VehicleType; e.EngineNo = n.EngineNo;
-        e.ChassisNo = n.ChassisNo; e.Kms = n.Kms; e.BatterySerialNo1 = n.BatterySerialNo1;
-        e.BatterySerialNo2 = n.BatterySerialNo2; e.BatterySerialNo3 = n.BatterySerialNo3;
-        e.BatterySerialNo4 = n.BatterySerialNo4; e.BatterySerialNo5 = n.BatterySerialNo5;
-        e.BatterySerialNo6 = n.BatterySerialNo6; e.IndividualAhbattery1 = n.IndividualAhbattery1;
-        e.IndividualAhbattery2 = n.IndividualAhbattery2; e.IndividualAhbattery3 = n.IndividualAhbattery3;
-        e.IndividualAhbattery4 = n.IndividualAhbattery4; e.IndividualAhbattery5 = n.IndividualAhbattery5;
-        e.IndividualAhbattery6 = n.IndividualAhbattery6; e.PartyName = n.PartyName;
-        e.MobileNumber = n.MobileNumber; e.Supervisor = n.Supervisor; e.Technician = n.Technician;
-        e.ServiceHead = n.ServiceHead; e.JobType = n.JobType; e.SaleDate = n.SaleDate;
-        e.CouponNo = n.CouponNo; e.ExpectedDeliveryDate = n.ExpectedDeliveryDate;
-        e.ProformaDate = n.ProformaDate; e.InvoiceDate = n.InvoiceDate;
-        e.EstimatedJobExpenses = n.EstimatedJobExpenses; e.LabourHours = n.LabourHours;
-        e.Parts = n.Parts; e.Accessory = n.Accessory; e.Oil = n.Oil; e.Labour = n.Labour;
-        e.OutsideWork = n.OutsideWork; e.TotalWotax = n.TotalWotax; e.Gstamount = n.Gstamount;
-        e.Igstamount = n.Igstamount; e.NetTotal = n.NetTotal; e.UpdatedAt = DateTime.UtcNow;
-    }
 
     private static DmsVehicleSale ParseVehicleSale(VsrValue v) => new()
     {
@@ -1568,33 +1513,6 @@ public class DataSyncService
         CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
     };
 
-    private static void UpdateVehicleSale(DmsVehicleSale e, DmsVehicleSale n)
-    {
-        e.DealerName = n.DealerName; e.DealerCode = n.DealerCode; e.InvoiceNo = n.InvoiceNo;
-        e.InvoiceDate = n.InvoiceDate; e.Location = n.Location;
-        e.LocCode = n.LocCode; e.LocationCity = n.LocationCity; e.CustDob = n.CustDob;
-        e.Gender = n.Gender; e.SoldTo = n.SoldTo; e.AccountType = n.AccountType;
-        e.PartyEmail = n.PartyEmail; e.CusMob = n.CusMob; e.Address1 = n.Address1;
-        e.Address2 = n.Address2; e.City = n.City; e.State = n.State; e.ExecutiveName = n.ExecutiveName;
-        e.Pin = n.Pin; e.MotorNo = n.MotorNo; e.Remarks = n.Remarks;
-        e.ItemModel = n.ItemModel; e.Oemmodel = n.Oemmodel; e.ColorCode = n.ColorCode;
-        e.VehicleType = n.VehicleType; e.VehicleGroup = n.VehicleGroup; e.Hsnsaccode = n.Hsnsaccode;
-        e.SaleType = n.SaleType; e.FinancedBy = n.FinancedBy; e.FinAmount = n.FinAmount;
-        e.ItemRate = n.ItemRate; e.InsuAmount = n.InsuAmount; e.RegnAmount = n.RegnAmount;
-        e.AcsryAmount = n.AcsryAmount; e.PreGstdiscAmount = n.PreGstdiscAmount;
-        e.DiscTypeName = n.DiscTypeName; e.PostGstdisc = n.PostGstdisc; e.FameIi = n.FameIi;
-        e.StateFameIi = n.StateFameIi; e.Sgstper = n.Sgstper; e.Sgstamount = n.Sgstamount;
-        e.Cgstper = n.Cgstper; e.Cgstamount = n.Cgstamount; e.Igstper = n.Igstper;
-        e.Igstamount = n.Igstamount; e.NetAmount = n.NetAmount; e.ReferenceNo = n.ReferenceNo;
-        e.BookingDate = n.BookingDate; e.TotalCount = n.TotalCount; e.Battery = n.Battery;
-        e.BatteryChemical = n.BatteryChemical; e.BatteryCapacity = n.BatteryCapacity;
-        e.BatteryMake = n.BatteryMake; e.ChargerNo = n.ChargerNo; e.ChargerNo2 = n.ChargerNo2;
-        e.Converter = n.Converter; e.Vcu = n.Vcu; e.ControllerNo = n.ControllerNo;
-        e.FameIirequired = n.FameIirequired; e.SegmentName = n.SegmentName;
-        e.InstitutionalName = n.InstitutionalName; e.SchemeName = n.SchemeName;
-        e.UpdatedAt = DateTime.UtcNow;
-    }
-
     private static DmsVehicleDispatch MapVehicleDispatch(VdrValue d) => new()
     {
         SaleDate = ParseDate(d.SaleDate), InvoiceNo = d.InvoiceNo, InvoiceDate = ParseDate(d.InvoiceDate),
@@ -1616,25 +1534,6 @@ public class DataSyncService
         CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
     };
 
-    private static void UpdateVehicleDispatch(DmsVehicleDispatch e, DmsVehicleDispatch n)
-    {
-        e.SaleDate = n.SaleDate; e.InvoiceNo = n.InvoiceNo; e.InvoiceDate = n.InvoiceDate; e.Location = n.Location;
-        e.LocationCode = n.LocationCode; e.LocationCity = n.LocationCity; e.LocationStatus = n.LocationStatus;
-        e.DealerName = n.DealerName; e.Zone = n.Zone; e.AreaOffice = n.AreaOffice; e.MfgYear = n.MfgYear;
-        e.BrandName = n.BrandName; e.ModelCode = n.ModelCode; e.ColorCode = n.ColorCode;
-        e.RegNo = n.RegNo; e.MotorNo = n.MotorNo; e.BatteryId = n.BatteryId; e.BatteryNo = n.BatteryNo;
-        e.EcuSerialNo = n.EcuSerialNo; e.EcuImEi = n.EcuImEi; e.EcuBalMac = n.EcuBalMac;
-        e.ImmoblizerNo = n.ImmoblizerNo; e.BikeSimId = n.BikeSimId; e.BikeMobileNo = n.BikeMobileNo;
-        e.ChargerNo = n.ChargerNo; e.ControllerNo = n.ControllerNo; e.SoundbarSerialNo = n.SoundbarSerialNo;
-        e.SoundbarBalMac = n.SoundbarBalMac; e.Voltage = n.Voltage; e.RegNumber = n.RegNumber;
-        e.StartDate = n.StartDate; e.Tyre1 = n.Tyre1; e.Tyre2 = n.Tyre2; e.VehicleStatus = n.VehicleStatus;
-        e.BookingId = n.BookingId; e.BillNo = n.BillNo; e.BillDate = n.BillDate; e.BillType = n.BillType;
-        e.FinancerName = n.FinancerName; e.FinAmount = n.FinAmount; e.NameOfParty = n.NameOfParty;
-        e.Address1 = n.Address1; e.Address2 = n.Address2; e.State = n.State; e.City = n.City;
-        e.Pin = n.Pin; e.MobileNo = n.MobileNo; e.Email = n.Email; e.AppPush = n.AppPush;
-        e.LeadId = n.LeadId; e.Vcu = n.Vcu; e.UpdatedAt = DateTime.UtcNow;
-    }
-
     private static DmsLineOrderReport MapLineOrderReport(LorValue r) => new()
     {
         DealerName = r.DealerName, DealerCode = r.DealerCode, UniqueId = r.UniqueId, LocCode = r.LocCode,
@@ -1650,21 +1549,6 @@ public class DataSyncService
         TotalAmount = ParseDecimal(r.TotalAmount), Mrp = ParseDecimal(r.Mrp), DealerType = r.DealerType,
         CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
     };
-
-    private static void UpdateLineOrderReport(DmsLineOrderReport e, DmsLineOrderReport n)
-    {
-        e.DealerName = n.DealerName; e.DealerCode = n.DealerCode;
-        e.DocDate = n.DocDate; e.DocNo = n.DocNo; e.DocType = n.DocType; e.JobDate = n.JobDate;
-        e.JobNo = n.JobNo; e.BrandName = n.BrandName; e.Model = n.Model; e.JobCardType = n.JobCardType;
-        e.PaymentMode = n.PaymentMode; e.PartyName = n.PartyName; e.PartyMobile = n.PartyMobile;
-        e.RegNo = n.RegNo; e.VehicleType = n.VehicleType; e.ChassisNo = n.ChassisNo; e.Location = n.Location;
-        e.ItemName = n.ItemName; e.ItemDescription = n.ItemDescription; e.ItemType = n.ItemType;
-        e.Qty = n.Qty; e.Rate = n.Rate; e.Total = n.Total; e.SgstPer = n.SgstPer;
-        e.SgstAmount = n.SgstAmount; e.CgstPer = n.CgstPer; e.CgstAmount = n.CgstAmount;
-        e.IgstPer = n.IgstPer; e.IgstAmount = n.IgstAmount; e.Discount = n.Discount;
-        e.TotalAmount = n.TotalAmount; e.Mrp = n.Mrp; e.DealerType = n.DealerType;
-        e.UpdatedAt = DateTime.UtcNow;
-    }
 
     private static DateOnly? ParseDate(string? val)
     {
