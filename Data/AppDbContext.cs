@@ -35,6 +35,7 @@ public partial class AppDbContext : DbContext
     public DbSet<DmsCallCentreDealer> DmsCallCentreDealers  { get; set; }
     public DbSet<DmsLineOrderReport> DmsLineOrderReports { get; set; }
     public DbSet<DmsShadowfaxChassisMaster> DmsShadowfaxChassisMasters { get; set; }
+    public DbSet<DmsJobReport> DmsJobReports { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -522,6 +523,42 @@ public partial class AppDbContext : DbContext
 
             entity.Property(e => e.UpdatedAt)
                 .HasDefaultValueSql("(getutcdate())");
+        });
+
+        modelBuilder.Entity<DmsJobReport>(entity =>
+        {
+            entity.ToTable("DMS_JobReport");
+
+            entity.HasKey(e => e.Id);
+
+            entity.Property(e => e.DealerName).HasMaxLength(200);
+            entity.Property(e => e.DealerCode).HasMaxLength(20);
+            entity.Property(e => e.DealerLocation).HasMaxLength(200);
+            entity.Property(e => e.City).HasMaxLength(100);
+            entity.Property(e => e.State).HasMaxLength(100);
+            entity.Property(e => e.JobNo).HasMaxLength(50);
+            entity.Property(e => e.JobType).HasMaxLength(100);
+            entity.Property(e => e.ServiceHead).HasMaxLength(100);
+            entity.Property(e => e.ServiceType).HasMaxLength(100);
+            entity.Property(e => e.Kms).HasMaxLength(50);
+            entity.Property(e => e.CustomerName).HasMaxLength(200);
+            entity.Property(e => e.MobileNo).HasMaxLength(20);
+            entity.Property(e => e.ChassisNo).HasMaxLength(50);
+            entity.Property(e => e.RegNo).HasMaxLength(50);
+            entity.Property(e => e.EngineNo).HasMaxLength(50);
+            entity.Property(e => e.ItemName).HasMaxLength(200);
+            entity.Property(e => e.ComplaintCode).HasMaxLength(100);
+            entity.Property(e => e.JobStatus).HasMaxLength(50);
+            entity.Property(e => e.BatteryNo).HasMaxLength(50);
+            entity.Property(e => e.BrandName).HasMaxLength(100);
+            entity.Property(e => e.ChargerNo).HasMaxLength(50);
+            entity.Property(e => e.Supervisor).HasMaxLength(100);
+            entity.Property(e => e.Technician).HasMaxLength(100);
+            entity.Property(e => e.CreatedThrough).HasMaxLength(50);
+            entity.Property(e => e.UniqueKey).HasMaxLength(400);
+
+            entity.HasIndex(e => e.UniqueKey)
+                .HasDatabaseName("IX_JobReport_UniqueKey");
         });
 
         OnModelCreatingPartial(modelBuilder);

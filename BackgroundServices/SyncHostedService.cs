@@ -28,7 +28,7 @@ public class SyncHostedService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
-        _logger.LogInformation("SyncHostedService starting — nightly full-reload mode (12:00 AM IST only, insert-only).");
+        _logger.LogInformation("SyncHostedService starting — nightly insert-only reload mode (12:00 AM IST).");
 
         while (!ct.IsCancellationRequested)
         {
@@ -39,7 +39,7 @@ public class SyncHostedService : BackgroundService
             if (isMidnightIst && _lastReloadDateIst != nowIst.Date)
             {
                 _lastReloadDateIst = nowIst.Date;
-                _logger.LogInformation("Midnight IST trigger fired at {time} — starting nightly truncate + full reload.", nowIst);
+                _logger.LogInformation("Midnight IST trigger fired at {time} — starting nightly insert-only reload (no truncate).", nowIst);
 
                 using var scope = _scopeFactory.CreateScope();
                 var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
@@ -48,12 +48,12 @@ public class SyncHostedService : BackgroundService
                 {
                     var result = await svc.RunNightlyFullReloadAsync(ct);
                     _logger.LogInformation(
-                        "Nightly full reload complete: {fet} fetched, {ins} inserted.",
+                        "Nightly reload complete: {fet} fetched, {ins} inserted.",
                         result.RecordsFetched, result.RecordsInserted);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Nightly full reload failed");
+                    _logger.LogError(ex, "Nightly reload failed");
                 }
             }
 

@@ -1381,7 +1381,7 @@ public class DataSyncService
             "DMS_VehicleSales",
             "DMS_VehicleDispatches",
             "DMS_LineOrderReport",
-            "DMS_Dealers",
+            //"DMS_Dealers",
             "DMS_CallCentreDealers"
         };
 
@@ -1444,6 +1444,434 @@ public class DataSyncService
             overallResult.RecordsFetched, overallResult.RecordsInserted);
 
         return overallResult;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // UPSERT VARIANTS — used only by the PUT endpoints in
+    // DataController. Insert new records AND update existing matches,
+    // unlike the POST/insert-only Sync* methods above.
+    // ─────────────────────────────────────────────────────────
+
+    public async Task<SyncResult> UpsertServiceHistoryForRangeAsync(DateTime startDate, DateTime endDate)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var log = new DmsSyncLog
+        {
+            SyncType  = "ServiceHistoryUpsert",
+            SyncDate  = DateOnly.FromDateTime(endDate),
+            StartedAt = DateTime.UtcNow,
+            Status    = "Running"
+        };
+        db.DmsSyncLogs.Add(log);
+        await db.SaveChangesAsync();
+
+        var result = new SyncResult { SyncType = "ServiceHistoryUpsert", Date = endDate };
+
+        try
+        {
+            var token = await _erpApi.GetValidTokenAsync();
+            var jobs = await _erpApi.FetchDjrRangeAsync(startDate, endDate, token);
+            result.RecordsFetched = jobs.Count;
+
+            var afterFilter = jobs
+                .Where(j => j.JobNo != "Total"
+                        && !string.IsNullOrEmpty(j.DealerCode)
+                        && !string.IsNullOrEmpty(j.JobNo))
+                .ToList();
+
+            var parsedRecords = afterFilter
+                .Select(j =>
+                {
+                    var parsed = ParseServiceHistory(j);
+                    if (parsed.JobDate == null)
+                        parsed.JobDate = DateOnly.FromDateTime(endDate);
+                    parsed.UniqueKey = BuildUniqueKey(parsed.DealerCode, parsed.JobNo, parsed.JobDate, parsed.ChassisNo);
+                    return parsed;
+                })
+                .ToList();
+
+            var dedupedRecords = parsedRecords
+                .GroupBy(p => p.UniqueKey)
+                .Select(g => g.Last())
+                .ToList();
+
+            var candidateKeys = dedupedRecords.Select(p => p.UniqueKey).ToHashSet();
+            var existingRaw = await db.DmsServiceHistories
+                .Where(x => x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
+                .ToListAsync();
+            var existingLookup = existingRaw
+                .Where(x => x.UniqueKey != null)
+                .GroupBy(x => x.UniqueKey!)
+                .ToDictionary(g => g.Key, g => g.First());
+
+            int saveCounter = 0;
+            int skippedOnError = 0;
+
+            foreach (var parsed in dedupedRecords)
+            {
+                try
+                {
+                    if (existingLookup.TryGetValue(parsed.UniqueKey!, out var existing))
+                    {
+                        existing.JobDate = parsed.JobDate; existing.DocNo = parsed.DocNo;
+                        existing.DocType = parsed.DocType; existing.DocDate = parsed.DocDate;
+                        existing.InvoiceDate = parsed.InvoiceDate; existing.NetTotal = parsed.NetTotal;
+                        existing.EstimatedJobExpenses = parsed.EstimatedJobExpenses;
+                        existing.Parts = parsed.Parts; existing.Labour = parsed.Labour;
+                        existing.Gstamount = parsed.Gstamount; existing.Igstamount = parsed.Igstamount;
+                        existing.TotalWotax = parsed.TotalWotax; existing.UpdatedAt = DateTime.UtcNow;
+                        result.RecordsUpdated++;
+                    }
+                    else
+                    {
+                        db.DmsServiceHistories.Add(parsed);
+                        result.RecordsInserted++;
+                    }
+
+                    saveCounter++;
+                    if (saveCounter % SaveBatchSize == 0)
+                        await db.SaveChangesAsync();
+                }
+                catch (Exception ex)
+                {
+                    skippedOnError++;
+                    _logger.LogWarning("Upsert skip job {no} for {dc}: {msg}", parsed.JobNo, parsed.DealerCode, ex.Message);
+                }
+            }
+
+            log.ErrorMessage = $"{skippedOnError} per-record error(s). UPSERT mode.";
+            await db.SaveChangesAsync();
+            log.Status = "Success";
+        }
+        catch (Exception ex)
+        {
+            log.Status = "Failed";
+            log.ErrorMessage = ex.InnerException?.Message ?? ex.Message;
+            result.Error = log.ErrorMessage;
+            _logger.LogError(ex, "ServiceHistory upsert failed");
+        }
+
+        log.CompletedAt = DateTime.UtcNow;
+        log.RecordsFetched = result.RecordsFetched;
+        log.RecordsInserted = result.RecordsInserted;
+        log.RecordsUpdated = result.RecordsUpdated;
+        await db.SaveChangesAsync();
+        return result;
+    }
+
+    public async Task<SyncResult> UpsertVehicleSalesForRangeAsync(DateTime startDate, DateTime endDate)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var log = new DmsSyncLog
+        {
+            SyncType = "VehicleSalesUpsert", SyncDate = DateOnly.FromDateTime(endDate),
+            StartedAt = DateTime.UtcNow, Status = "Running"
+        };
+        db.DmsSyncLogs.Add(log);
+        await db.SaveChangesAsync();
+
+        var result = new SyncResult { SyncType = "VehicleSalesUpsert", Date = endDate };
+
+        try
+        {
+            var token = await _erpApi.GetValidTokenAsync();
+            var sales = await _erpApi.FetchVsrAsync("", startDate, endDate, token);
+            result.RecordsFetched = sales.Count;
+
+            var dedupedRecords = sales
+                .Where(s => !string.IsNullOrEmpty(s.ChassisNo))
+                .GroupBy(s => s.ChassisNo!.Trim().ToUpperInvariant())
+                .Select(g => g.Last())
+                .ToList();
+
+            var chassisKeys = dedupedRecords.Select(s => s.ChassisNo!.Trim().ToUpperInvariant()).ToHashSet();
+            var existingRaw = await db.DmsVehicleSales
+                .Where(x => x.ChassisNo != null && chassisKeys.Contains(x.ChassisNo!.Trim().ToUpper()))
+                .ToListAsync();
+            var existingLookup = existingRaw
+                .Where(x => x.ChassisNo != null)
+                .GroupBy(x => x.ChassisNo!.Trim().ToUpperInvariant())
+                .ToDictionary(g => g.Key, g => g.First());
+
+            int saveCounter = 0;
+            int skippedOnError = 0;
+
+            foreach (var sale in dedupedRecords)
+            {
+                try
+                {
+                    var parsed = ParseVehicleSale(sale);
+                    var key = parsed.ChassisNo!.Trim().ToUpperInvariant();
+
+                    if (existingLookup.TryGetValue(key, out var existing))
+                    {
+                        existing.InvoiceNo = parsed.InvoiceNo; existing.InvoiceDate = parsed.InvoiceDate;
+                        existing.NetAmount = parsed.NetAmount; existing.ItemRate = parsed.ItemRate;
+                        existing.FinancedBy = parsed.FinancedBy; existing.FinAmount = parsed.FinAmount;
+                        existing.SoldTo = parsed.SoldTo; existing.CusMob = parsed.CusMob;
+                        existing.UpdatedAt = DateTime.UtcNow;
+                        result.RecordsUpdated++;
+                    }
+                    else
+                    {
+                        db.DmsVehicleSales.Add(parsed);
+                        result.RecordsInserted++;
+                    }
+
+                    saveCounter++;
+                    if (saveCounter % SaveBatchSize == 0)
+                        await db.SaveChangesAsync();
+                }
+                catch (Exception ex)
+                {
+                    skippedOnError++;
+                    _logger.LogWarning("Upsert skip sale (chassis {ch}): {msg}", sale.ChassisNo, ex.Message);
+                }
+            }
+
+            log.ErrorMessage = $"{skippedOnError} per-record error(s). UPSERT mode.";
+            await db.SaveChangesAsync();
+            log.Status = "Success";
+        }
+        catch (Exception ex)
+        {
+            log.Status = "Failed";
+            log.ErrorMessage = ex.InnerException?.Message ?? ex.Message;
+            result.Error = log.ErrorMessage;
+            _logger.LogError(ex, "VehicleSales upsert failed");
+        }
+
+        log.CompletedAt = DateTime.UtcNow;
+        log.RecordsFetched = result.RecordsFetched;
+        log.RecordsInserted = result.RecordsInserted;
+        log.RecordsUpdated = result.RecordsUpdated;
+        await db.SaveChangesAsync();
+        return result;
+    }
+
+    public async Task<SyncResult> UpsertVehicleDispatchesForRangeAsync(DateTime startDate, DateTime endDate)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var log = new DmsSyncLog
+        {
+            SyncType = "VehicleDispatchesUpsert", SyncDate = DateOnly.FromDateTime(endDate),
+            StartedAt = DateTime.UtcNow, Status = "Running"
+        };
+        db.DmsSyncLogs.Add(log);
+        await db.SaveChangesAsync();
+
+        var result = new SyncResult { SyncType = "VehicleDispatchesUpsert", Date = endDate };
+
+        try
+        {
+            var token = await _erpApi.GetValidTokenAsync();
+            var dispatches = await _erpApi.FetchVdrAsync(startDate, endDate, token);
+            result.RecordsFetched = dispatches.Count;
+
+            var dedupedRecords = dispatches
+                .Where(d => !string.IsNullOrEmpty(d.ChassisNo))
+                .GroupBy(d => d.ChassisNo!.Trim().ToUpperInvariant())
+                .Select(g => g.Last())
+                .ToList();
+
+            var chassisKeys = dedupedRecords.Select(d => d.ChassisNo!.Trim().ToUpperInvariant()).ToHashSet();
+            var existingRaw = await db.DmsVehicleDispatches
+                .Where(x => x.ChassisNo != null && chassisKeys.Contains(x.ChassisNo!.Trim().ToUpper()))
+                .ToListAsync();
+            var existingLookup = existingRaw
+                .Where(x => x.ChassisNo != null)
+                .GroupBy(x => x.ChassisNo!.Trim().ToUpperInvariant())
+                .ToDictionary(g => g.Key, g => g.First());
+
+            int saveCounter = 0;
+            int skippedOnError = 0;
+
+            foreach (var d in dedupedRecords)
+            {
+                try
+                {
+                    var parsed = MapVehicleDispatch(d);
+                    var key = parsed.ChassisNo!.Trim().ToUpperInvariant();
+
+                    if (existingLookup.TryGetValue(key, out var existing))
+                    {
+                        existing.VehicleStatus = parsed.VehicleStatus; existing.InvoiceNo = parsed.InvoiceNo;
+                        existing.InvoiceDate = parsed.InvoiceDate; existing.NameOfParty = parsed.NameOfParty;
+                        existing.MobileNo = parsed.MobileNo; existing.FinancerName = parsed.FinancerName;
+                        existing.FinAmount = parsed.FinAmount; existing.UpdatedAt = DateTime.UtcNow;
+                        result.RecordsUpdated++;
+                    }
+                    else
+                    {
+                        db.DmsVehicleDispatches.Add(parsed);
+                        result.RecordsInserted++;
+                    }
+
+                    saveCounter++;
+                    if (saveCounter % SaveBatchSize == 0)
+                        await db.SaveChangesAsync();
+                }
+                catch (Exception ex)
+                {
+                    skippedOnError++;
+                    _logger.LogWarning("Upsert skip dispatch (chassis {ch}): {msg}", d.ChassisNo, ex.Message);
+                }
+            }
+
+            log.ErrorMessage = $"{skippedOnError} per-record error(s). UPSERT mode.";
+            await db.SaveChangesAsync();
+            log.Status = "Success";
+        }
+        catch (Exception ex)
+        {
+            log.Status = "Failed";
+            log.ErrorMessage = ex.InnerException?.Message ?? ex.Message;
+            result.Error = log.ErrorMessage;
+            _logger.LogError(ex, "VehicleDispatches upsert failed");
+        }
+
+        log.CompletedAt = DateTime.UtcNow;
+        log.RecordsFetched = result.RecordsFetched;
+        log.RecordsInserted = result.RecordsInserted;
+        log.RecordsUpdated = result.RecordsUpdated;
+        await db.SaveChangesAsync();
+        return result;
+    }
+
+    public async Task<SyncResult> UpsertLineOrderReportAsync(DateTime startDate, DateTime endDate)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var log = new DmsSyncLog
+        {
+            SyncType = "LineOrderReportUpsert", SyncDate = DateOnly.FromDateTime(endDate),
+            StartedAt = DateTime.UtcNow, Status = "Running"
+        };
+        db.DmsSyncLogs.Add(log);
+        await db.SaveChangesAsync();
+
+        var result = new SyncResult { SyncType = "LineOrderReportUpsert", Date = endDate };
+
+        try
+        {
+            var token = await _erpApi.GetValidTokenAsync();
+
+            var dealerCodes = await db.DmsDealers
+                .Where(d => d.DealerCode != null)
+                .Select(d => d.DealerCode!)
+                .Distinct()
+                .ToListAsync();
+
+            if (!dealerCodes.Any())
+            {
+                log.Status = "Failed";
+                log.ErrorMessage = "No dealers in DMS_Dealers. Run dealer sync first.";
+                log.CompletedAt = DateTime.UtcNow;
+                await db.SaveChangesAsync();
+                return result;
+            }
+
+            int skippedOnError = 0;
+            int saveCounter = 0;
+
+            foreach (var dealerCode in dealerCodes)
+            {
+                await Task.Delay(200);
+                try
+                {
+                    var records = await _erpApi.FetchLorAsync(dealerCode, startDate, endDate, token);
+                    result.RecordsFetched += records.Count;
+
+                    var parsedRecords = records
+                        .Select(r =>
+                        {
+                            var parsed = MapLineOrderReport(r);
+                            parsed.UniqueKey = BuildLorUniqueKey(
+                                parsed.DealerCode, parsed.JobNo, parsed.JobDate,
+                                parsed.ChassisNo, parsed.ItemName, parsed.ItemDescription);
+                            return parsed;
+                        })
+                        .ToList();
+
+                    var dedupedRecords = parsedRecords
+                        .GroupBy(p => p.UniqueKey)
+                        .Select(g => g.Last())
+                        .ToList();
+
+                    if (!dedupedRecords.Any()) continue;
+
+                    var candidateKeys = dedupedRecords.Select(p => p.UniqueKey).ToHashSet();
+                    var existingRaw = await db.DmsLineOrderReports
+                        .Where(x => x.DealerCode == dealerCode && x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
+                        .ToListAsync();
+                    var existingLookup = existingRaw
+                        .Where(x => x.UniqueKey != null)
+                        .GroupBy(x => x.UniqueKey!)
+                        .ToDictionary(g => g.Key, g => g.First());
+
+                    foreach (var parsed in dedupedRecords)
+                    {
+                        try
+                        {
+                            if (existingLookup.TryGetValue(parsed.UniqueKey!, out var existing))
+                            {
+                                existing.Rate = parsed.Rate; existing.Total = parsed.Total;
+                                existing.TotalAmount = parsed.TotalAmount; existing.Discount = parsed.Discount;
+                                existing.SgstAmount = parsed.SgstAmount; existing.CgstAmount = parsed.CgstAmount;
+                                existing.IgstAmount = parsed.IgstAmount; existing.DocNo = parsed.DocNo;
+                                existing.DocDate = parsed.DocDate; existing.UpdatedAt = DateTime.UtcNow;
+                                result.RecordsUpdated++;
+                            }
+                            else
+                            {
+                                db.DmsLineOrderReports.Add(parsed);
+                                result.RecordsInserted++;
+                            }
+
+                            saveCounter++;
+                            if (saveCounter % SaveBatchSize == 0)
+                                await db.SaveChangesAsync();
+                        }
+                        catch (Exception ex)
+                        {
+                            skippedOnError++;
+                            _logger.LogWarning("Upsert skip LOR (dealer {dc}, job {jn}): {msg}",
+                                dealerCode, parsed.JobNo, ex.Message);
+                        }
+                    }
+
+                    await db.SaveChangesAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("LOR upsert fetch failed for dealer {dc}: {msg}", dealerCode, ex.Message);
+                }
+            }
+
+            log.ErrorMessage = $"{skippedOnError} per-record error(s). UPSERT mode.";
+            log.Status = "Success";
+        }
+        catch (Exception ex)
+        {
+            log.Status = "Failed";
+            log.ErrorMessage = ex.InnerException?.Message ?? ex.Message;
+            result.Error = log.ErrorMessage;
+            _logger.LogError(ex, "LOR upsert failed");
+        }
+
+        log.CompletedAt = DateTime.UtcNow;
+        log.RecordsFetched = result.RecordsFetched;
+        log.RecordsInserted = result.RecordsInserted;
+        log.RecordsUpdated = result.RecordsUpdated;
+        await db.SaveChangesAsync();
+        return result;
     }
 
     // ─────────────────────────────────────────────────────────
