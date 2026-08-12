@@ -3,6 +3,7 @@ using AutoGeniusSync.DTOs;
 using AutoGeniusSync.Models;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using AutoGeniusSync.Helpers;
 
 namespace AutoGeniusSync.Controllers;
 
@@ -508,5 +509,111 @@ public class JobReportController : ControllerBase
         _logger.LogInformation("JobReport deleted: Id {id}, Job {jn}", id, existing.JobNo);
 
         return NoContent();
+    }
+
+    // ── POST /api/jobreport/bulk — insert-only ──
+    [HttpPost("bulk")]
+    public async Task<IActionResult> BulkInsert([FromBody] List<JobReportRecordDto> records)
+    {
+        if (records is null || records.Count == 0)
+            return BadRequest(new { error = "Payload must be a non-empty array of records." });
+
+        foreach (var r in records)
+            if (string.IsNullOrWhiteSpace(r.UniqueKey))
+                r.UniqueKey = UniqueKeyBuilder.JobReport(r.DealerCode, r.JobNo, r.JobDate, r.ChassisNo);
+
+        var deduped = records.GroupBy(r => r.UniqueKey).Select(g => g.Last()).ToList();
+        var keys = deduped.Select(r => r.UniqueKey!).ToList();
+
+        var existingKeys = (await _db.DmsJobReports
+            .Where(x => x.UniqueKey != null && keys.Contains(x.UniqueKey))
+            .Select(x => x.UniqueKey!)
+            .ToListAsync()).ToHashSet();
+
+        var toInsert = new List<DmsJobReport>();
+        var skipped = new List<string>();
+
+        foreach (var r in deduped)
+        {
+            if (existingKeys.Contains(r.UniqueKey!)) { skipped.Add(r.UniqueKey!); continue; }
+            toInsert.Add(MapJobReport(r));
+        }
+
+        if (toInsert.Count > 0)
+        {
+            await _db.DmsJobReports.AddRangeAsync(toInsert);
+            await _db.SaveChangesAsync();
+        }
+
+        _logger.LogInformation("JobReport bulk insert: {ins} inserted, {skip} skipped", toInsert.Count, skipped.Count);
+        return Ok(new { Inserted = toInsert.Count, SkippedDuplicates = skipped.Count, SkippedKeys = skipped });
+    }
+
+    // ── PUT /api/jobreport/bulk — upsert ──
+    [HttpPut("bulk")]
+    public async Task<IActionResult> BulkUpsert([FromBody] List<JobReportRecordDto> records)
+    {
+        if (records is null || records.Count == 0)
+            return BadRequest(new { error = "Payload must be a non-empty array of records." });
+
+        foreach (var r in records)
+            if (string.IsNullOrWhiteSpace(r.UniqueKey))
+                r.UniqueKey = UniqueKeyBuilder.JobReport(r.DealerCode, r.JobNo, r.JobDate, r.ChassisNo);
+
+        var deduped = records.GroupBy(r => r.UniqueKey).Select(g => g.Last()).ToList();
+        var keys = deduped.Select(r => r.UniqueKey!).ToList();
+
+        var existing = await _db.DmsJobReports
+            .Where(x => x.UniqueKey != null && keys.Contains(x.UniqueKey))
+            .ToListAsync();
+        var lookup = existing.ToDictionary(x => x.UniqueKey!, x => x);
+
+        int inserted = 0, updated = 0;
+
+        foreach (var r in deduped)
+        {
+            if (lookup.TryGetValue(r.UniqueKey!, out var row))
+            {
+                ApplyJobReport(row, r);
+                row.UpdatedAt = DateTime.UtcNow;
+                updated++;
+            }
+            else
+            {
+                _db.DmsJobReports.Add(MapJobReport(r));
+                inserted++;
+            }
+        }
+
+        await _db.SaveChangesAsync();
+        _logger.LogInformation("JobReport bulk upsert: {ins} inserted, {upd} updated", inserted, updated);
+        return Ok(new { Inserted = inserted, Updated = updated });
+    }
+
+    private static DmsJobReport MapJobReport(JobReportRecordDto r) => new()
+    {
+        DealerName = r.DealerName, DealerCode = r.DealerCode, DealerLocation = r.DealerLocation,
+        City = r.City, State = r.State, JobNo = r.JobNo, JobDate = r.JobDate, JobType = r.JobType,
+        ServiceHead = r.ServiceHead, ServiceType = r.ServiceType, Kms = r.Kms, CustomerName = r.CustomerName,
+        MobileNo = r.MobileNo, ChassisNo = r.ChassisNo, RegNo = r.RegNo, EngineNo = r.EngineNo,
+        ItemName = r.ItemName, CustomerVoice = r.CustomerVoice, ComplaintCode = r.ComplaintCode,
+        Observation = r.Observation, SupervisorComment = r.SupervisorComment, JobStatus = r.JobStatus,
+        BatteryNo = r.BatteryNo, BrandName = r.BrandName, ChargerNo = r.ChargerNo, SaleDate = r.SaleDate,
+        Supervisor = r.Supervisor, Technician = r.Technician, JobEndDate = r.JobEndDate,
+        CreatedThrough = r.CreatedThrough, UniqueKey = r.UniqueKey,
+        CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
+    };
+
+    private static void ApplyJobReport(DmsJobReport row, JobReportRecordDto r)
+    {
+        row.DealerName = r.DealerName; row.DealerCode = r.DealerCode; row.DealerLocation = r.DealerLocation;
+        row.City = r.City; row.State = r.State; row.JobNo = r.JobNo; row.JobDate = r.JobDate; row.JobType = r.JobType;
+        row.ServiceHead = r.ServiceHead; row.ServiceType = r.ServiceType; row.Kms = r.Kms; row.CustomerName = r.CustomerName;
+        row.MobileNo = r.MobileNo; row.ChassisNo = r.ChassisNo; row.RegNo = r.RegNo; row.EngineNo = r.EngineNo;
+        row.ItemName = r.ItemName; row.CustomerVoice = r.CustomerVoice; row.ComplaintCode = r.ComplaintCode;
+        row.Observation = r.Observation; row.SupervisorComment = r.SupervisorComment; row.JobStatus = r.JobStatus;
+        row.BatteryNo = r.BatteryNo; row.BrandName = r.BrandName; row.ChargerNo = r.ChargerNo; row.SaleDate = r.SaleDate;
+        row.Supervisor = r.Supervisor; row.Technician = r.Technician; row.JobEndDate = r.JobEndDate;
+        row.CreatedThrough = r.CreatedThrough;
     }
 }

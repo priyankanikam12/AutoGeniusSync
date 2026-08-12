@@ -110,7 +110,11 @@ public partial class AppDbContext : DbContext
             entity.HasIndex(e => e.JobDate, "IX_DMS_Service_JobDate");
 
             // The ONLY correct unique constraint: one row per (DealerCode, JobNo).
-            entity.HasIndex(e => new { e.DealerCode, e.JobNo }, "UQ_DMS_Service_Job").IsUnique();
+            entity.HasIndex(e => e.UniqueKey, "UQ_DMS_ServiceHistory_UniqueKey")
+                .IsUnique()
+                .HasFilter("[UniqueKey] IS NOT NULL");
+            entity.Property(e => e.UniqueKey).HasMaxLength(400);
+            entity.Property(e => e.RowHash).HasMaxLength(100);
 
             entity.Property(e => e.Accessory)
                 .HasDefaultValue(0m)
@@ -240,7 +244,11 @@ public partial class AppDbContext : DbContext
 
             entity.HasIndex(e => e.InvoiceDate, "IX_DMS_VehicleSales_InvoiceDate");
 
-            entity.HasIndex(e => new { e.DealerCode, e.InvoiceNo }, "UQ_DMS_VehicleSales_Invoice").IsUnique();
+            entity.HasIndex(e => e.UniqueKey, "UQ_DMS_VehicleSales_UniqueKey")
+                .IsUnique()
+                .HasFilter("[UniqueKey] IS NOT NULL");
+            entity.Property(e => e.UniqueKey).HasMaxLength(400);
+            entity.Property(e => e.RowHash).HasMaxLength(100);
 
             entity.Property(e => e.AccountType).HasMaxLength(100);
             entity.Property(e => e.AcsryAmount)
@@ -409,8 +417,12 @@ public partial class AppDbContext : DbContext
 
         modelBuilder.Entity<DmsVehicleDispatch>(entity =>
         {
-            entity.HasIndex(v => new { v.InvoiceNo, v.ChassisNo })
-                .IsUnique();
+            entity.HasIndex(v => v.UniqueKey)
+                .IsUnique()
+                .HasFilter("[UniqueKey] IS NOT NULL")
+                .HasDatabaseName("UQ_DMS_VehicleDispatches_UniqueKey");
+            entity.Property(v => v.UniqueKey).HasMaxLength(400);
+            entity.Property(v => v.RowHash).HasMaxLength(100);
 
             entity.HasIndex(v => v.SaleDate);
 
@@ -436,9 +448,12 @@ public partial class AppDbContext : DbContext
 
             entity.HasKey(e => e.Id);
 
-            entity.HasIndex(e => new { e.DealerCode, e.UniqueId })
+            entity.HasIndex(e => e.UniqueKey)
                 .IsUnique()
-                .HasDatabaseName("UQ_DMS_LOR_DealerUniqueId");
+                .HasFilter("[UniqueKey] IS NOT NULL")
+                .HasDatabaseName("UQ_DMS_LOR_UniqueKey");
+            entity.Property(e => e.UniqueKey).HasMaxLength(400);
+            entity.Property(e => e.RowHash).HasMaxLength(100);
 
             entity.HasIndex(e => e.ChassisNo)
                 .HasDatabaseName("IX_DMS_LOR_ChassisNo");
@@ -558,7 +573,9 @@ public partial class AppDbContext : DbContext
             entity.Property(e => e.UniqueKey).HasMaxLength(400);
 
             entity.HasIndex(e => e.UniqueKey)
-                .HasDatabaseName("IX_JobReport_UniqueKey");
+            .IsUnique()
+            .HasFilter("[UniqueKey] IS NOT NULL")
+            .HasDatabaseName("UQ_DMS_JobReport_UniqueKey");
         });
 
         OnModelCreatingPartial(modelBuilder);

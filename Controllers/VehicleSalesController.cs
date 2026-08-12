@@ -3,6 +3,8 @@ using AutoGeniusSync.Services;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using AutoGeniusSync.DTOs;
+using AutoGeniusSync.Helpers;
+using AutoGeniusSync.Models;
 
 namespace AutoGeniusSync.Controllers;
 
@@ -225,4 +227,103 @@ public class VehicleSalesController : ControllerBase
     //     _ = Task.Run(() => _sync.BackfillVehicleSalesAsync());
     //     return Accepted(new { message = "Full VSR backfill started. Check /api/sync/status." });
     // }
+
+    [HttpPost("bulk")]
+    public async Task<IActionResult> BulkInsert([FromBody] List<VehicleSaleRecordDto> records)
+    {
+        if (records is null || records.Count == 0)
+            return BadRequest(new { error = "Payload must be a non-empty array of records." });
+
+        foreach (var r in records)
+            if (string.IsNullOrWhiteSpace(r.UniqueKey))
+                r.UniqueKey = UniqueKeyBuilder.VehicleSale(r.DealerCode, r.InvoiceNo, r.ChassisNo);
+
+        var deduped = records.GroupBy(r => r.UniqueKey).Select(g => g.Last()).ToList();
+        var keys = deduped.Select(r => r.UniqueKey!).ToList();
+
+        var existingKeys = (await _db.DmsVehicleSales
+            .Where(x => x.UniqueKey != null && keys.Contains(x.UniqueKey))
+            .Select(x => x.UniqueKey!)
+            .ToListAsync()).ToHashSet();
+
+        var toInsert = new List<DmsVehicleSale>();
+        var skipped = new List<string>();
+
+        foreach (var r in deduped)
+        {
+            if (existingKeys.Contains(r.UniqueKey!)) { skipped.Add(r.UniqueKey!); continue; }
+            toInsert.Add(MapVehicleSale(r));
+        }
+
+        if (toInsert.Count > 0) { await _db.DmsVehicleSales.AddRangeAsync(toInsert); await _db.SaveChangesAsync(); }
+        return Ok(new { Inserted = toInsert.Count, SkippedDuplicates = skipped.Count, SkippedKeys = skipped });
+    }
+
+    [HttpPut("bulk")]
+    public async Task<IActionResult> BulkUpsert([FromBody] List<VehicleSaleRecordDto> records)
+    {
+        if (records is null || records.Count == 0)
+            return BadRequest(new { error = "Payload must be a non-empty array of records." });
+
+        foreach (var r in records)
+            if (string.IsNullOrWhiteSpace(r.UniqueKey))
+                r.UniqueKey = UniqueKeyBuilder.VehicleSale(r.DealerCode, r.InvoiceNo, r.ChassisNo);
+
+        var deduped = records.GroupBy(r => r.UniqueKey).Select(g => g.Last()).ToList();
+        var keys = deduped.Select(r => r.UniqueKey!).ToList();
+
+        var existing = await _db.DmsVehicleSales.Where(x => x.UniqueKey != null && keys.Contains(x.UniqueKey)).ToListAsync();
+        var lookup = existing.ToDictionary(x => x.UniqueKey!, x => x);
+
+        int inserted = 0, updated = 0;
+        foreach (var r in deduped)
+        {
+            if (lookup.TryGetValue(r.UniqueKey!, out var row)) { ApplyVehicleSale(row, r); row.UpdatedAt = DateTime.UtcNow; updated++; }
+            else { _db.DmsVehicleSales.Add(MapVehicleSale(r)); inserted++; }
+        }
+
+        await _db.SaveChangesAsync();
+        return Ok(new { Inserted = inserted, Updated = updated });
+    }
+
+    private static DmsVehicleSale MapVehicleSale(VehicleSaleRecordDto r) => new()
+    {
+        DealerName = r.DealerName, DealerCode = r.DealerCode, InvoiceNo = r.InvoiceNo, InvoiceDate = r.InvoiceDate,
+        Location = r.Location, LocCode = r.LocCode, LocationCity = r.LocationCity, CustDob = r.CustDob, Gender = r.Gender,
+        SoldTo = r.SoldTo, AccountType = r.AccountType, PartyEmail = r.PartyEmail, CusMob = r.CusMob,
+        Address1 = r.Address1, Address2 = r.Address2, City = r.City, State = r.State, ExecutiveName = r.ExecutiveName,
+        Pin = r.Pin, ChassisNo = r.ChassisNo, MotorNo = r.MotorNo, Remarks = r.Remarks, ItemModel = r.ItemModel,
+        Oemmodel = r.Oemmodel, ColorCode = r.ColorCode, VehicleType = r.VehicleType, VehicleGroup = r.VehicleGroup,
+        Hsnsaccode = r.Hsnsaccode, SaleType = r.SaleType, FinancedBy = r.FinancedBy, FinAmount = r.FinAmount,
+        ItemRate = r.ItemRate, InsuAmount = r.InsuAmount, RegnAmount = r.RegnAmount, AcsryAmount = r.AcsryAmount,
+        PreGstdiscAmount = r.PreGstdiscAmount, DiscTypeName = r.DiscTypeName, PostGstdisc = r.PostGstdisc,
+        FameIi = r.FameIi, StateFameIi = r.StateFameIi, Sgstper = r.Sgstper, Sgstamount = r.Sgstamount,
+        Cgstper = r.Cgstper, Cgstamount = r.Cgstamount, Igstper = r.Igstper, Igstamount = r.Igstamount,
+        NetAmount = r.NetAmount, ReferenceNo = r.ReferenceNo, BookingDate = r.BookingDate, TotalCount = r.TotalCount,
+        Battery = r.Battery, BatteryChemical = r.BatteryChemical, BatteryCapacity = r.BatteryCapacity,
+        BatteryMake = r.BatteryMake, ChargerNo = r.ChargerNo, ChargerNo2 = r.ChargerNo2, Converter = r.Converter,
+        Vcu = r.Vcu, ControllerNo = r.ControllerNo, FameIirequired = r.FameIirequired, SegmentName = r.SegmentName,
+        InstitutionalName = r.InstitutionalName, SchemeName = r.SchemeName, RowHash = r.RowHash, UniqueKey = r.UniqueKey,
+        CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
+    };
+
+    private static void ApplyVehicleSale(DmsVehicleSale row, VehicleSaleRecordDto r)
+    {
+        row.DealerName = r.DealerName; row.DealerCode = r.DealerCode; row.InvoiceNo = r.InvoiceNo; row.InvoiceDate = r.InvoiceDate;
+        row.Location = r.Location; row.LocCode = r.LocCode; row.LocationCity = r.LocationCity; row.CustDob = r.CustDob; row.Gender = r.Gender;
+        row.SoldTo = r.SoldTo; row.AccountType = r.AccountType; row.PartyEmail = r.PartyEmail; row.CusMob = r.CusMob;
+        row.Address1 = r.Address1; row.Address2 = r.Address2; row.City = r.City; row.State = r.State; row.ExecutiveName = r.ExecutiveName;
+        row.Pin = r.Pin; row.ChassisNo = r.ChassisNo; row.MotorNo = r.MotorNo; row.Remarks = r.Remarks; row.ItemModel = r.ItemModel;
+        row.Oemmodel = r.Oemmodel; row.ColorCode = r.ColorCode; row.VehicleType = r.VehicleType; row.VehicleGroup = r.VehicleGroup;
+        row.Hsnsaccode = r.Hsnsaccode; row.SaleType = r.SaleType; row.FinancedBy = r.FinancedBy; row.FinAmount = r.FinAmount;
+        row.ItemRate = r.ItemRate; row.InsuAmount = r.InsuAmount; row.RegnAmount = r.RegnAmount; row.AcsryAmount = r.AcsryAmount;
+        row.PreGstdiscAmount = r.PreGstdiscAmount; row.DiscTypeName = r.DiscTypeName; row.PostGstdisc = r.PostGstdisc;
+        row.FameIi = r.FameIi; row.StateFameIi = r.StateFameIi; row.Sgstper = r.Sgstper; row.Sgstamount = r.Sgstamount;
+        row.Cgstper = r.Cgstper; row.Cgstamount = r.Cgstamount; row.Igstper = r.Igstper; row.Igstamount = r.Igstamount;
+        row.NetAmount = r.NetAmount; row.ReferenceNo = r.ReferenceNo; row.BookingDate = r.BookingDate; row.TotalCount = r.TotalCount;
+        row.Battery = r.Battery; row.BatteryChemical = r.BatteryChemical; row.BatteryCapacity = r.BatteryCapacity;
+        row.BatteryMake = r.BatteryMake; row.ChargerNo = r.ChargerNo; row.ChargerNo2 = r.ChargerNo2; row.Converter = r.Converter;
+        row.Vcu = r.Vcu; row.ControllerNo = r.ControllerNo; row.FameIirequired = r.FameIirequired; row.SegmentName = r.SegmentName;
+        row.InstitutionalName = r.InstitutionalName; row.SchemeName = r.SchemeName; row.RowHash = r.RowHash;
+    }
 }
