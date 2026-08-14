@@ -36,6 +36,8 @@ public partial class AppDbContext : DbContext
     public DbSet<DmsLineOrderReport> DmsLineOrderReports { get; set; }
     public DbSet<DmsShadowfaxChassisMaster> DmsShadowfaxChassisMasters { get; set; }
     public DbSet<DmsJobReport> DmsJobReports { get; set; }
+    public DbSet<DmsRepairBill> DmsRepairBills { get; set; }
+    public DbSet<DmsProforma> DmsProformas { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -576,6 +578,68 @@ public partial class AppDbContext : DbContext
             .IsUnique()
             .HasFilter("[UniqueKey] IS NOT NULL")
             .HasDatabaseName("UQ_DMS_JobReport_UniqueKey");
+        });
+
+        modelBuilder.Entity<DmsRepairBill>(entity =>
+        {
+            entity.ToTable("DMS_RepairBill");
+
+            entity.HasKey(e => e.Id);
+
+            // Unique key: (Location, BillNo)
+            entity.HasIndex(e => new { e.Location, e.BillNo })
+                .IsUnique()
+                .HasDatabaseName("UQ_DMS_RepairBill_Location_BillNo");
+
+            entity.HasIndex(e => e.ChassisNo).HasDatabaseName("IX_DMS_RepairBill_ChassisNo");
+            entity.HasIndex(e => e.BillDate).HasDatabaseName("IX_DMS_RepairBill_BillDate");
+            entity.HasIndex(e => e.JobNo).HasDatabaseName("IX_DMS_RepairBill_JobNo");
+
+            entity.Property(e => e.BillNo).HasMaxLength(50).IsRequired();
+            entity.Property(e => e.Location).HasMaxLength(500).IsRequired();
+            entity.Property(e => e.PartyName).HasMaxLength(500);
+            entity.Property(e => e.RegNo).HasMaxLength(100);
+            entity.Property(e => e.BillType).HasMaxLength(100);
+            entity.Property(e => e.JobNo).HasMaxLength(50);
+            entity.Property(e => e.NetAmount).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
+            entity.Property(e => e.UserName).HasMaxLength(200);
+            entity.Property(e => e.UserNameEdit).HasMaxLength(200);
+            entity.Property(e => e.ChassisNo).HasMaxLength(100);
+
+            entity.Property(e => e.CreatedAt).HasDefaultValueSql("(getutcdate())");
+            entity.Property(e => e.UpdatedAt).HasDefaultValueSql("(getutcdate())");
+        });
+
+        modelBuilder.Entity<DmsProforma>(entity =>
+        {
+            entity.ToTable("DMS_Proforma");
+
+            entity.HasKey(e => e.Id);
+
+            // Unique key: SerialNo
+            entity.HasIndex(e => e.SerialNo)
+                .IsUnique()
+                .HasDatabaseName("UQ_DMS_Proforma_SerialNo");
+
+            entity.HasIndex(e => e.ChassisNo).HasDatabaseName("IX_DMS_Proforma_ChassisNo");
+            entity.HasIndex(e => e.InvoiceNo).HasDatabaseName("IX_DMS_Proforma_InvoiceNo");
+            entity.HasIndex(e => e.RBillNo).HasDatabaseName("IX_DMS_Proforma_RBillNo");
+            entity.HasIndex(e => e.InvoiceDate).HasDatabaseName("IX_DMS_Proforma_InvoiceDate");
+
+            entity.Property(e => e.InvoiceNo).HasMaxLength(100);
+            entity.Property(e => e.DealerName).HasMaxLength(500);
+            entity.Property(e => e.DealerLocation).HasMaxLength(500);
+            entity.Property(e => e.ModelName).HasMaxLength(300);
+            entity.Property(e => e.ChassisNo).HasMaxLength(100);
+            entity.Property(e => e.ItemCode).HasMaxLength(100);
+            entity.Property(e => e.ItemDescription).HasMaxLength(500);
+            entity.Property(e => e.SerialNo).HasMaxLength(100).IsRequired();
+            entity.Property(e => e.RBillNo).HasMaxLength(50);
+            entity.Property(e => e.PartyName).HasMaxLength(500);
+            entity.Property(e => e.PartyState).HasMaxLength(200);
+
+            entity.Property(e => e.CreatedAt).HasDefaultValueSql("(getutcdate())");
+            entity.Property(e => e.UpdatedAt).HasDefaultValueSql("(getutcdate())");
         });
 
         OnModelCreatingPartial(modelBuilder);

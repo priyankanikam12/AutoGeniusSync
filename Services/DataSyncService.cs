@@ -1382,7 +1382,7 @@ public class DataSyncService
             "DMS_VehicleDispatches",
             "DMS_LineOrderReport",
             //"DMS_Dealers",
-            "DMS_CallCentreDealers"
+            //"DMS_CallCentreDealers"
         };
 
         foreach (var table in tables)
