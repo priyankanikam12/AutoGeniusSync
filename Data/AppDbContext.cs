@@ -500,6 +500,8 @@ public partial class AppDbContext : DbContext
             entity.Property(e => e.Discount).HasColumnType("decimal(18,2)");
             entity.Property(e => e.TotalAmount).HasColumnType("decimal(18,2)");
             entity.Property(e => e.Mrp).HasColumnType("decimal(18,2)");
+            entity.Property(e => e.MaterialCode).HasMaxLength(100);
+            entity.Property(e => e.MaterialDate).HasDefaultValueSql("(getutcdate())");
 
             entity.Property(e => e.CreatedAt).HasDefaultValueSql("(getutcdate())");
             entity.Property(e => e.UpdatedAt).HasDefaultValueSql("(getutcdate())");
@@ -608,6 +610,32 @@ public partial class AppDbContext : DbContext
 
             entity.Property(e => e.CreatedAt).HasDefaultValueSql("(getutcdate())");
             entity.Property(e => e.UpdatedAt).HasDefaultValueSql("(getutcdate())");
+            entity.Property(e => e.InsuranceType).HasMaxLength(20);
+            entity.Property(e => e.InsuranceDetails).HasMaxLength(500);
+            entity.Property(e => e.JobCardNo).HasMaxLength(50);
+            entity.Property(e => e.Cgst).HasColumnType("decimal(18,2)").HasColumnName("CGST").HasDefaultValue(0m);
+            entity.Property(e => e.Sgst).HasColumnType("decimal(18,2)").HasColumnName("SGST").HasDefaultValue(0m);
+            entity.Property(e => e.Igst).HasColumnType("decimal(18,2)").HasColumnName("IGST").HasDefaultValue(0m);
+            entity.Property(e => e.TotalAmount).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
+            entity.Property(e => e.ItemRate).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
+            entity.Property(e => e.ItemQty).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
+            entity.Property(e => e.Mrp).HasColumnType("decimal(18,2)").HasColumnName("MRP").HasDefaultValue(0m);
+            entity.Property(e => e.DiscountType).HasMaxLength(20);
+            entity.Property(e => e.DiscountValue).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
+            entity.Property(e => e.DiscountPercent).HasColumnType("decimal(8,2)").HasDefaultValue(0m);
+            entity.Property(e => e.PartNo).HasMaxLength(100);
+            entity.Property(e => e.PartName).HasMaxLength(300);
+            entity.Property(e => e.PartDescription).HasMaxLength(500);
+            entity.Property(e => e.Labour).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
+            entity.Property(e => e.LabourDescription).HasMaxLength(500);
+            entity.Property(e => e.MaterialCode).HasMaxLength(100);
+            entity.Property(e => e.DealerType).HasMaxLength(100);
+            entity.Property(e => e.UniqueKey).HasMaxLength(150);
+
+            entity.HasIndex(e => e.UniqueKey)
+                .IsUnique()
+                .HasFilter("[UniqueKey] IS NOT NULL")
+                .HasDatabaseName("UQ_DMS_RepairBill_UniqueKey");
         });
 
         modelBuilder.Entity<DmsProforma>(entity =>
@@ -640,6 +668,32 @@ public partial class AppDbContext : DbContext
 
             entity.Property(e => e.CreatedAt).HasDefaultValueSql("(getutcdate())");
             entity.Property(e => e.UpdatedAt).HasDefaultValueSql("(getutcdate())");
+            entity.Property(e => e.InsuranceType).HasMaxLength(20);
+            entity.Property(e => e.InsuranceDetails).HasMaxLength(500);
+            entity.Property(e => e.JobCardNo).HasMaxLength(50);
+            entity.Property(e => e.Cgst).HasColumnType("decimal(18,2)").HasColumnName("CGST").HasDefaultValue(0m);
+            entity.Property(e => e.Sgst).HasColumnType("decimal(18,2)").HasColumnName("SGST").HasDefaultValue(0m);
+            entity.Property(e => e.Igst).HasColumnType("decimal(18,2)").HasColumnName("IGST").HasDefaultValue(0m);
+            entity.Property(e => e.TotalAmount).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
+            entity.Property(e => e.ItemRate).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
+            entity.Property(e => e.ItemQty).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
+            entity.Property(e => e.Mrp).HasColumnType("decimal(18,2)").HasColumnName("MRP").HasDefaultValue(0m);
+            entity.Property(e => e.DiscountType).HasMaxLength(20);
+            entity.Property(e => e.DiscountValue).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
+            entity.Property(e => e.DiscountPercent).HasColumnType("decimal(8,2)").HasDefaultValue(0m);
+            entity.Property(e => e.PartNo).HasMaxLength(100);
+            entity.Property(e => e.PartName).HasMaxLength(300);
+            entity.Property(e => e.PartDescription).HasMaxLength(500);
+            entity.Property(e => e.Labour).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
+            entity.Property(e => e.LabourDescription).HasMaxLength(500);
+            entity.Property(e => e.MaterialCode).HasMaxLength(100);
+            entity.Property(e => e.DealerType).HasMaxLength(100);
+            entity.Property(e => e.UniqueKey).HasMaxLength(150);
+
+            entity.HasIndex(e => e.UniqueKey)
+                .IsUnique()
+                .HasFilter("[UniqueKey] IS NOT NULL")
+                .HasDatabaseName("UQ_DMS_Proforma_UniqueKey");
         });
 
         OnModelCreatingPartial(modelBuilder);

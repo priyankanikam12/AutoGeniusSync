@@ -47,6 +47,10 @@ public partial class DmsLineOrderReport
 
     public string? DealerType { get; set; }
 
+    // ── New fields ──
+    public string? MaterialCode { get; set; }
+    public DateOnly? MaterialDate { get; set; }
+
     public DateTime? CreatedAt { get; set; }
     public DateTime? UpdatedAt { get; set; }
     public string? RowHash { get; set; }

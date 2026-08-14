@@ -100,6 +100,7 @@ public class LineOrderReportController : ControllerBase
         SgstAmount = r.SgstAmount, CgstPer = r.CgstPer, CgstAmount = r.CgstAmount, IgstPer = r.IgstPer,
         IgstAmount = r.IgstAmount, Discount = r.Discount, TotalAmount = r.TotalAmount, Mrp = r.Mrp,
         DealerType = r.DealerType, RowHash = r.RowHash, UniqueKey = r.UniqueKey,
+        MaterialCode = r.MaterialCode, MaterialDate = r.MaterialDate,
         CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
     };
 
@@ -114,5 +115,6 @@ public class LineOrderReportController : ControllerBase
         row.SgstAmount = r.SgstAmount; row.CgstPer = r.CgstPer; row.CgstAmount = r.CgstAmount; row.IgstPer = r.IgstPer;
         row.IgstAmount = r.IgstAmount; row.Discount = r.Discount; row.TotalAmount = r.TotalAmount; row.Mrp = r.Mrp;
         row.DealerType = r.DealerType; row.RowHash = r.RowHash;
+        row.MaterialCode = r.MaterialCode; row.MaterialDate = r.MaterialDate;
     }
 }

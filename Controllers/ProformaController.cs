@@ -118,18 +118,41 @@ public class ProformaController : ControllerBase
         else
         {
             var updated = MapToEntity(dto);
-            existing.InvoiceNo       = updated.InvoiceNo;
-            existing.InvoiceDate     = updated.InvoiceDate;
-            existing.DealerName      = updated.DealerName;
-            existing.DealerLocation  = updated.DealerLocation;
-            existing.ModelName       = updated.ModelName;
-            existing.ChassisNo       = updated.ChassisNo;
-            existing.ItemCode        = updated.ItemCode;
-            existing.ItemDescription = updated.ItemDescription;
-            existing.RBillNo         = updated.RBillNo;
-            existing.RBillDate       = updated.RBillDate;
-            existing.PartyName       = updated.PartyName;
-            existing.PartyState      = updated.PartyState;
+            existing.InvoiceNo         = updated.InvoiceNo;
+            existing.InvoiceDate       = updated.InvoiceDate;
+            existing.DealerName        = updated.DealerName;
+            existing.DealerLocation    = updated.DealerLocation;
+            existing.ModelName         = updated.ModelName;
+            existing.ChassisNo         = updated.ChassisNo;
+            existing.ItemCode          = updated.ItemCode;
+            existing.ItemDescription   = updated.ItemDescription;
+            existing.RBillNo           = updated.RBillNo;
+            existing.RBillDate         = updated.RBillDate;
+            existing.PartyName         = updated.PartyName;
+            existing.PartyState        = updated.PartyState;
+            existing.InsuranceType     = updated.InsuranceType;
+            existing.InsuranceDetails  = updated.InsuranceDetails;
+            existing.JobCardNo         = updated.JobCardNo;
+            existing.JobCardDate       = updated.JobCardDate;
+            existing.Cgst              = updated.Cgst;
+            existing.Sgst              = updated.Sgst;
+            existing.Igst              = updated.Igst;
+            existing.TotalAmount       = updated.TotalAmount;
+            existing.ItemRate          = updated.ItemRate;
+            existing.ItemQty           = updated.ItemQty;
+            existing.Mrp               = updated.Mrp;
+            existing.DiscountType      = updated.DiscountType;
+            existing.DiscountValue     = updated.DiscountValue;
+            existing.DiscountPercent   = updated.DiscountPercent;
+            existing.PartNo            = updated.PartNo;
+            existing.PartName          = updated.PartName;
+            existing.PartDescription   = updated.PartDescription;
+            existing.Labour            = updated.Labour;
+            existing.LabourDescription = updated.LabourDescription;
+            existing.UniqueKey         = updated.UniqueKey;
+            existing.MaterialCode      = updated.MaterialCode;
+            existing.MaterialDate      = updated.MaterialDate;
+            existing.DealerType        = updated.DealerType;
         }
 
         existing.UpdatedAt = DateTime.UtcNow;
@@ -143,19 +166,42 @@ public class ProformaController : ControllerBase
 
     private static DmsProforma MapToEntity(ProformaDto dto) => new()
     {
-        InvoiceNo       = dto.InvoiceNo,
-        InvoiceDate     = ParseDate(dto.InvoiceDate),
-        DealerName      = dto.DealerName,
-        DealerLocation  = dto.DealerLocation,
-        ModelName       = dto.ModelName,
-        ChassisNo       = dto.ChassisNo,
-        ItemCode        = dto.ItemCode,
-        ItemDescription = dto.ItemDescription,
-        SerialNo        = dto.SerialNo,
-        RBillNo         = dto.RBillNo,
-        RBillDate       = ParseDate(dto.RBillDate),
-        PartyName       = dto.PartyName,
-        PartyState      = dto.PartyState
+        InvoiceNo         = dto.InvoiceNo,
+        InvoiceDate       = ParseDate(dto.InvoiceDate),
+        DealerName        = dto.DealerName,
+        DealerLocation    = dto.DealerLocation,
+        ModelName         = dto.ModelName,
+        ChassisNo         = dto.ChassisNo,
+        ItemCode          = dto.ItemCode,
+        ItemDescription   = dto.ItemDescription,
+        SerialNo          = dto.SerialNo,
+        RBillNo           = dto.RBillNo,
+        RBillDate         = ParseDate(dto.RBillDate),
+        PartyName         = dto.PartyName,
+        PartyState        = dto.PartyState,
+        InsuranceType     = dto.InsuranceType,
+        InsuranceDetails  = dto.InsuranceDetails,
+        JobCardNo         = dto.JobCardNo,
+        JobCardDate       = ParseDate(dto.JobCardDate),
+        Cgst              = ParseDecimal(dto.Cgst),
+        Sgst              = ParseDecimal(dto.Sgst),
+        Igst              = ParseDecimal(dto.Igst),
+        TotalAmount       = ParseDecimal(dto.TotalAmount),
+        ItemRate          = ParseDecimal(dto.ItemRate),
+        ItemQty           = ParseDecimal(dto.ItemQty),
+        Mrp               = ParseDecimal(dto.Mrp),
+        DiscountType      = dto.DiscountType,
+        DiscountValue     = ParseDecimal(dto.DiscountValue),
+        DiscountPercent   = ParseDecimal(dto.DiscountPercent),
+        PartNo            = dto.PartNo,
+        PartName          = dto.PartName,
+        PartDescription   = dto.PartDescription,
+        Labour            = ParseDecimal(dto.Labour),
+        LabourDescription = dto.LabourDescription,
+        UniqueKey         = dto.UniqueKey,
+        MaterialCode      = dto.MaterialCode,
+        MaterialDate      = ParseDate(dto.MaterialDate),
+        DealerType        = dto.DealerType
     };
 
     private static DateOnly? ParseDate(string? val)
@@ -168,5 +214,12 @@ public class ProformaController : ControllerBase
         if (DateTime.TryParse(val, out var d2))
             return DateOnly.FromDateTime(d2);
         return null;
+    }
+
+    private static decimal? ParseDecimal(string? val)
+    {
+        if (string.IsNullOrWhiteSpace(val)) return 0;
+        return decimal.TryParse(val, System.Globalization.NumberStyles.Any,
+            System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : 0;
     }
 }

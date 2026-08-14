@@ -40,6 +40,8 @@ public class LorRecordDto
     public decimal? Mrp { get; set; }
     public string? DealerType { get; set; }
     public string? RowHash { get; set; }
+    public string? MaterialCode { get; set; }
+    public DateOnly? MaterialDate { get; set; }
     public string? UniqueKey { get; set; }
 }
 
