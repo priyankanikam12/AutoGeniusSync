@@ -164,6 +164,157 @@ public class ProformaController : ControllerBase
         return Ok(existing);
     }
 
+    // ── POST /api/proforma/bulk — insert only, skip duplicates by SerialNo ──
+    [HttpPost("bulk")]
+    public async Task<IActionResult> BulkInsert([FromBody] List<ProformaDto> dtos)
+    {
+        if (dtos == null || dtos.Count == 0)
+            return BadRequest(new { error = "Request body must contain a non-empty array of proforma records." });
+
+        var result = new BulkInsertResult();
+        var now = DateTime.UtcNow;
+
+        // Dedupe within the incoming batch itself
+        var seen = new HashSet<string>();
+        var toInsert = new List<(string SerialNo, ProformaDto Dto)>();
+
+        foreach (var dto in dtos)
+        {
+            if (string.IsNullOrWhiteSpace(dto.SerialNo))
+            {
+                result.SkippedDuplicates++;
+                result.SkippedKeys.Add("(missing SerialNo)");
+                continue;
+            }
+            if (!seen.Add(dto.SerialNo))
+            {
+                result.SkippedDuplicates++;
+                result.SkippedKeys.Add(dto.SerialNo);
+                continue;
+            }
+            toInsert.Add((dto.SerialNo, dto));
+        }
+
+        // Single round-trip check against DB for existing SerialNos
+        var candidateSerials = toInsert.Select(x => x.SerialNo).ToList();
+        var existingSerials = await _db.DmsProformas
+            .Where(x => candidateSerials.Contains(x.SerialNo))
+            .Select(x => x.SerialNo)
+            .ToListAsync();
+        var existingSet = existingSerials.ToHashSet();
+
+        foreach (var (serialNo, dto) in toInsert)
+        {
+            if (existingSet.Contains(serialNo))
+            {
+                result.SkippedDuplicates++;
+                result.SkippedKeys.Add(serialNo);
+                continue;
+            }
+
+            var entity = MapToEntity(dto);
+            entity.CreatedAt = now;
+            entity.UpdatedAt = now;
+            _db.DmsProformas.Add(entity);
+            result.Inserted++;
+        }
+
+        await _db.SaveChangesAsync();
+
+        _logger.LogInformation("Bulk proforma insert: {inserted} inserted, {skipped} skipped",
+            result.Inserted, result.SkippedDuplicates);
+
+        return Ok(result);
+    }
+
+    // ── PUT /api/proforma/bulk — update only, skip if SerialNo not found ──
+    [HttpPut("bulk")]
+    public async Task<IActionResult> BulkUpdate([FromBody] List<ProformaDto> dtos)
+    {
+        if (dtos == null || dtos.Count == 0)
+            return BadRequest(new { error = "Request body must contain a non-empty array of proforma records." });
+
+        var result = new BulkUpdateResult();
+        var now = DateTime.UtcNow;
+
+        var seen = new HashSet<string>();
+        var toUpdate = new List<(string SerialNo, ProformaDto Dto)>();
+
+        foreach (var dto in dtos)
+        {
+            if (string.IsNullOrWhiteSpace(dto.SerialNo))
+            {
+                result.SkippedNotFound++;
+                result.SkippedKeys.Add("(missing SerialNo)");
+                continue;
+            }
+            if (!seen.Add(dto.SerialNo)) continue; // last one in batch wins silently, or track if you prefer
+            toUpdate.Add((dto.SerialNo, dto));
+        }
+
+        var candidateSerials = toUpdate.Select(x => x.SerialNo).ToList();
+        var existingEntities = await _db.DmsProformas
+            .Where(x => candidateSerials.Contains(x.SerialNo))
+            .ToDictionaryAsync(x => x.SerialNo);
+
+        foreach (var (serialNo, dto) in toUpdate)
+        {
+            if (!existingEntities.TryGetValue(serialNo, out var existing))
+            {
+                result.SkippedNotFound++;
+                result.SkippedKeys.Add(serialNo);
+                continue;
+            }
+
+            var updated = MapToEntity(dto);
+            existing.InvoiceNo         = updated.InvoiceNo;
+            existing.InvoiceDate       = updated.InvoiceDate;
+            existing.DealerName        = updated.DealerName;
+            existing.DealerLocation    = updated.DealerLocation;
+            existing.ModelName         = updated.ModelName;
+            existing.ChassisNo         = updated.ChassisNo;
+            existing.ItemCode          = updated.ItemCode;
+            existing.ItemDescription   = updated.ItemDescription;
+            existing.RBillNo           = updated.RBillNo;
+            existing.RBillDate         = updated.RBillDate;
+            existing.PartyName         = updated.PartyName;
+            existing.PartyState        = updated.PartyState;
+            existing.InsuranceType     = updated.InsuranceType;
+            existing.InsuranceDetails  = updated.InsuranceDetails;
+            existing.JobCardNo         = updated.JobCardNo;
+            existing.JobCardDate       = updated.JobCardDate;
+            existing.Cgst              = updated.Cgst;
+            existing.Sgst              = updated.Sgst;
+            existing.Igst              = updated.Igst;
+            existing.TotalAmount       = updated.TotalAmount;
+            existing.ItemRate          = updated.ItemRate;
+            existing.ItemQty           = updated.ItemQty;
+            existing.Mrp               = updated.Mrp;
+            existing.DiscountType      = updated.DiscountType;
+            existing.DiscountValue     = updated.DiscountValue;
+            existing.DiscountPercent   = updated.DiscountPercent;
+            existing.PartNo            = updated.PartNo;
+            existing.PartName          = updated.PartName;
+            existing.PartDescription   = updated.PartDescription;
+            existing.Labour            = updated.Labour;
+            existing.LabourDescription = updated.LabourDescription;
+            existing.UniqueKey         = updated.UniqueKey;
+            existing.MaterialCode      = updated.MaterialCode;
+            existing.MaterialDate      = updated.MaterialDate;
+            existing.DealerType        = updated.DealerType;
+            existing.UpdatedAt         = now;
+
+            result.Updated++;
+        }
+
+        await _db.SaveChangesAsync();
+
+        _logger.LogInformation("Bulk proforma update: {updated} updated, {skipped} skipped (not found)",
+            result.Updated, result.SkippedNotFound);
+
+        return Ok(result);
+    }
+
     private static DmsProforma MapToEntity(ProformaDto dto) => new()
     {
         InvoiceNo         = dto.InvoiceNo,

@@ -169,6 +169,162 @@ public class RepairBillController : ControllerBase
         return Ok(existing);
     }
 
+    // ── POST /api/repairbill/bulk — insert only, skip duplicates by (Location, BillNo) ──
+    [HttpPost("bulk")]
+    public async Task<IActionResult> BulkInsert([FromBody] List<RepairBillDto> dtos)
+    {
+        if (dtos == null || dtos.Count == 0)
+            return BadRequest(new { error = "Request body must contain a non-empty array of repair bill records." });
+
+        var result = new BulkInsertResult();
+        var now = DateTime.UtcNow;
+
+        var seen = new HashSet<(string, string)>();
+        var toInsert = new List<((string Location, string BillNo) Key, RepairBillDto Dto)>();
+
+        foreach (var dto in dtos)
+        {
+            if (string.IsNullOrWhiteSpace(dto.BillNo) || string.IsNullOrWhiteSpace(dto.Location))
+            {
+                result.SkippedDuplicates++;
+                result.SkippedKeys.Add("(missing Location/BillNo)");
+                continue;
+            }
+            var key = (dto.Location, dto.BillNo);
+            if (!seen.Add(key))
+            {
+                result.SkippedDuplicates++;
+                result.SkippedKeys.Add($"{dto.Location}/{dto.BillNo}");
+                continue;
+            }
+            toInsert.Add((key, dto));
+        }
+
+        var locations = toInsert.Select(x => x.Key.Location).Distinct().ToList();
+        var billNos = toInsert.Select(x => x.Key.BillNo).Distinct().ToList();
+
+        var existingKeys = (await _db.DmsRepairBills
+            .Where(x => locations.Contains(x.Location) && billNos.Contains(x.BillNo))
+            .Select(x => new { x.Location, x.BillNo })
+            .ToListAsync())
+            .Select(x => (x.Location, x.BillNo))
+            .ToHashSet();
+
+        foreach (var (key, dto) in toInsert)
+        {
+            if (existingKeys.Contains(key))
+            {
+                result.SkippedDuplicates++;
+                result.SkippedKeys.Add($"{key.Location}/{key.BillNo}");
+                continue;
+            }
+
+            var entity = MapToEntity(dto);
+            entity.CreatedAt = now;
+            entity.UpdatedAt = now;
+            _db.DmsRepairBills.Add(entity);
+            result.Inserted++;
+        }
+
+        await _db.SaveChangesAsync();
+
+        _logger.LogInformation("Bulk repair bill insert: {inserted} inserted, {skipped} skipped",
+            result.Inserted, result.SkippedDuplicates);
+
+        return Ok(result);
+    }
+
+    // ── PUT /api/repairbill/bulk — update only, skip if (Location, BillNo) not found ──
+    [HttpPut("bulk")]
+    public async Task<IActionResult> BulkUpdate([FromBody] List<RepairBillDto> dtos)
+    {
+        if (dtos == null || dtos.Count == 0)
+            return BadRequest(new { error = "Request body must contain a non-empty array of repair bill records." });
+
+        var result = new BulkUpdateResult();
+        var now = DateTime.UtcNow;
+
+        var seen = new HashSet<(string, string)>();
+        var toUpdate = new List<((string Location, string BillNo) Key, RepairBillDto Dto)>();
+
+        foreach (var dto in dtos)
+        {
+            if (string.IsNullOrWhiteSpace(dto.BillNo) || string.IsNullOrWhiteSpace(dto.Location))
+            {
+                result.SkippedNotFound++;
+                result.SkippedKeys.Add("(missing Location/BillNo)");
+                continue;
+            }
+            var key = (dto.Location, dto.BillNo);
+            if (!seen.Add(key)) continue;
+            toUpdate.Add((key, dto));
+        }
+
+        var locations = toUpdate.Select(x => x.Key.Location).Distinct().ToList();
+        var billNos = toUpdate.Select(x => x.Key.BillNo).Distinct().ToList();
+
+        var existingEntities = (await _db.DmsRepairBills
+            .Where(x => locations.Contains(x.Location) && billNos.Contains(x.BillNo))
+            .ToListAsync())
+            .ToDictionary(x => (x.Location, x.BillNo));
+
+        foreach (var (key, dto) in toUpdate)
+        {
+            if (!existingEntities.TryGetValue(key, out var existing))
+            {
+                result.SkippedNotFound++;
+                result.SkippedKeys.Add($"{key.Location}/{key.BillNo}");
+                continue;
+            }
+
+            var updated = MapToEntity(dto);
+            existing.BillDate          = updated.BillDate;
+            existing.PartyName         = updated.PartyName;
+            existing.RegNo             = updated.RegNo;
+            existing.BillType          = updated.BillType;
+            existing.JobNo             = updated.JobNo;
+            existing.NetAmount         = updated.NetAmount;
+            existing.UserName          = updated.UserName;
+            existing.UserNameEdit      = updated.UserNameEdit;
+            existing.DateAdded         = updated.DateAdded;
+            existing.DateModified      = updated.DateModified;
+            existing.ChassisNo         = updated.ChassisNo;
+            existing.InsuranceType     = updated.InsuranceType;
+            existing.InsuranceDetails  = updated.InsuranceDetails;
+            existing.JobCardNo         = updated.JobCardNo;
+            existing.JobCardDate       = updated.JobCardDate;
+            existing.Cgst              = updated.Cgst;
+            existing.Sgst              = updated.Sgst;
+            existing.Igst              = updated.Igst;
+            existing.TotalAmount       = updated.TotalAmount;
+            existing.ItemRate          = updated.ItemRate;
+            existing.ItemQty           = updated.ItemQty;
+            existing.Mrp               = updated.Mrp;
+            existing.DiscountType      = updated.DiscountType;
+            existing.DiscountValue     = updated.DiscountValue;
+            existing.DiscountPercent   = updated.DiscountPercent;
+            existing.PartNo            = updated.PartNo;
+            existing.PartName          = updated.PartName;
+            existing.PartDescription   = updated.PartDescription;
+            existing.Labour            = updated.Labour;
+            existing.LabourDescription = updated.LabourDescription;
+            existing.UniqueKey         = updated.UniqueKey;
+            existing.MaterialCode      = updated.MaterialCode;
+            existing.MaterialDate      = updated.MaterialDate;
+            existing.DealerType        = updated.DealerType;
+            existing.UpdatedAt         = now;
+
+            result.Updated++;
+        }
+
+        await _db.SaveChangesAsync();
+
+        _logger.LogInformation("Bulk repair bill update: {updated} updated, {skipped} skipped (not found)",
+            result.Updated, result.SkippedNotFound);
+
+        return Ok(result);
+    }
+
     private static DmsRepairBill MapToEntity(RepairBillDto dto) => new()
     {
         BillDate          = ParseDate(dto.Date),
