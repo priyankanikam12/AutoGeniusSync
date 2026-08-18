@@ -25,8 +25,13 @@ public partial class DmsJobReport
     public string? EngineNo { get; set; }
     public string? ItemName { get; set; }
 
+    // Legacy single-complaint columns. Kept so old reports/queries that read
+    // these two flat columns keep working — they are now populated from the
+    // FIRST entry of Complaints below. The full set of complaints lives in
+    // the child table.
     public string? CustomerVoice { get; set; }
     public string? ComplaintCode { get; set; }
+
     public string? Observation { get; set; }
     public string? SupervisorComment { get; set; }
     public string? JobStatus { get; set; }
@@ -44,4 +49,7 @@ public partial class DmsJobReport
     public string? UniqueKey { get; set; }
     public DateTime? CreatedAt { get; set; }
     public DateTime? UpdatedAt { get; set; }
+
+    // NEW: one job card can have many customerVoice/complaintCode pairs.
+    public List<DmsJobReportComplaint> Complaints { get; set; } = new();
 }

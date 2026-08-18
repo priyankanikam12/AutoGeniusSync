@@ -1,3 +1,6 @@
+using System.Text.Json.Serialization;
+using AutoGeniusSync.Json;
+
 namespace AutoGeniusSync.DTOs;
 
 // Used for POST (create) and PUT (full update) request bodies.
@@ -11,8 +14,12 @@ public class JobReportInput
     public string? City { get; set; }
     public string? State { get; set; }
 
+    [JsonConverter(typeof(FlexibleStringConverter))]
     public string? JobNo { get; set; }
+
+    [JsonConverter(typeof(FlexibleDateOnlyConverter))]
     public DateOnly? JobDate { get; set; }
+
     public string? JobType { get; set; }
     public string? ServiceHead { get; set; }
     public string? ServiceType { get; set; }
@@ -25,8 +32,11 @@ public class JobReportInput
     public string? EngineNo { get; set; }
     public string? ItemName { get; set; }
 
+    // Legacy single-complaint fields, kept for backward compatibility.
+    // Prefer Complaints below for new callers.
     public string? CustomerVoice { get; set; }
     public string? ComplaintCode { get; set; }
+
     public string? Observation { get; set; }
     public string? SupervisorComment { get; set; }
     public string? JobStatus { get; set; }
@@ -34,10 +44,18 @@ public class JobReportInput
     public string? BatteryNo { get; set; }
     public string? BrandName { get; set; }
     public string? ChargerNo { get; set; }
+
+    [JsonConverter(typeof(FlexibleDateOnlyConverter))]
     public DateOnly? SaleDate { get; set; }
 
     public string? Supervisor { get; set; }
     public string? Technician { get; set; }
+
+    [JsonConverter(typeof(FlexibleDateOnlyConverter))]
     public DateOnly? JobEndDate { get; set; }
+
     public string? CreatedThrough { get; set; }
+
+    // NEW: multiple customerVoice/complaintCode pairs for one job card.
+    public List<ComplaintDto>? Complaints { get; set; }
 }

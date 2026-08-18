@@ -39,6 +39,42 @@ public class JobReportController : ControllerBase
         return null;
     }
 
+    // ── Builds the child Complaints rows for a record, from whichever shape the caller sent ──
+    // Prefers the new "Complaints" array; falls back to the legacy single
+    // CustomerVoice/ComplaintCode pair so older callers keep working.
+    private static List<DmsJobReportComplaint> BuildComplaints(
+        List<ComplaintDto>? complaints, string? legacyCustomerVoice, string? legacyComplaintCode)
+    {
+        var list = new List<DmsJobReportComplaint>();
+
+        if (complaints is { Count: > 0 })
+        {
+            foreach (var c in complaints)
+            {
+                if (string.IsNullOrWhiteSpace(c.CustomerVoice) && string.IsNullOrWhiteSpace(c.ComplaintCode))
+                    continue;
+
+                list.Add(new DmsJobReportComplaint
+                {
+                    CustomerVoice = c.CustomerVoice,
+                    ComplaintCode = c.ComplaintCode,
+                    CreatedAt = DateTime.UtcNow
+                });
+            }
+        }
+        else if (!string.IsNullOrWhiteSpace(legacyCustomerVoice) || !string.IsNullOrWhiteSpace(legacyComplaintCode))
+        {
+            list.Add(new DmsJobReportComplaint
+            {
+                CustomerVoice = legacyCustomerVoice,
+                ComplaintCode = legacyComplaintCode,
+                CreatedAt = DateTime.UtcNow
+            });
+        }
+
+        return list;
+    }
+
     private static DmsJobReport MapRow(string[] cols)
     {
         string? Get(int i) => i < cols.Length ? cols[i].Trim() : null;
@@ -47,8 +83,10 @@ public class JobReportController : ControllerBase
         var jobNo      = Get(5);
         var jobDate    = ParseDate(Get(6));
         var chassisNo  = Get(13);
+        var customerVoice = Get(17);
+        var complaintCode = Get(18);
 
-        return new DmsJobReport
+        var entity = new DmsJobReport
         {
             DealerName        = Get(0),
             DealerCode        = dealerCode,
@@ -67,8 +105,8 @@ public class JobReportController : ControllerBase
             RegNo             = Get(14),
             EngineNo          = Get(15),
             ItemName          = Get(16),
-            CustomerVoice     = Get(17),
-            ComplaintCode     = Get(18),
+            CustomerVoice     = customerVoice,
+            ComplaintCode     = complaintCode,
             Observation       = Get(19),
             SupervisorComment = Get(20),
             JobStatus         = Get(21),
@@ -84,10 +122,16 @@ public class JobReportController : ControllerBase
             CreatedAt         = DateTime.UtcNow,
             UpdatedAt         = DateTime.UtcNow
         };
+
+        // CSV rows only ever carry one complaint — mirror it into the child table too,
+        // so GetAll/GetById responses look the same regardless of ingestion path.
+        entity.Complaints = BuildComplaints(null, customerVoice, complaintCode);
+
+        return entity;
     }
 
     // ═══════════════════════════════════════════════════════
-    // FILE UPLOAD ENDPOINTS — unchanged
+    // FILE UPLOAD ENDPOINTS — unchanged (still one complaint per CSV row)
     // ═══════════════════════════════════════════════════════
 
     [HttpPost("upload")]
@@ -216,6 +260,7 @@ public class JobReportController : ControllerBase
 
         var candidateKeys = dedupedRows.Select(r => r.UniqueKey).ToHashSet();
         var existingRows = await _db.DmsJobReports
+            .Include(x => x.Complaints)
             .Where(x => x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
             .ToListAsync();
         var existingLookup = existingRows
@@ -256,6 +301,11 @@ public class JobReportController : ControllerBase
                     existing.JobEndDate        = row.JobEndDate;
                     existing.CreatedThrough    = row.CreatedThrough;
                     existing.UpdatedAt         = DateTime.UtcNow;
+
+                    // Replace complaints wholesale (CSV row still carries only one).
+                    existing.Complaints.Clear();
+                    foreach (var c in row.Complaints) existing.Complaints.Add(c);
+
                     updated++;
                 }
                 else
@@ -297,7 +347,7 @@ public class JobReportController : ControllerBase
         [FromQuery] int page = 1,
         [FromQuery] int pageSize = 100)
     {
-        var q = _db.DmsJobReports.AsQueryable();
+        var q = _db.DmsJobReports.Include(x => x.Complaints).AsQueryable();
 
         if (!string.IsNullOrEmpty(dealerCode))
             q = q.Where(x => x.DealerCode == dealerCode);
@@ -318,7 +368,7 @@ public class JobReportController : ControllerBase
     [HttpGet("{id:int}")]
     public async Task<IActionResult> GetById(int id)
     {
-        var row = await _db.DmsJobReports.FirstOrDefaultAsync(x => x.Id == id);
+        var row = await _db.DmsJobReports.Include(x => x.Complaints).FirstOrDefaultAsync(x => x.Id == id);
         return row == null ? NotFound(new { error = $"JobReport with Id {id} not found." }) : Ok(row);
     }
 
@@ -339,6 +389,8 @@ public class JobReportController : ControllerBase
         if (existing != null)
             return Conflict(new { error = "A record with this DealerCode+JobNo+JobDate+ChassisNo already exists.", ExistingId = existing.Id });
 
+        var complaints = BuildComplaints(input.Complaints, input.CustomerVoice, input.ComplaintCode);
+
         var entity = new DmsJobReport
         {
             DealerName        = input.DealerName,
@@ -358,8 +410,9 @@ public class JobReportController : ControllerBase
             RegNo             = input.RegNo,
             EngineNo          = input.EngineNo,
             ItemName          = input.ItemName,
-            CustomerVoice     = input.CustomerVoice,
-            ComplaintCode     = input.ComplaintCode,
+            // Legacy flat columns mirror the first complaint, for old readers.
+            CustomerVoice     = complaints.Count > 0 ? complaints[0].CustomerVoice : input.CustomerVoice,
+            ComplaintCode     = complaints.Count > 0 ? complaints[0].ComplaintCode : input.ComplaintCode,
             Observation       = input.Observation,
             SupervisorComment = input.SupervisorComment,
             JobStatus         = input.JobStatus,
@@ -373,12 +426,24 @@ public class JobReportController : ControllerBase
             CreatedThrough    = input.CreatedThrough,
             UniqueKey         = uniqueKey,
             CreatedAt         = DateTime.UtcNow,
-            UpdatedAt         = DateTime.UtcNow
+            UpdatedAt         = DateTime.UtcNow,
+            Complaints        = complaints
             // Id is NOT set — the database generates it on insert.
         };
 
         _db.DmsJobReports.Add(entity);
-        await _db.SaveChangesAsync();
+
+        try
+        {
+            await _db.SaveChangesAsync();
+        }
+        catch (DbUpdateException)
+        {
+            // DB-level unique index on UniqueKey caught a race: someone else inserted
+            // the same DealerCode+JobNo+JobDate+ChassisNo between our check above and this save.
+            _logger.LogWarning("JobReport create conflict (unique index) for key {key}", uniqueKey);
+            return Conflict(new { error = "A record with this DealerCode+JobNo+JobDate+ChassisNo already exists.", UniqueKey = uniqueKey });
+        }
 
         _logger.LogInformation("JobReport created: Id {id}, Job {jn}", entity.Id, entity.JobNo);
 
@@ -393,7 +458,7 @@ public class JobReportController : ControllerBase
         if (input == null)
             return BadRequest(new { error = "Request body is required." });
 
-        var existing = await _db.DmsJobReports.FirstOrDefaultAsync(x => x.Id == id);
+        var existing = await _db.DmsJobReports.Include(x => x.Complaints).FirstOrDefaultAsync(x => x.Id == id);
         if (existing == null)
             return NotFound(new { error = $"JobReport with Id {id} not found." });
 
@@ -414,8 +479,6 @@ public class JobReportController : ControllerBase
         existing.RegNo             = input.RegNo;
         existing.EngineNo          = input.EngineNo;
         existing.ItemName          = input.ItemName;
-        existing.CustomerVoice     = input.CustomerVoice;
-        existing.ComplaintCode     = input.ComplaintCode;
         existing.Observation       = input.Observation;
         existing.SupervisorComment = input.SupervisorComment;
         existing.JobStatus         = input.JobStatus;
@@ -430,6 +493,13 @@ public class JobReportController : ControllerBase
         existing.UniqueKey         = BuildKey(input.DealerCode, input.JobNo, input.JobDate, input.ChassisNo);
         existing.UpdatedAt         = DateTime.UtcNow;
 
+        // Replace complaints wholesale with whatever this PUT sent.
+        var complaints = BuildComplaints(input.Complaints, input.CustomerVoice, input.ComplaintCode);
+        existing.Complaints.Clear();
+        foreach (var c in complaints) existing.Complaints.Add(c);
+        existing.CustomerVoice = complaints.Count > 0 ? complaints[0].CustomerVoice : input.CustomerVoice;
+        existing.ComplaintCode = complaints.Count > 0 ? complaints[0].ComplaintCode : input.ComplaintCode;
+
         await _db.SaveChangesAsync();
 
         _logger.LogInformation("JobReport updated: Id {id}, Job {jn}", id, existing.JobNo);
@@ -437,7 +507,12 @@ public class JobReportController : ControllerBase
         return Ok(existing);
     }
 
-    // PATCH /api/jobreport/{id} — partial update, unchanged
+    // PATCH /api/jobreport/{id} — partial update, unchanged.
+    // NOTE: this dictionary-based endpoint still only edits header fields, not
+    // the Complaints list. If you need to add/remove a single complaint from an
+    // existing job card without resending the whole record, that should be a
+    // dedicated endpoint (e.g. POST/DELETE /api/jobreport/{id}/complaints) —
+    // happy to add that if you want it; flagging it rather than guessing at the shape.
     [HttpPatch("{id:int}")]
     public async Task<IActionResult> PartialUpdate(int id, [FromBody] Dictionary<string, object?> updates)
     {
@@ -503,6 +578,7 @@ public class JobReportController : ControllerBase
         if (existing == null)
             return NotFound(new { error = $"JobReport with Id {id} not found." });
 
+        // Complaints cascade-delete via the FK relationship configured in AppDbContext.
         _db.DmsJobReports.Remove(existing);
         await _db.SaveChangesAsync();
 
@@ -518,9 +594,11 @@ public class JobReportController : ControllerBase
         if (records is null || records.Count == 0)
             return BadRequest(new { error = "Payload must be a non-empty array of records." });
 
+        // UniqueKey is always recomputed here — never trusted from the client.
+        // (The sample payload sends "uniqueKey" as the sender's own numeric job-card
+        // id, which is a different concept from our Dealer+JobNo+JobDate+Chassis key.)
         foreach (var r in records)
-            if (string.IsNullOrWhiteSpace(r.UniqueKey))
-                r.UniqueKey = UniqueKeyBuilder.JobReport(r.DealerCode, r.JobNo, r.JobDate, r.ChassisNo);
+            r.UniqueKey = UniqueKeyBuilder.JobReport(r.DealerCode, r.JobNo, r.JobDate, r.ChassisNo);
 
         var deduped = records.GroupBy(r => r.UniqueKey).Select(g => g.Last()).ToList();
         var keys = deduped.Select(r => r.UniqueKey!).ToList();
@@ -539,14 +617,44 @@ public class JobReportController : ControllerBase
             toInsert.Add(MapJobReport(r));
         }
 
+        var insertedCount = 0;
+
         if (toInsert.Count > 0)
         {
             await _db.DmsJobReports.AddRangeAsync(toInsert);
-            await _db.SaveChangesAsync();
+            try
+            {
+                await _db.SaveChangesAsync();
+                insertedCount = toInsert.Count;
+            }
+            catch (DbUpdateException)
+            {
+                // The DB-level unique index on UniqueKey rejected the batch — most likely
+                // one row raced with a concurrent request between our existence check above
+                // and this save. Don't let one collision roll back the whole batch: retry
+                // row-by-row so everything that isn't actually a duplicate still gets saved.
+                _logger.LogWarning("JobReport bulk insert hit a unique-index conflict, retrying row-by-row");
+                _db.ChangeTracker.Clear();
+
+                foreach (var entity in toInsert)
+                {
+                    _db.DmsJobReports.Add(entity);
+                    try
+                    {
+                        await _db.SaveChangesAsync();
+                        insertedCount++;
+                    }
+                    catch (DbUpdateException)
+                    {
+                        _db.ChangeTracker.Clear();
+                        skipped.Add(entity.UniqueKey ?? "(no key)");
+                    }
+                }
+            }
         }
 
-        _logger.LogInformation("JobReport bulk insert: {ins} inserted, {skip} skipped", toInsert.Count, skipped.Count);
-        return Ok(new { Inserted = toInsert.Count, SkippedDuplicates = skipped.Count, SkippedKeys = skipped });
+        _logger.LogInformation("JobReport bulk insert: {ins} inserted, {skip} skipped", insertedCount, skipped.Count);
+        return Ok(new { Inserted = insertedCount, SkippedDuplicates = skipped.Count, SkippedKeys = skipped });
     }
 
     // ── PUT /api/jobreport/bulk — upsert ──
@@ -557,13 +665,14 @@ public class JobReportController : ControllerBase
             return BadRequest(new { error = "Payload must be a non-empty array of records." });
 
         foreach (var r in records)
-            if (string.IsNullOrWhiteSpace(r.UniqueKey))
-                r.UniqueKey = UniqueKeyBuilder.JobReport(r.DealerCode, r.JobNo, r.JobDate, r.ChassisNo);
+            r.UniqueKey = UniqueKeyBuilder.JobReport(r.DealerCode, r.JobNo, r.JobDate, r.ChassisNo);
 
         var deduped = records.GroupBy(r => r.UniqueKey).Select(g => g.Last()).ToList();
         var keys = deduped.Select(r => r.UniqueKey!).ToList();
 
+        // Include Complaints so we can replace them below without a second round-trip.
         var existing = await _db.DmsJobReports
+            .Include(x => x.Complaints)
             .Where(x => x.UniqueKey != null && keys.Contains(x.UniqueKey))
             .ToListAsync();
         var lookup = existing.ToDictionary(x => x.UniqueKey!, x => x);
@@ -585,24 +694,82 @@ public class JobReportController : ControllerBase
             }
         }
 
-        await _db.SaveChangesAsync();
+        try
+        {
+            await _db.SaveChangesAsync();
+        }
+        catch (DbUpdateException)
+        {
+            // The DB-level unique index on UniqueKey rejected the batch — most likely one
+            // of the "new" records here raced with a concurrent insert of the same
+            // DealerCode+JobNo+JobDate+ChassisNo between our lookup above and this save.
+            // Don't let one collision roll back the whole batch: retry row-by-row.
+            _logger.LogWarning("JobReport bulk upsert hit a unique-index conflict, retrying row-by-row");
+            _db.ChangeTracker.Clear();
+
+            inserted = 0;
+            updated = 0;
+            var conflicted = new List<string>();
+
+            foreach (var r in deduped)
+            {
+                try
+                {
+                    var row = await _db.DmsJobReports.Include(x => x.Complaints)
+                        .FirstOrDefaultAsync(x => x.UniqueKey == r.UniqueKey);
+
+                    if (row != null)
+                    {
+                        ApplyJobReport(row, r);
+                        row.UpdatedAt = DateTime.UtcNow;
+                        await _db.SaveChangesAsync();
+                        updated++;
+                    }
+                    else
+                    {
+                        _db.DmsJobReports.Add(MapJobReport(r));
+                        await _db.SaveChangesAsync();
+                        inserted++;
+                    }
+                }
+                catch (DbUpdateException)
+                {
+                    _db.ChangeTracker.Clear();
+                    conflicted.Add(r.UniqueKey ?? "(no key)");
+                }
+            }
+
+            _logger.LogInformation("JobReport bulk upsert (row-by-row): {ins} inserted, {upd} updated, {conf} conflicted",
+                inserted, updated, conflicted.Count);
+            return Ok(new { Inserted = inserted, Updated = updated, Conflicted = conflicted.Count, ConflictedKeys = conflicted });
+        }
+
         _logger.LogInformation("JobReport bulk upsert: {ins} inserted, {upd} updated", inserted, updated);
         return Ok(new { Inserted = inserted, Updated = updated });
     }
 
-    private static DmsJobReport MapJobReport(JobReportRecordDto r) => new()
+    private static DmsJobReport MapJobReport(JobReportRecordDto r)
     {
-        DealerName = r.DealerName, DealerCode = r.DealerCode, DealerLocation = r.DealerLocation,
-        City = r.City, State = r.State, JobNo = r.JobNo, JobDate = r.JobDate, JobType = r.JobType,
-        ServiceHead = r.ServiceHead, ServiceType = r.ServiceType, Kms = r.Kms, CustomerName = r.CustomerName,
-        MobileNo = r.MobileNo, ChassisNo = r.ChassisNo, RegNo = r.RegNo, EngineNo = r.EngineNo,
-        ItemName = r.ItemName, CustomerVoice = r.CustomerVoice, ComplaintCode = r.ComplaintCode,
-        Observation = r.Observation, SupervisorComment = r.SupervisorComment, JobStatus = r.JobStatus,
-        BatteryNo = r.BatteryNo, BrandName = r.BrandName, ChargerNo = r.ChargerNo, SaleDate = r.SaleDate,
-        Supervisor = r.Supervisor, Technician = r.Technician, JobEndDate = r.JobEndDate,
-        CreatedThrough = r.CreatedThrough, UniqueKey = r.UniqueKey,
-        CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow
-    };
+        var complaints = BuildComplaints(r.Complaints, r.CustomerVoice, r.ComplaintCode);
+
+        return new DmsJobReport
+        {
+            DealerName = r.DealerName, DealerCode = r.DealerCode, DealerLocation = r.DealerLocation,
+            City = r.City, State = r.State, JobNo = r.JobNo, JobDate = r.JobDate, JobType = r.JobType,
+            ServiceHead = r.ServiceHead, ServiceType = r.ServiceType, Kms = r.Kms, CustomerName = r.CustomerName,
+            MobileNo = r.MobileNo, ChassisNo = r.ChassisNo, RegNo = r.RegNo, EngineNo = r.EngineNo,
+            ItemName = r.ItemName,
+            // Legacy flat columns mirror the first complaint, for old readers.
+            CustomerVoice = complaints.Count > 0 ? complaints[0].CustomerVoice : r.CustomerVoice,
+            ComplaintCode = complaints.Count > 0 ? complaints[0].ComplaintCode : r.ComplaintCode,
+            Observation = r.Observation, SupervisorComment = r.SupervisorComment, JobStatus = r.JobStatus,
+            BatteryNo = r.BatteryNo, BrandName = r.BrandName, ChargerNo = r.ChargerNo, SaleDate = r.SaleDate,
+            Supervisor = r.Supervisor, Technician = r.Technician, JobEndDate = r.JobEndDate,
+            CreatedThrough = r.CreatedThrough, UniqueKey = r.UniqueKey,
+            CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow,
+            Complaints = complaints
+        };
+    }
 
     private static void ApplyJobReport(DmsJobReport row, JobReportRecordDto r)
     {
@@ -610,10 +777,18 @@ public class JobReportController : ControllerBase
         row.City = r.City; row.State = r.State; row.JobNo = r.JobNo; row.JobDate = r.JobDate; row.JobType = r.JobType;
         row.ServiceHead = r.ServiceHead; row.ServiceType = r.ServiceType; row.Kms = r.Kms; row.CustomerName = r.CustomerName;
         row.MobileNo = r.MobileNo; row.ChassisNo = r.ChassisNo; row.RegNo = r.RegNo; row.EngineNo = r.EngineNo;
-        row.ItemName = r.ItemName; row.CustomerVoice = r.CustomerVoice; row.ComplaintCode = r.ComplaintCode;
+        row.ItemName = r.ItemName;
         row.Observation = r.Observation; row.SupervisorComment = r.SupervisorComment; row.JobStatus = r.JobStatus;
         row.BatteryNo = r.BatteryNo; row.BrandName = r.BrandName; row.ChargerNo = r.ChargerNo; row.SaleDate = r.SaleDate;
         row.Supervisor = r.Supervisor; row.Technician = r.Technician; row.JobEndDate = r.JobEndDate;
         row.CreatedThrough = r.CreatedThrough;
+
+        // Replace complaints wholesale — simplest correct semantics for an upsert:
+        // whatever the caller sends is now the full set of complaints for this job card.
+        var complaints = BuildComplaints(r.Complaints, r.CustomerVoice, r.ComplaintCode);
+        row.Complaints.Clear();
+        foreach (var c in complaints) row.Complaints.Add(c);
+        row.CustomerVoice = complaints.Count > 0 ? complaints[0].CustomerVoice : r.CustomerVoice;
+        row.ComplaintCode = complaints.Count > 0 ? complaints[0].ComplaintCode : r.ComplaintCode;
     }
 }

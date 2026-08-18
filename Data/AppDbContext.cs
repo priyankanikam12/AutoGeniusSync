@@ -38,6 +38,7 @@ public partial class AppDbContext : DbContext
     public DbSet<DmsJobReport> DmsJobReports { get; set; }
     public DbSet<DmsRepairBill> DmsRepairBills { get; set; }
     public DbSet<DmsProforma> DmsProformas { get; set; }
+    public DbSet<DmsJobReportComplaint> DmsJobReportComplaints => Set<DmsJobReportComplaint>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -579,7 +580,7 @@ public partial class AppDbContext : DbContext
             entity.HasIndex(e => e.UniqueKey)
             .IsUnique()
             .HasFilter("[UniqueKey] IS NOT NULL")
-            .HasDatabaseName("UQ_DMS_JobReport_UniqueKey");
+            .HasDatabaseName("UX_DMS_JobReport_UniqueKey");
         });
 
         modelBuilder.Entity<DmsRepairBill>(entity =>
@@ -695,6 +696,20 @@ public partial class AppDbContext : DbContext
                 .HasFilter("[UniqueKey] IS NOT NULL")
                 .HasDatabaseName("UQ_DMS_Proforma_UniqueKey");
         });
+
+        modelBuilder.Entity<DmsJobReportComplaint>(entity =>
+        {
+            entity.ToTable("DMS_JobReportComplaints");
+
+            entity.HasOne(c => c.JobReport)
+                .WithMany(r => r.Complaints)
+                .HasForeignKey(c => c.JobReportId)
+                .OnDelete(DeleteBehavior.Cascade); // deleting a job card deletes its complaints
+
+            entity.HasIndex(c => c.JobReportId);
+        });
+
+
 
         OnModelCreatingPartial(modelBuilder);
     }
