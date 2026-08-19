@@ -12,10 +12,12 @@ namespace AutoGeniusSync.Controllers;
 public class ServiceHistoryController : ControllerBase
 {
     private readonly AppDbContext _db;
+    private readonly IConfiguration _config;
 
-    public ServiceHistoryController(AppDbContext db)
+    public ServiceHistoryController(AppDbContext db, IConfiguration config)
     {
         _db = db;
+        _config = config;
     }
 
     // ── GET /api/servicehistory?from=2022-07-01&to=2022-07-31 ──
@@ -77,6 +79,98 @@ public class ServiceHistoryController : ControllerBase
 
         if (!string.IsNullOrEmpty(chassisNo))
             query = query.Where(s => s.ChassisNo != null && s.ChassisNo.Contains(chassisNo));
+
+        if (!string.IsNullOrEmpty(from) && DateOnly.TryParse(from, out var f))
+            query = query.Where(s => s.JobDate >= f);
+
+        if (!string.IsNullOrEmpty(to) && DateOnly.TryParse(to, out var t))
+            query = query.Where(s => s.JobDate <= t);
+
+        var total = await query.CountAsync();
+        var records = await query
+            .OrderByDescending(s => s.JobDate)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .Select(s => new ServiceHistoryShareDto
+            {
+                Id = s.Id,
+                DealerCode = s.DealerCode,
+                JobNo = s.JobNo,
+                JobDate = s.JobDate,
+                CompName = s.CompName,
+                Location = s.Location,
+                InTime = s.InTime,
+                CloseTime = s.CloseTime,
+                JobCategory = s.JobCategory,
+                Ffrpercentage = s.Ffrpercentage,
+                DocNo = s.DocNo,
+                DocType = s.DocType,
+                DocDate = s.DocDate,
+                Model = s.Model,
+                RegNo = s.RegNo,
+                EngineNo = s.EngineNo,
+                ChassisNo = s.ChassisNo,
+                Kms = s.Kms,
+                BatterySerialNo1 = s.BatterySerialNo1,
+                BatterySerialNo2 = s.BatterySerialNo2,
+                BatterySerialNo3 = s.BatterySerialNo3,
+                BatterySerialNo4 = s.BatterySerialNo4,
+                BatterySerialNo5 = s.BatterySerialNo5,
+                BatterySerialNo6 = s.BatterySerialNo6,
+                PartyName = s.PartyName,
+                MobileNumber = s.MobileNumber,
+                Supervisor = s.Supervisor,
+                Technician = s.Technician,
+                ServiceHead = s.ServiceHead,
+                JobType = s.JobType,
+                SaleDate = s.SaleDate,
+                CouponNo = s.CouponNo,
+                ExpectedDeliveryDate = s.ExpectedDeliveryDate,
+                ProformaDate = s.ProformaDate,
+                InvoiceDate = s.InvoiceDate,
+                EstimatedJobExpenses = s.EstimatedJobExpenses,
+                LabourHours = s.LabourHours,
+                Parts = s.Parts,
+                Labour = s.Labour,
+                OutsideWork = s.OutsideWork,
+                TotalWotax = s.TotalWotax,
+                Gstamount = s.Gstamount,
+                Igstamount = s.Igstamount,
+                NetTotal = s.NetTotal,
+                RepairType = s.RepairType,
+                CompletionDate = s.CompletionDate,
+                JobStatus = s.JobStatus,
+                RowHash = s.RowHash,
+                UniqueKey = s.UniqueKey,
+                CreatedAt = s.CreatedAt,
+                UpdatedAt = s.UpdatedAt
+            })
+            .ToListAsync();
+
+        return Ok(new { Total = total, Page = page, PageSize = pageSize, Records = records });
+    }
+
+    // ── GET /api/servicehistory/zomato — Zomato-only feed, API-key gated ──
+    // Always scoped server-side to PartyName LIKE '%Zomato%'; the caller cannot
+    // widen this via any parameter. Requires header X-API-Key to match the value
+    // configured at ApiKeys:Zomato in appsettings — never hardcode the key here.
+    // Uses the same ServiceHistoryShareDto projection as /share, since this also
+    // leaves the system to an external party.
+    [HttpGet("zomato")]
+    public async Task<IActionResult> GetZomato(
+        [FromHeader(Name = "X-API-Key")] string? apiKey,
+        [FromQuery] string? from,
+        [FromQuery] string? to,
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 100)
+    {
+        var expectedKey = _config["ApiKeys:Zomato"];
+        if (string.IsNullOrEmpty(expectedKey) || !string.Equals(apiKey, expectedKey, StringComparison.Ordinal))
+            return Unauthorized(new { error = "Invalid or missing X-API-Key." });
+
+        var query = _db.DmsServiceHistories
+            .Where(s => !s.IsRowTotal && s.PartyName != null && s.PartyName.Contains("Zomato"))
+            .AsQueryable();
 
         if (!string.IsNullOrEmpty(from) && DateOnly.TryParse(from, out var f))
             query = query.Where(s => s.JobDate >= f);
