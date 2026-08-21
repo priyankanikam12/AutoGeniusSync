@@ -783,23 +783,49 @@ public class DataSyncService
         var end   = toDate   ?? DateTime.UtcNow.Date;
 
         var totalResult = new SyncResult { SyncType = "BackfillVehicleSales" };
+        var failedChunks = new List<string>();
 
         try
         {
             var chunkStart = start;
             while (chunkStart <= end && !ct.IsCancellationRequested)
             {
-                var chunkEnd = chunkStart.AddMonths(1).AddDays(-1);
+                var chunkEnd = chunkStart.AddDays(6);
                 if (chunkEnd > end) chunkEnd = end;
 
                 var r = await SyncVehicleSalesForRangeAsync(chunkStart, chunkEnd);
                 totalResult.RecordsFetched  += r.RecordsFetched;
                 totalResult.RecordsInserted += r.RecordsInserted;
 
+                if (!string.IsNullOrEmpty(r.Error))
+                {
+                    _logger.LogWarning("VehicleSales window {from}-{to} failed, retrying once: {err}",
+                        chunkStart.ToShortDateString(), chunkEnd.ToShortDateString(), r.Error);
+
+                    var retry = await SyncVehicleSalesForRangeAsync(chunkStart, chunkEnd);
+                    totalResult.RecordsFetched  += retry.RecordsFetched;
+                    totalResult.RecordsInserted += retry.RecordsInserted;
+
+                    if (!string.IsNullOrEmpty(retry.Error))
+                        failedChunks.Add($"{chunkStart:yyyy-MM-dd}..{chunkEnd:yyyy-MM-dd}: {retry.Error}");
+                }
+
                 chunkStart = chunkEnd.AddDays(1);
             }
 
-            topLog.Status = "Success";
+            if (failedChunks.Any())
+            {
+                topLog.Status = "PartialFailure";
+                topLog.ErrorMessage = $"{failedChunks.Count} window(s) failed after retry — VehicleSales data is INCOMPLETE for: "
+                    + string.Join(" | ", failedChunks);
+                totalResult.Error = topLog.ErrorMessage;
+                _logger.LogError("VSR backfill finished with {n} unrecoverable window(s): {details}",
+                    failedChunks.Count, topLog.ErrorMessage);
+            }
+            else
+            {
+                topLog.Status = "Success";
+            }
         }
         catch (Exception ex)
         {
@@ -1136,23 +1162,49 @@ public class DataSyncService
         var end   = toDate   ?? DateTime.UtcNow.Date;
 
         var totalResult = new SyncResult { SyncType = "BackfillVehicleDispatches" };
+        var failedChunks = new List<string>();
 
         try
         {
             var chunkStart = start;
             while (chunkStart <= end && !ct.IsCancellationRequested)
             {
-                var chunkEnd = chunkStart.AddMonths(1).AddDays(-1);
+                var chunkEnd = chunkStart.AddDays(6);
                 if (chunkEnd > end) chunkEnd = end;
 
                 var r = await SyncVehicleDispatchesForRangeAsync(chunkStart, chunkEnd);
                 totalResult.RecordsFetched  += r.RecordsFetched;
                 totalResult.RecordsInserted += r.RecordsInserted;
 
+                if (!string.IsNullOrEmpty(r.Error))
+                {
+                    _logger.LogWarning("VehicleDispatches window {from}-{to} failed, retrying once: {err}",
+                        chunkStart.ToShortDateString(), chunkEnd.ToShortDateString(), r.Error);
+
+                    var retry = await SyncVehicleDispatchesForRangeAsync(chunkStart, chunkEnd);
+                    totalResult.RecordsFetched  += retry.RecordsFetched;
+                    totalResult.RecordsInserted += retry.RecordsInserted;
+
+                    if (!string.IsNullOrEmpty(retry.Error))
+                        failedChunks.Add($"{chunkStart:yyyy-MM-dd}..{chunkEnd:yyyy-MM-dd}: {retry.Error}");
+                }
+
                 chunkStart = chunkEnd.AddDays(1);
             }
 
-            topLog.Status = "Success";
+            if (failedChunks.Any())
+            {
+                topLog.Status = "PartialFailure";
+                topLog.ErrorMessage = $"{failedChunks.Count} window(s) failed after retry — VehicleDispatches data is INCOMPLETE for: "
+                    + string.Join(" | ", failedChunks);
+                totalResult.Error = topLog.ErrorMessage;
+                _logger.LogError("VDR backfill finished with {n} unrecoverable window(s): {details}",
+                    failedChunks.Count, topLog.ErrorMessage);
+            }
+            else
+            {
+                topLog.Status = "Success";
+            }
         }
         catch (Exception ex)
         {
@@ -1370,6 +1422,14 @@ public class DataSyncService
     // ─────────────────────────────────────────────────────────
     // TRUNCATE ALL DATA TABLES
     // ─────────────────────────────────────────────────────────
+    private static readonly HashSet<string> AllowedTruncateTables = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "DMS_ServiceHistory",
+        "DMS_VehicleSales",
+        "DMS_VehicleDispatches",
+        "DMS_LineOrderReport"
+    };
+
     public async Task TruncateAllDataTablesAsync()
     {
         using var scope = _scopeFactory.CreateScope();
@@ -1387,9 +1447,13 @@ public class DataSyncService
 
         foreach (var table in tables)
         {
+            if (!AllowedTruncateTables.Contains(table))
+                throw new InvalidOperationException($"Refusing to truncate unrecognized table '{table}'.");
             try
             {
-                await db.Database.ExecuteSqlRawAsync($"TRUNCATE TABLE {table}");
+        #pragma warning disable EF1002 // table name validated against AllowedTruncateTables immediately above
+                await db.Database.ExecuteSqlRawAsync($"TRUNCATE TABLE [{table}]");
+        #pragma warning restore EF1002
                 _logger.LogInformation("Truncated {table}", table);
             }
             catch (Exception ex)
