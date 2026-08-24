@@ -39,6 +39,9 @@ public partial class AppDbContext : DbContext
     public DbSet<DmsRepairBill> DmsRepairBills { get; set; }
     public DbSet<DmsProforma> DmsProformas { get; set; }
     public DbSet<DmsJobReportComplaint> DmsJobReportComplaints => Set<DmsJobReportComplaint>();
+    public DbSet<DmsMaterialTransfer> DmsMaterialTransfers => Set<DmsMaterialTransfer>();
+    public DbSet<DmsMaterialTransferItem> DmsMaterialTransferItems => Set<DmsMaterialTransferItem>();
+    public DbSet<DmsMaterialTransferLabor> DmsMaterialTransferLabors => Set<DmsMaterialTransferLabor>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -709,7 +712,31 @@ public partial class AppDbContext : DbContext
             entity.HasIndex(c => c.JobReportId);
         });
 
+        modelBuilder.Entity<DmsMaterialTransfer>(e =>
+        {
+            e.ToTable("DMS_MaterialTransfer");
+            e.HasIndex(x => x.UniqueKey).IsUnique();
+            e.HasIndex(x => x.DealerCode);
+            e.HasIndex(x => x.DocDate);
+            e.HasMany(x => x.Items)
+                .WithOne(i => i.MaterialTransfer!)
+                .HasForeignKey(i => i.MaterialTransferId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
 
+        modelBuilder.Entity<DmsMaterialTransferItem>(e =>
+        {
+            e.ToTable("DMS_MaterialTransferItem");
+            e.HasMany(x => x.LabourLines)
+                .WithOne(l => l.MaterialTransferItem!)
+                .HasForeignKey(l => l.MaterialTransferItemId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<DmsMaterialTransferLabor>(e =>
+        {
+            e.ToTable("DMS_MaterialTransferLabor");
+        });
 
         OnModelCreatingPartial(modelBuilder);
     }

@@ -19,4 +19,7 @@ public static class UniqueKeyBuilder
 
     public static string VehicleDispatch(string? invoiceNo, string? chassisNo)
         => $"{Norm(invoiceNo)}{Norm(chassisNo)}";
+    
+    public static string MaterialTransfer(long? uniqueId, long? jobId)
+        => $"{uniqueId}_{jobId}";
 }

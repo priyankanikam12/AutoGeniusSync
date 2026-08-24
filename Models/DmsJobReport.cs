@@ -47,6 +47,7 @@ public partial class DmsJobReport
     public string? CreatedThrough { get; set; }
 
     public string? UniqueKey { get; set; }
+    public string? Action { get; set; }
     public DateTime? CreatedAt { get; set; }
     public DateTime? UpdatedAt { get; set; }
 

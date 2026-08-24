@@ -75,6 +75,56 @@ public class JobReportController : ControllerBase
         return list;
     }
 
+    // ── Server-maintained audit trail (the "Action" column) ──
+    // Appends one {action, at, payload} entry to whatever JSON array is already
+    // stored in Action, and returns the updated array as a string. Never
+    // overwrites history: the first insert starts the array, every later
+    // update/patch/upsert grows it. Clients never send or see this field on
+    // input — it's populated automatically here.
+    private static string AppendActionLog(string? existingLog, string actionType, object? payload)
+    {
+        System.Text.Json.Nodes.JsonArray array;
+
+        if (!string.IsNullOrWhiteSpace(existingLog))
+        {
+            try
+            {
+                array = System.Text.Json.Nodes.JsonNode.Parse(existingLog) as System.Text.Json.Nodes.JsonArray
+                        ?? new System.Text.Json.Nodes.JsonArray();
+            }
+            catch
+            {
+                // corrupted or pre-existing non-array content — don't lose the row over it,
+                // just start a fresh log rather than throwing.
+                array = new System.Text.Json.Nodes.JsonArray();
+            }
+        }
+        else
+        {
+            array = new System.Text.Json.Nodes.JsonArray();
+        }
+
+        var entry = new System.Text.Json.Nodes.JsonObject
+        {
+            ["action"]  = actionType,
+            ["at"]      = DateTime.UtcNow.ToString("O"),
+            ["payload"] = payload == null ? null : System.Text.Json.JsonSerializer.SerializeToNode(payload)
+        };
+
+        array.Add(entry);
+        return array.ToJsonString();
+    }
+
+    // Used for the CSV upload paths, where the "payload" worth logging is the
+    // mapped row's own fields rather than the raw split columns.
+    private static object CsvPayloadSnapshot(DmsJobReport r) => new
+    {
+        r.DealerName, r.DealerCode, r.DealerLocation, r.City, r.State, r.JobNo, r.JobDate, r.JobType,
+        r.ServiceHead, r.ServiceType, r.Kms, r.CustomerName, r.MobileNo, r.ChassisNo, r.RegNo, r.EngineNo,
+        r.ItemName, r.CustomerVoice, r.ComplaintCode, r.Observation, r.SupervisorComment, r.JobStatus,
+        r.BatteryNo, r.BrandName, r.ChargerNo, r.SaleDate, r.Supervisor, r.Technician, r.JobEndDate, r.CreatedThrough
+    };
+
     private static DmsJobReport MapRow(string[] cols)
     {
         string? Get(int i) => i < cols.Length ? cols[i].Trim() : null;
@@ -131,7 +181,7 @@ public class JobReportController : ControllerBase
     }
 
     // ═══════════════════════════════════════════════════════
-    // FILE UPLOAD ENDPOINTS — unchanged (still one complaint per CSV row)
+    // FILE UPLOAD ENDPOINTS — still one complaint per CSV row
     // ═══════════════════════════════════════════════════════
 
     [HttpPost("upload")]
@@ -192,6 +242,8 @@ public class JobReportController : ControllerBase
                 skippedAsExisting++;
                 continue;
             }
+
+            row.Action = AppendActionLog(null, "CSV_INSERT", CsvPayloadSnapshot(row));
 
             _db.DmsJobReports.Add(row);
             inserted++;
@@ -306,10 +358,13 @@ public class JobReportController : ControllerBase
                     existing.Complaints.Clear();
                     foreach (var c in row.Complaints) existing.Complaints.Add(c);
 
+                    existing.Action = AppendActionLog(existing.Action, "CSV_UPDATE", CsvPayloadSnapshot(row));
+
                     updated++;
                 }
                 else
                 {
+                    row.Action = AppendActionLog(null, "CSV_INSERT", CsvPayloadSnapshot(row));
                     _db.DmsJobReports.Add(row);
                     inserted++;
                 }
@@ -431,6 +486,8 @@ public class JobReportController : ControllerBase
             // Id is NOT set — the database generates it on insert.
         };
 
+        entity.Action = AppendActionLog(null, "CREATE", input);
+
         _db.DmsJobReports.Add(entity);
 
         try
@@ -500,6 +557,8 @@ public class JobReportController : ControllerBase
         existing.CustomerVoice = complaints.Count > 0 ? complaints[0].CustomerVoice : input.CustomerVoice;
         existing.ComplaintCode = complaints.Count > 0 ? complaints[0].ComplaintCode : input.ComplaintCode;
 
+        existing.Action = AppendActionLog(existing.Action, "UPDATE", input);
+
         await _db.SaveChangesAsync();
 
         _logger.LogInformation("JobReport updated: Id {id}, Job {jn}", id, existing.JobNo);
@@ -507,7 +566,7 @@ public class JobReportController : ControllerBase
         return Ok(existing);
     }
 
-    // PATCH /api/jobreport/{id} — partial update, unchanged.
+    // PATCH /api/jobreport/{id} — partial update.
     // NOTE: this dictionary-based endpoint still only edits header fields, not
     // the Complaints list. If you need to add/remove a single complaint from an
     // existing job card without resending the whole record, that should be a
@@ -563,6 +622,7 @@ public class JobReportController : ControllerBase
 
         existing.UniqueKey = BuildKey(existing.DealerCode, existing.JobNo, existing.JobDate, existing.ChassisNo);
         existing.UpdatedAt = DateTime.UtcNow;
+        existing.Action = AppendActionLog(existing.Action, "PATCH", updates);
 
         await _db.SaveChangesAsync();
 
@@ -614,7 +674,10 @@ public class JobReportController : ControllerBase
         foreach (var r in deduped)
         {
             if (existingKeys.Contains(r.UniqueKey!)) { skipped.Add(r.UniqueKey!); continue; }
-            toInsert.Add(MapJobReport(r));
+
+            var entity = MapJobReport(r);
+            entity.Action = AppendActionLog(null, "BULK_INSERT", r);
+            toInsert.Add(entity);
         }
 
         var insertedCount = 0;
@@ -684,12 +747,15 @@ public class JobReportController : ControllerBase
             if (lookup.TryGetValue(r.UniqueKey!, out var row))
             {
                 ApplyJobReport(row, r);
+                row.Action = AppendActionLog(row.Action, "BULK_UPDATE", r);
                 row.UpdatedAt = DateTime.UtcNow;
                 updated++;
             }
             else
             {
-                _db.DmsJobReports.Add(MapJobReport(r));
+                var entity = MapJobReport(r);
+                entity.Action = AppendActionLog(null, "BULK_INSERT", r);
+                _db.DmsJobReports.Add(entity);
                 inserted++;
             }
         }
@@ -721,13 +787,16 @@ public class JobReportController : ControllerBase
                     if (row != null)
                     {
                         ApplyJobReport(row, r);
+                        row.Action = AppendActionLog(row.Action, "BULK_UPDATE", r);
                         row.UpdatedAt = DateTime.UtcNow;
                         await _db.SaveChangesAsync();
                         updated++;
                     }
                     else
                     {
-                        _db.DmsJobReports.Add(MapJobReport(r));
+                        var entity = MapJobReport(r);
+                        entity.Action = AppendActionLog(null, "BULK_INSERT", r);
+                        _db.DmsJobReports.Add(entity);
                         await _db.SaveChangesAsync();
                         inserted++;
                     }
