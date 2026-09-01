@@ -65,6 +65,34 @@ public class LineOrderReportController : ControllerBase
         return Ok(new { Total = total, Page = page, PageSize = pageSize, Records = records });
     }
 
+    // ── GET /api/lineorderreport/anvweb — ANV Web Ventures-only feed, API-key gated ──
+    // Always scoped server-side to PartyName = 'ANV Web Ventures Private Limited'; the
+    // caller cannot widen this via any parameter. Requires header X-API-Key to match
+    // the value configured at ApiKeys:ANVWeb in appsettings — never hardcode the key here.
+    [HttpGet("anvweb")]
+    public async Task<IActionResult> GetAnvWeb(
+        [FromHeader(Name = "X-API-Key")] string? apiKey,
+        [FromQuery] string? from,
+        [FromQuery] string? to,
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 100)
+    {
+        var expectedKey = _config["ApiKeys:ANVWeb"];
+        if (string.IsNullOrEmpty(expectedKey) || !string.Equals(apiKey, expectedKey, StringComparison.Ordinal))
+            return Unauthorized(new { error = "Invalid or missing X-API-Key." });
+
+        var q = _db.DmsLineOrderReports
+            .Where(x => x.PartyName == "ANV Web Ventures Private Limited")
+            .AsQueryable();
+
+        if (!string.IsNullOrEmpty(from) && DateOnly.TryParse(from, out var f)) q = q.Where(x => x.JobDate >= f);
+        if (!string.IsNullOrEmpty(to) && DateOnly.TryParse(to, out var t)) q = q.Where(x => x.JobDate <= t);
+
+        var total = await q.CountAsync();
+        var records = await q.OrderByDescending(x => x.JobDate).Skip((page - 1) * pageSize).Take(pageSize).ToListAsync();
+        return Ok(new { Total = total, Page = page, PageSize = pageSize, Records = records });
+    }
+
     [HttpPost("bulk")]
     public async Task<IActionResult> BulkInsert([FromBody] List<LorRecordDto> records)
     {
