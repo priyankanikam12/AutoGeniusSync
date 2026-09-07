@@ -1,393 +1,321 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
 using AutoGeniusSync.Data;
 using AutoGeniusSync.DTOs;
+using AutoGeniusSync.Helpers;
 using AutoGeniusSync.Models;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 
-namespace AutoGeniusSync.Controllers;
-
-[ApiController]
-[Route("api/[controller]")]
-public class RepairBillController : ControllerBase
+namespace AutoGeniusSync.Controllers
 {
-    private readonly AppDbContext _db;
-    private readonly ILogger<RepairBillController> _logger;
-
-    public RepairBillController(AppDbContext db, ILogger<RepairBillController> logger)
+    [ApiController]
+    [Route("api/[controller]")]
+    public class RepairBillController : ControllerBase
     {
-        _db = db;
-        _logger = logger;
-    }
+        // NOTE: swap "AppDbContext" for whatever your actual DbContext class is named
+        // (same one your existing controllers inject) if it differs.
+        private readonly AppDbContext _context;
+        private readonly IConfiguration _config;
 
-    // ── GET /api/repairbill?location=...&billNo=...&chassisNo=...&from=...&to=... ──
-    [HttpGet]
-    public async Task<IActionResult> Get(
-        [FromQuery] string? location,
-        [FromQuery] string? billNo,
-        [FromQuery] string? chassisNo,
-        [FromQuery] string? jobNo,
-        [FromQuery] string? from,
-        [FromQuery] string? to,
-        [FromQuery] int page = 1,
-        [FromQuery] int pageSize = 100)
-    {
-        var q = _db.DmsRepairBills.AsQueryable();
-
-        if (!string.IsNullOrEmpty(location))
-            q = q.Where(x => x.Location.Contains(location));
-
-        if (!string.IsNullOrEmpty(billNo))
-            q = q.Where(x => x.BillNo == billNo);
-
-        if (!string.IsNullOrEmpty(chassisNo))
-            q = q.Where(x => x.ChassisNo != null && x.ChassisNo.Contains(chassisNo));
-
-        if (!string.IsNullOrEmpty(jobNo))
-            q = q.Where(x => x.JobNo == jobNo);
-
-        if (!string.IsNullOrEmpty(from) && DateOnly.TryParse(from, out var f))
-            q = q.Where(x => x.BillDate >= f);
-
-        if (!string.IsNullOrEmpty(to) && DateOnly.TryParse(to, out var t))
-            q = q.Where(x => x.BillDate <= t);
-
-        var total = await q.CountAsync();
-        var records = await q
-            .OrderByDescending(x => x.BillDate)
-            .Skip((page - 1) * pageSize)
-            .Take(pageSize)
-            .ToListAsync();
-
-        return Ok(new { Total = total, Page = page, PageSize = pageSize, Records = records });
-    }
-
-    // ── GET /api/repairbill/{location}/{billNo} ──
-    [HttpGet("{location}/{billNo}")]
-    public async Task<IActionResult> GetOne(string location, string billNo)
-    {
-        var record = await _db.DmsRepairBills
-            .FirstOrDefaultAsync(x => x.Location == location && x.BillNo == billNo);
-
-        return record == null ? NotFound() : Ok(record);
-    }
-
-    // ── GET /api/repairbill/chassis/{chassisNo} ──
-    [HttpGet("chassis/{chassisNo}")]
-    public async Task<IActionResult> GetByChassis(string chassisNo)
-        => Ok(await _db.DmsRepairBills
-            .Where(x => x.ChassisNo == chassisNo)
-            .OrderByDescending(x => x.BillDate)
-            .ToListAsync());
-
-    // ── POST /api/repairbill — insert only, 409 if (Location, BillNo) exists ──
-    [HttpPost]
-    public async Task<IActionResult> Create([FromBody] RepairBillDto dto)
-    {
-        if (string.IsNullOrWhiteSpace(dto.BillNo) || string.IsNullOrWhiteSpace(dto.Location))
-            return BadRequest(new { error = "BillNo and Location are required." });
-
-        var existing = await _db.DmsRepairBills
-            .FirstOrDefaultAsync(x => x.Location == dto.Location && x.BillNo == dto.BillNo);
-
-        if (existing != null)
-            return Conflict(new { error = $"Repair bill {dto.BillNo} at {dto.Location} already exists (unique key: Location + BillNo). Use PUT to update." });
-
-        var entity = MapToEntity(dto);
-        entity.CreatedAt = DateTime.UtcNow;
-        entity.UpdatedAt = DateTime.UtcNow;
-
-        _db.DmsRepairBills.Add(entity);
-        await _db.SaveChangesAsync();
-
-        _logger.LogInformation("Repair bill created: {loc}/{bill}", dto.Location, dto.BillNo);
-        return CreatedAtAction(nameof(GetOne), new { location = dto.Location, billNo = dto.BillNo }, entity);
-    }
-
-    // ── PUT /api/repairbill — upsert by (Location, BillNo) ──
-    [HttpPut]
-    public async Task<IActionResult> Upsert([FromBody] RepairBillDto dto)
-    {
-        if (string.IsNullOrWhiteSpace(dto.BillNo) || string.IsNullOrWhiteSpace(dto.Location))
-            return BadRequest(new { error = "BillNo and Location are required." });
-
-        var existing = await _db.DmsRepairBills
-            .FirstOrDefaultAsync(x => x.Location == dto.Location && x.BillNo == dto.BillNo);
-
-        bool created = existing == null;
-
-        if (existing == null)
+        public RepairBillController(AppDbContext context, IConfiguration config)
         {
-            existing = MapToEntity(dto);
-            existing.CreatedAt = DateTime.UtcNow;
-            _db.DmsRepairBills.Add(existing);
-        }
-        else
-        {
-            var updated = MapToEntity(dto);
-            existing.BillDate          = updated.BillDate;
-            existing.PartyName         = updated.PartyName;
-            existing.RegNo             = updated.RegNo;
-            existing.BillType          = updated.BillType;
-            existing.JobNo             = updated.JobNo;
-            existing.NetAmount         = updated.NetAmount;
-            existing.UserName          = updated.UserName;
-            existing.UserNameEdit      = updated.UserNameEdit;
-            existing.DateAdded         = updated.DateAdded;
-            existing.DateModified      = updated.DateModified;
-            existing.ChassisNo         = updated.ChassisNo;
-            existing.InsuranceType     = updated.InsuranceType;
-            existing.InsuranceDetails  = updated.InsuranceDetails;
-            existing.JobCardNo         = updated.JobCardNo;
-            existing.JobCardDate       = updated.JobCardDate;
-            existing.Cgst              = updated.Cgst;
-            existing.Sgst              = updated.Sgst;
-            existing.Igst              = updated.Igst;
-            existing.TotalAmount       = updated.TotalAmount;
-            existing.ItemRate          = updated.ItemRate;
-            existing.ItemQty           = updated.ItemQty;
-            existing.Mrp               = updated.Mrp;
-            existing.DiscountType      = updated.DiscountType;
-            existing.DiscountValue     = updated.DiscountValue;
-            existing.DiscountPercent   = updated.DiscountPercent;
-            existing.PartNo            = updated.PartNo;
-            existing.PartName          = updated.PartName;
-            existing.PartDescription   = updated.PartDescription;
-            existing.Labour            = updated.Labour;
-            existing.LabourDescription = updated.LabourDescription;
-            existing.UniqueKey         = updated.UniqueKey;
-            existing.MaterialCode      = updated.MaterialCode;
-            existing.MaterialDate      = updated.MaterialDate;
-            existing.DealerType        = updated.DealerType;
+            _context = context;
+            _config = config;
         }
 
-        existing.UpdatedAt = DateTime.UtcNow;
-        await _db.SaveChangesAsync();
-
-        _logger.LogInformation("Repair bill {action}: {loc}/{bill}",
-            created ? "created" : "updated", dto.Location, dto.BillNo);
-
-        return Ok(existing);
-    }
-
-    // ── POST /api/repairbill/bulk — insert only, skip duplicates by (Location, BillNo) ──
-    [HttpPost("bulk")]
-    public async Task<IActionResult> BulkInsert([FromBody] List<RepairBillDto> dtos)
-    {
-        if (dtos == null || dtos.Count == 0)
-            return BadRequest(new { error = "Request body must contain a non-empty array of repair bill records." });
-
-        var result = new BulkInsertResult();
-        var now = DateTime.UtcNow;
-
-        var seen = new HashSet<(string, string)>();
-        var toInsert = new List<((string Location, string BillNo) Key, RepairBillDto Dto)>();
-
-        foreach (var dto in dtos)
+        // Gate for all write endpoints (POST/PUT/DELETE) — reads appsettings "ApiKeys:Cogzim".
+        private bool IsValidApiKey(string? apiKey)
         {
-            if (string.IsNullOrWhiteSpace(dto.BillNo) || string.IsNullOrWhiteSpace(dto.Location))
-            {
-                result.SkippedDuplicates++;
-                result.SkippedKeys.Add("(missing Location/BillNo)");
-                continue;
-            }
-            var key = (dto.Location, dto.BillNo);
-            if (!seen.Add(key))
-            {
-                result.SkippedDuplicates++;
-                result.SkippedKeys.Add($"{dto.Location}/{dto.BillNo}");
-                continue;
-            }
-            toInsert.Add((key, dto));
+            var expected = _config["ApiKeys:Cogzim"];
+            return !string.IsNullOrEmpty(expected) && string.Equals(apiKey, expected, StringComparison.Ordinal);
         }
 
-        var locations = toInsert.Select(x => x.Key.Location).Distinct().ToList();
-        var billNos = toInsert.Select(x => x.Key.BillNo).Distinct().ToList();
-
-        var existingKeys = (await _db.DmsRepairBills
-            .Where(x => locations.Contains(x.Location) && billNos.Contains(x.BillNo))
-            .Select(x => new { x.Location, x.BillNo })
-            .ToListAsync())
-            .Select(x => (x.Location, x.BillNo))
-            .ToHashSet();
-
-        foreach (var (key, dto) in toInsert)
+        // GET api/repairbill?dealerCode=Cus9999&page=1&pageSize=50
+        [HttpGet]
+        public async Task<IActionResult> Get([FromQuery] string? dealerCode, [FromQuery] int page = 1, [FromQuery] int pageSize = 50)
         {
-            if (existingKeys.Contains(key))
+            if (page < 1) page = 1;
+            if (pageSize < 1 || pageSize > 500) pageSize = 50;
+
+            var query = _context.RepairBills.Include(p => p.Items).AsQueryable();
+
+            if (!string.IsNullOrWhiteSpace(dealerCode))
+                query = query.Where(p => p.DealerCode == dealerCode);
+
+            var total = await query.CountAsync();
+            var items = await query
+                .OrderByDescending(p => p.Id)
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
+                .ToListAsync();
+
+            return Ok(new { total, page, pageSize, records = items });
+        }
+
+        // GET api/repairbill/all
+        [HttpGet("all")]
+        public async Task<IActionResult> GetAll()
+        {
+            var items = await _context.RepairBills.Include(p => p.Items).ToListAsync();
+            return Ok(items);
+        }
+
+        // GET api/repairbill/5
+        [HttpGet("{id:int}")]
+        public async Task<IActionResult> GetById(int id)
+        {
+            var item = await _context.RepairBills.Include(p => p.Items).FirstOrDefaultAsync(p => p.Id == id);
+            if (item == null) return NotFound();
+            return Ok(item);
+        }
+
+        // GET api/repairbill/dealer/Cus9999
+        [HttpGet("dealer/{dealerCode}")]
+        public async Task<IActionResult> GetByDealer(string dealerCode)
+        {
+            var items = await _context.RepairBills
+                .Include(p => p.Items)
+                .Where(p => p.DealerCode == dealerCode)
+                .ToListAsync();
+            return Ok(items);
+        }
+
+        // GET api/repairbill/chassis/P6DEC12NPBC000004
+        [HttpGet("chassis/{chassisNo}")]
+        public async Task<IActionResult> GetByChassis(string chassisNo)
+        {
+            var items = await _context.RepairBills
+                .Include(p => p.Items)
+                .Where(p => p.ChassisNo == chassisNo)
+                .ToListAsync();
+            return Ok(items);
+        }
+
+        // POST api/repairbill/bulk — insert-only, silently skips records whose (uniqueId, uniqueKey) already exist
+        [HttpPost("bulk")]
+        public async Task<IActionResult> BulkInsert([FromHeader(Name = "X-API-Key")] string? apiKey, [FromBody] List<RepairBillRecordDto> records)
+        {
+            if (!IsValidApiKey(apiKey))
+                return Unauthorized(new { error = "Invalid or missing API key." });
+
+            if (records == null || records.Count == 0)
+                return BadRequest("No records supplied.");
+
+            var mapped = records.Select(r => MapToEntity(r)).ToList();
+
+            var keys = mapped.Select(e => e.ComputedUniqueKey).Distinct().ToList();
+            var existingKeys = (await _context.RepairBills
+                .Where(p => keys.Contains(p.ComputedUniqueKey))
+                .Select(p => p.ComputedUniqueKey)
+                .ToListAsync())
+                .ToHashSet();
+
+            var toInsert = new List<DmsRepairBill>();
+            var skipped = new List<string>();
+
+            foreach (var entity in mapped)
             {
-                result.SkippedDuplicates++;
-                result.SkippedKeys.Add($"{key.Location}/{key.BillNo}");
-                continue;
+                if (existingKeys.Contains(entity.ComputedUniqueKey))
+                {
+                    skipped.Add(entity.ComputedUniqueKey);
+                    continue;
+                }
+                toInsert.Add(entity);
+                existingKeys.Add(entity.ComputedUniqueKey); // guard against dupes within the same batch
             }
 
-            var entity = MapToEntity(dto);
-            entity.CreatedAt = now;
-            entity.UpdatedAt = now;
-            _db.DmsRepairBills.Add(entity);
-            result.Inserted++;
-        }
-
-        await _db.SaveChangesAsync();
-
-        _logger.LogInformation("Bulk repair bill insert: {inserted} inserted, {skipped} skipped",
-            result.Inserted, result.SkippedDuplicates);
-
-        return Ok(result);
-    }
-
-    // ── PUT /api/repairbill/bulk — update only, skip if (Location, BillNo) not found ──
-    [HttpPut("bulk")]
-    public async Task<IActionResult> BulkUpdate([FromBody] List<RepairBillDto> dtos)
-    {
-        if (dtos == null || dtos.Count == 0)
-            return BadRequest(new { error = "Request body must contain a non-empty array of repair bill records." });
-
-        var result = new BulkUpdateResult();
-        var now = DateTime.UtcNow;
-
-        var seen = new HashSet<(string, string)>();
-        var toUpdate = new List<((string Location, string BillNo) Key, RepairBillDto Dto)>();
-
-        foreach (var dto in dtos)
-        {
-            if (string.IsNullOrWhiteSpace(dto.BillNo) || string.IsNullOrWhiteSpace(dto.Location))
+            var inserted = 0;
+            try
             {
-                result.SkippedNotFound++;
-                result.SkippedKeys.Add("(missing Location/BillNo)");
-                continue;
+                await _context.RepairBills.AddRangeAsync(toInsert);
+                await _context.SaveChangesAsync();
+                inserted = toInsert.Count;
             }
-            var key = (dto.Location, dto.BillNo);
-            if (!seen.Add(key)) continue;
-            toUpdate.Add((key, dto));
-        }
-
-        var locations = toUpdate.Select(x => x.Key.Location).Distinct().ToList();
-        var billNos = toUpdate.Select(x => x.Key.BillNo).Distinct().ToList();
-
-        var existingEntities = (await _db.DmsRepairBills
-            .Where(x => locations.Contains(x.Location) && billNos.Contains(x.BillNo))
-            .ToListAsync())
-            .ToDictionary(x => (x.Location, x.BillNo));
-
-        foreach (var (key, dto) in toUpdate)
-        {
-            if (!existingEntities.TryGetValue(key, out var existing))
+            catch (DbUpdateException)
             {
-                result.SkippedNotFound++;
-                result.SkippedKeys.Add($"{key.Location}/{key.BillNo}");
-                continue;
+                _context.ChangeTracker.Clear();
+                inserted = 0;
+                foreach (var entity in toInsert)
+                {
+                    try
+                    {
+                        _context.RepairBills.Add(entity);
+                        await _context.SaveChangesAsync();
+                        inserted++;
+                    }
+                    catch (DbUpdateException)
+                    {
+                        _context.ChangeTracker.Clear();
+                        skipped.Add(entity.ComputedUniqueKey);
+                    }
+                }
             }
 
-            var updated = MapToEntity(dto);
-            existing.BillDate          = updated.BillDate;
-            existing.PartyName         = updated.PartyName;
-            existing.RegNo             = updated.RegNo;
-            existing.BillType          = updated.BillType;
-            existing.JobNo             = updated.JobNo;
-            existing.NetAmount         = updated.NetAmount;
-            existing.UserName          = updated.UserName;
-            existing.UserNameEdit      = updated.UserNameEdit;
-            existing.DateAdded         = updated.DateAdded;
-            existing.DateModified      = updated.DateModified;
-            existing.ChassisNo         = updated.ChassisNo;
-            existing.InsuranceType     = updated.InsuranceType;
-            existing.InsuranceDetails  = updated.InsuranceDetails;
-            existing.JobCardNo         = updated.JobCardNo;
-            existing.JobCardDate       = updated.JobCardDate;
-            existing.Cgst              = updated.Cgst;
-            existing.Sgst              = updated.Sgst;
-            existing.Igst              = updated.Igst;
-            existing.TotalAmount       = updated.TotalAmount;
-            existing.ItemRate          = updated.ItemRate;
-            existing.ItemQty           = updated.ItemQty;
-            existing.Mrp               = updated.Mrp;
-            existing.DiscountType      = updated.DiscountType;
-            existing.DiscountValue     = updated.DiscountValue;
-            existing.DiscountPercent   = updated.DiscountPercent;
-            existing.PartNo            = updated.PartNo;
-            existing.PartName          = updated.PartName;
-            existing.PartDescription   = updated.PartDescription;
-            existing.Labour            = updated.Labour;
-            existing.LabourDescription = updated.LabourDescription;
-            existing.UniqueKey         = updated.UniqueKey;
-            existing.MaterialCode      = updated.MaterialCode;
-            existing.MaterialDate      = updated.MaterialDate;
-            existing.DealerType        = updated.DealerType;
-            existing.UpdatedAt         = now;
-
-            result.Updated++;
+            return Ok(new { inserted, skipped = skipped.Count, skippedKeys = skipped });
         }
 
-        await _db.SaveChangesAsync();
+        // PUT api/repairbill/bulk — insert new (uniqueId, uniqueKey) combinations, update existing ones (including their line items)
+        [HttpPut("bulk")]
+        public async Task<IActionResult> BulkUpsert([FromHeader(Name = "X-API-Key")] string? apiKey, [FromBody] List<RepairBillRecordDto> records)
+        {
+            if (!IsValidApiKey(apiKey))
+                return Unauthorized(new { error = "Invalid or missing API key." });
 
-        _logger.LogInformation("Bulk repair bill update: {updated} updated, {skipped} skipped (not found)",
-            result.Updated, result.SkippedNotFound);
+            if (records == null || records.Count == 0)
+                return BadRequest("No records supplied.");
 
-        return Ok(result);
-    }
+            var mapped = records.Select(r => MapToEntity(r)).ToList();
+            var keys = mapped.Select(e => e.ComputedUniqueKey).Distinct().ToList();
 
-    private static DmsRepairBill MapToEntity(RepairBillDto dto) => new()
-    {
-        BillDate          = ParseDate(dto.Date),
-        BillNo            = dto.BillNo,
-        Location          = dto.Location,
-        PartyName         = dto.PartyName,
-        RegNo             = dto.RegNo,
-        BillType          = dto.BillType,
-        JobNo             = dto.JobNo,
-        NetAmount         = ParseDecimal(dto.NetAmount),
-        UserName          = dto.UserName,
-        UserNameEdit      = dto.UserNameEdit,
-        DateAdded         = ParseDateTime(dto.DateAdded),
-        DateModified      = ParseDateTime(dto.DateModified),
-        ChassisNo         = dto.ChassisNo,
-        InsuranceType     = dto.InsuranceType,
-        InsuranceDetails  = dto.InsuranceDetails,
-        JobCardNo         = dto.JobCardNo,
-        JobCardDate       = ParseDate(dto.JobCardDate),
-        Cgst              = ParseDecimal(dto.Cgst),
-        Sgst              = ParseDecimal(dto.Sgst),
-        Igst              = ParseDecimal(dto.Igst),
-        TotalAmount       = ParseDecimal(dto.TotalAmount),
-        ItemRate          = ParseDecimal(dto.ItemRate),
-        ItemQty           = ParseDecimal(dto.ItemQty),
-        Mrp               = ParseDecimal(dto.Mrp),
-        DiscountType      = dto.DiscountType,
-        DiscountValue     = ParseDecimal(dto.DiscountValue),
-        DiscountPercent   = ParseDecimal(dto.DiscountPercent),
-        PartNo            = dto.PartNo,
-        PartName          = dto.PartName,
-        PartDescription   = dto.PartDescription,
-        Labour            = ParseDecimal(dto.Labour),
-        LabourDescription = dto.LabourDescription,
-        UniqueKey         = dto.UniqueKey,
-        MaterialCode      = dto.MaterialCode,
-        MaterialDate      = ParseDate(dto.MaterialDate),
-        DealerType        = dto.DealerType
-    };
+            var existing = await _context.RepairBills
+                .Include(p => p.Items)
+                .Where(p => keys.Contains(p.ComputedUniqueKey))
+                .ToDictionaryAsync(p => p.ComputedUniqueKey);
 
-    private static DateOnly? ParseDate(string? val)
-    {
-        if (string.IsNullOrWhiteSpace(val)) return null;
-        if (DateTime.TryParseExact(val, "dd-MM-yyyy",
-            System.Globalization.CultureInfo.InvariantCulture,
-            System.Globalization.DateTimeStyles.None, out var d))
-            return DateOnly.FromDateTime(d);
-        if (DateTime.TryParse(val, out var d2))
-            return DateOnly.FromDateTime(d2);
-        return null;
-    }
+            var toInsert = new List<DmsRepairBill>();
+            var updated = 0;
 
-    private static DateTime? ParseDateTime(string? val)
-    {
-        if (string.IsNullOrWhiteSpace(val)) return null;
-        return DateTime.TryParse(val, System.Globalization.CultureInfo.InvariantCulture,
-            System.Globalization.DateTimeStyles.None, out var d) ? d : null;
-    }
+            foreach (var entity in mapped)
+            {
+                if (existing.TryGetValue(entity.ComputedUniqueKey, out var current))
+                {
+                    ApplyHeaderFields(current, entity);
+                    _context.RepairBillItems.RemoveRange(current.Items);
+                    current.Items = entity.Items;
+                    current.UpdatedAt = DateTime.UtcNow;
+                    updated++;
+                }
+                else
+                {
+                    toInsert.Add(entity);
+                }
+            }
 
-    private static decimal? ParseDecimal(string? val)
-    {
-        if (string.IsNullOrWhiteSpace(val)) return 0;
-        return decimal.TryParse(val, System.Globalization.NumberStyles.Any,
-            System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : 0;
+            var inserted = 0;
+            try
+            {
+                if (toInsert.Count > 0)
+                    await _context.RepairBills.AddRangeAsync(toInsert);
+                await _context.SaveChangesAsync();
+                inserted = toInsert.Count;
+            }
+            catch (DbUpdateException)
+            {
+                _context.ChangeTracker.Clear();
+                foreach (var entity in toInsert)
+                {
+                    try
+                    {
+                        _context.RepairBills.Add(entity);
+                        await _context.SaveChangesAsync();
+                        inserted++;
+                    }
+                    catch (DbUpdateException)
+                    {
+                        _context.ChangeTracker.Clear();
+                    }
+                }
+            }
+
+            return Ok(new { inserted, updated });
+        }
+
+        // DELETE api/repairbill/5
+        [HttpDelete("{id:int}")]
+        public async Task<IActionResult> Delete(int id, [FromHeader(Name = "X-API-Key")] string? apiKey)
+        {
+            if (!IsValidApiKey(apiKey))
+                return Unauthorized(new { error = "Invalid or missing API key." });
+
+            var item = await _context.RepairBills.FindAsync(id);
+            if (item == null) return NotFound();
+            _context.RepairBills.Remove(item);
+            await _context.SaveChangesAsync();
+            return NoContent();
+        }
+
+        // DELETE api/repairbill/bulk  — body: [ { "uniqueId": 19, "uniqueKey": 21 }, ... ]
+        [HttpDelete("bulk")]
+        public async Task<IActionResult> BulkDelete([FromHeader(Name = "X-API-Key")] string? apiKey, [FromBody] List<RepairBillDeleteRequestDto> requests)
+        {
+            if (!IsValidApiKey(apiKey))
+                return Unauthorized(new { error = "Invalid or missing API key." });
+
+            if (requests == null || requests.Count == 0)
+                return BadRequest("No records supplied.");
+
+            var keys = requests.Select(r => UniqueKeyBuilder.RepairBill(r.UniqueId, r.UniqueKey)).ToList();
+
+            var toDelete = await _context.RepairBills
+                .Where(p => keys.Contains(p.ComputedUniqueKey))
+                .ToListAsync();
+
+            _context.RepairBills.RemoveRange(toDelete);
+            await _context.SaveChangesAsync();
+
+            return Ok(new { deleted = toDelete.Count });
+        }
+
+        private static DmsRepairBill MapToEntity(RepairBillRecordDto r)
+        {
+            return new DmsRepairBill
+            {
+                DealerName = r.DealerName,
+                DealerCode = r.DealerCode,
+                UniqueKey = r.UniqueKey,
+                UniqueId = r.UniqueId,
+                InvoiceNo = r.InvoiceNo,
+                InvoiceDate = r.InvoiceDate,
+                Location = r.Location,
+                PartyName = r.PartyName,
+                BillType = r.BillType,
+                CashType = r.CashType,
+                CashAccount = r.CashAccount,
+                RegNo = r.RegNo,
+                ChassisNo = r.ChassisNo,
+                ComputedUniqueKey = UniqueKeyBuilder.RepairBill(r.UniqueId, r.UniqueKey),
+                Items = (r.ProformaDetl ?? new List<RepairBillDetailDto>()).Select(d => new DmsRepairBillItem
+                {
+                    SourceItemId = d.Id,
+                    ItemIdno = d.ItemIdno,
+                    ItemCode = d.ItemCode,
+                    ItemDesc = d.ItemDesc,
+                    ItemType = d.ItemType,
+                    Qty = d.Qty,
+                    Rate = d.Rate,
+                    IssueType = d.IssueType,
+                    SgstPer = d.SgstPer,
+                    SgstAmount = d.SgstAmount,
+                    CgstPer = d.CgstPer,
+                    CgstAmount = d.CgstAmount,
+                    IgstPer = d.IgstPer,
+                    IgstAmount = d.IgstAmount,
+                    WavRate = d.WavRate,
+                    TotAmnt = d.TotAmnt,
+                    MtrlIssue = d.MtrlIssue
+                }).ToList()
+            };
+        }
+
+        private static void ApplyHeaderFields(DmsRepairBill target, DmsRepairBill source)
+        {
+            target.DealerName = source.DealerName;
+            target.DealerCode = source.DealerCode;
+            target.UniqueKey = source.UniqueKey;
+            target.UniqueId = source.UniqueId;
+            target.InvoiceNo = source.InvoiceNo;
+            target.InvoiceDate = source.InvoiceDate;
+            target.Location = source.Location;
+            target.PartyName = source.PartyName;
+            target.BillType = source.BillType;
+            target.CashType = source.CashType;
+            target.CashAccount = source.CashAccount;
+            target.RegNo = source.RegNo;
+            target.ChassisNo = source.ChassisNo;
+        }
     }
 }

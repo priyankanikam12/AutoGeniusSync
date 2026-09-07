@@ -1,376 +1,321 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
 using AutoGeniusSync.Data;
 using AutoGeniusSync.DTOs;
+using AutoGeniusSync.Helpers;
 using AutoGeniusSync.Models;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 
-namespace AutoGeniusSync.Controllers;
-
-[ApiController]
-[Route("api/[controller]")]
-public class ProformaController : ControllerBase
+namespace AutoGeniusSync.Controllers
 {
-    private readonly AppDbContext _db;
-    private readonly ILogger<ProformaController> _logger;
-
-    public ProformaController(AppDbContext db, ILogger<ProformaController> logger)
+    [ApiController]
+    [Route("api/[controller]")]
+    public class ProformaController : ControllerBase
     {
-        _db = db;
-        _logger = logger;
-    }
+        // NOTE: swap "AppDbContext" for whatever your actual DbContext class is named
+        // (same one your existing controllers inject) if it differs.
+        private readonly AppDbContext _context;
+        private readonly IConfiguration _config;
 
-    // ── GET /api/proforma?invoiceNo=...&chassisNo=...&rBillNo=...&from=...&to=... ──
-    [HttpGet]
-    public async Task<IActionResult> Get(
-        [FromQuery] string? invoiceNo,
-        [FromQuery] string? chassisNo,
-        [FromQuery] string? rBillNo,
-        [FromQuery] string? serialNo,
-        [FromQuery] string? from,
-        [FromQuery] string? to,
-        [FromQuery] int page = 1,
-        [FromQuery] int pageSize = 100)
-    {
-        var q = _db.DmsProformas.AsQueryable();
-
-        if (!string.IsNullOrEmpty(invoiceNo))
-            q = q.Where(x => x.InvoiceNo == invoiceNo);
-
-        if (!string.IsNullOrEmpty(chassisNo))
-            q = q.Where(x => x.ChassisNo != null && x.ChassisNo.Contains(chassisNo));
-
-        if (!string.IsNullOrEmpty(rBillNo))
-            q = q.Where(x => x.RBillNo == rBillNo);
-
-        if (!string.IsNullOrEmpty(serialNo))
-            q = q.Where(x => x.SerialNo.Contains(serialNo));
-
-        if (!string.IsNullOrEmpty(from) && DateOnly.TryParse(from, out var f))
-            q = q.Where(x => x.InvoiceDate >= f);
-
-        if (!string.IsNullOrEmpty(to) && DateOnly.TryParse(to, out var t))
-            q = q.Where(x => x.InvoiceDate <= t);
-
-        var total = await q.CountAsync();
-        var records = await q
-            .OrderByDescending(x => x.InvoiceDate)
-            .Skip((page - 1) * pageSize)
-            .Take(pageSize)
-            .ToListAsync();
-
-        return Ok(new { Total = total, Page = page, PageSize = pageSize, Records = records });
-    }
-
-    // ── GET /api/proforma/{serialNo} ──
-    [HttpGet("{serialNo}")]
-    public async Task<IActionResult> GetOne(string serialNo)
-    {
-        var record = await _db.DmsProformas.FirstOrDefaultAsync(x => x.SerialNo == serialNo);
-        return record == null ? NotFound() : Ok(record);
-    }
-
-    // ── GET /api/proforma/chassis/{chassisNo} ──
-    [HttpGet("chassis/{chassisNo}")]
-    public async Task<IActionResult> GetByChassis(string chassisNo)
-        => Ok(await _db.DmsProformas
-            .Where(x => x.ChassisNo == chassisNo)
-            .OrderByDescending(x => x.InvoiceDate)
-            .ToListAsync());
-
-    // ── POST /api/proforma — insert only, 409 if SerialNo exists ──
-    [HttpPost]
-    public async Task<IActionResult> Create([FromBody] ProformaDto dto)
-    {
-        if (string.IsNullOrWhiteSpace(dto.SerialNo))
-            return BadRequest(new { error = "Serial No is required." });
-
-        var existing = await _db.DmsProformas.FirstOrDefaultAsync(x => x.SerialNo == dto.SerialNo);
-        if (existing != null)
-            return Conflict(new { error = $"Proforma with Serial No {dto.SerialNo} already exists (unique key: SerialNo). Use PUT to update." });
-
-        var entity = MapToEntity(dto);
-        entity.CreatedAt = DateTime.UtcNow;
-        entity.UpdatedAt = DateTime.UtcNow;
-
-        _db.DmsProformas.Add(entity);
-        await _db.SaveChangesAsync();
-
-        _logger.LogInformation("Proforma created: {serial}", dto.SerialNo);
-        return CreatedAtAction(nameof(GetOne), new { serialNo = dto.SerialNo }, entity);
-    }
-
-    // ── PUT /api/proforma — upsert by SerialNo ──
-    [HttpPut]
-    public async Task<IActionResult> Upsert([FromBody] ProformaDto dto)
-    {
-        if (string.IsNullOrWhiteSpace(dto.SerialNo))
-            return BadRequest(new { error = "Serial No is required." });
-
-        var existing = await _db.DmsProformas.FirstOrDefaultAsync(x => x.SerialNo == dto.SerialNo);
-        bool created = existing == null;
-
-        if (existing == null)
+        public ProformaController(AppDbContext context, IConfiguration config)
         {
-            existing = MapToEntity(dto);
-            existing.CreatedAt = DateTime.UtcNow;
-            _db.DmsProformas.Add(existing);
-        }
-        else
-        {
-            var updated = MapToEntity(dto);
-            existing.InvoiceNo         = updated.InvoiceNo;
-            existing.InvoiceDate       = updated.InvoiceDate;
-            existing.DealerName        = updated.DealerName;
-            existing.DealerLocation    = updated.DealerLocation;
-            existing.ModelName         = updated.ModelName;
-            existing.ChassisNo         = updated.ChassisNo;
-            existing.ItemCode          = updated.ItemCode;
-            existing.ItemDescription   = updated.ItemDescription;
-            existing.RBillNo           = updated.RBillNo;
-            existing.RBillDate         = updated.RBillDate;
-            existing.PartyName         = updated.PartyName;
-            existing.PartyState        = updated.PartyState;
-            existing.InsuranceType     = updated.InsuranceType;
-            existing.InsuranceDetails  = updated.InsuranceDetails;
-            existing.JobCardNo         = updated.JobCardNo;
-            existing.JobCardDate       = updated.JobCardDate;
-            existing.Cgst              = updated.Cgst;
-            existing.Sgst              = updated.Sgst;
-            existing.Igst              = updated.Igst;
-            existing.TotalAmount       = updated.TotalAmount;
-            existing.ItemRate          = updated.ItemRate;
-            existing.ItemQty           = updated.ItemQty;
-            existing.Mrp               = updated.Mrp;
-            existing.DiscountType      = updated.DiscountType;
-            existing.DiscountValue     = updated.DiscountValue;
-            existing.DiscountPercent   = updated.DiscountPercent;
-            existing.PartNo            = updated.PartNo;
-            existing.PartName          = updated.PartName;
-            existing.PartDescription   = updated.PartDescription;
-            existing.Labour            = updated.Labour;
-            existing.LabourDescription = updated.LabourDescription;
-            existing.UniqueKey         = updated.UniqueKey;
-            existing.MaterialCode      = updated.MaterialCode;
-            existing.MaterialDate      = updated.MaterialDate;
-            existing.DealerType        = updated.DealerType;
+            _context = context;
+            _config = config;
         }
 
-        existing.UpdatedAt = DateTime.UtcNow;
-        await _db.SaveChangesAsync();
-
-        _logger.LogInformation("Proforma {action}: {serial}",
-            created ? "created" : "updated", dto.SerialNo);
-
-        return Ok(existing);
-    }
-
-    // ── POST /api/proforma/bulk — insert only, skip duplicates by SerialNo ──
-    [HttpPost("bulk")]
-    public async Task<IActionResult> BulkInsert([FromBody] List<ProformaDto> dtos)
-    {
-        if (dtos == null || dtos.Count == 0)
-            return BadRequest(new { error = "Request body must contain a non-empty array of proforma records." });
-
-        var result = new BulkInsertResult();
-        var now = DateTime.UtcNow;
-
-        // Dedupe within the incoming batch itself
-        var seen = new HashSet<string>();
-        var toInsert = new List<(string SerialNo, ProformaDto Dto)>();
-
-        foreach (var dto in dtos)
+        // Gate for all write endpoints (POST/PUT/DELETE) — reads appsettings "ApiKeys:Cogzim".
+        private bool IsValidApiKey(string? apiKey)
         {
-            if (string.IsNullOrWhiteSpace(dto.SerialNo))
-            {
-                result.SkippedDuplicates++;
-                result.SkippedKeys.Add("(missing SerialNo)");
-                continue;
-            }
-            if (!seen.Add(dto.SerialNo))
-            {
-                result.SkippedDuplicates++;
-                result.SkippedKeys.Add(dto.SerialNo);
-                continue;
-            }
-            toInsert.Add((dto.SerialNo, dto));
+            var expected = _config["ApiKeys:Cogzim"];
+            return !string.IsNullOrEmpty(expected) && string.Equals(apiKey, expected, StringComparison.Ordinal);
         }
 
-        // Single round-trip check against DB for existing SerialNos
-        var candidateSerials = toInsert.Select(x => x.SerialNo).ToList();
-        var existingSerials = await _db.DmsProformas
-            .Where(x => candidateSerials.Contains(x.SerialNo))
-            .Select(x => x.SerialNo)
-            .ToListAsync();
-        var existingSet = existingSerials.ToHashSet();
-
-        foreach (var (serialNo, dto) in toInsert)
+        // GET api/proforma?dealerCode=Cus9999&page=1&pageSize=50
+        [HttpGet]
+        public async Task<IActionResult> Get([FromQuery] string? dealerCode, [FromQuery] int page = 1, [FromQuery] int pageSize = 50)
         {
-            if (existingSet.Contains(serialNo))
+            if (page < 1) page = 1;
+            if (pageSize < 1 || pageSize > 500) pageSize = 50;
+
+            var query = _context.Proformas.Include(p => p.Items).AsQueryable();
+
+            if (!string.IsNullOrWhiteSpace(dealerCode))
+                query = query.Where(p => p.DealerCode == dealerCode);
+
+            var total = await query.CountAsync();
+            var items = await query
+                .OrderByDescending(p => p.Id)
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
+                .ToListAsync();
+
+            return Ok(new { total, page, pageSize, records = items });
+        }
+
+        // GET api/proforma/all
+        [HttpGet("all")]
+        public async Task<IActionResult> GetAll()
+        {
+            var items = await _context.Proformas.Include(p => p.Items).ToListAsync();
+            return Ok(items);
+        }
+
+        // GET api/proforma/5
+        [HttpGet("{id:int}")]
+        public async Task<IActionResult> GetById(int id)
+        {
+            var item = await _context.Proformas.Include(p => p.Items).FirstOrDefaultAsync(p => p.Id == id);
+            if (item == null) return NotFound();
+            return Ok(item);
+        }
+
+        // GET api/proforma/dealer/Cus9999
+        [HttpGet("dealer/{dealerCode}")]
+        public async Task<IActionResult> GetByDealer(string dealerCode)
+        {
+            var items = await _context.Proformas
+                .Include(p => p.Items)
+                .Where(p => p.DealerCode == dealerCode)
+                .ToListAsync();
+            return Ok(items);
+        }
+
+        // GET api/proforma/chassis/P6DEC12NPCB009555
+        [HttpGet("chassis/{chassisNo}")]
+        public async Task<IActionResult> GetByChassis(string chassisNo)
+        {
+            var items = await _context.Proformas
+                .Include(p => p.Items)
+                .Where(p => p.ChassisNo == chassisNo)
+                .ToListAsync();
+            return Ok(items);
+        }
+
+        // POST api/proforma/bulk  — insert-only, silently skips records whose (uniqueId, uniqueKey) already exist
+        [HttpPost("bulk")]
+        public async Task<IActionResult> BulkInsert([FromHeader(Name = "X-API-Key")] string? apiKey, [FromBody] List<ProformaRecordDto> records)
+        {
+            if (!IsValidApiKey(apiKey))
+                return Unauthorized(new { error = "Invalid or missing API key." });
+
+            if (records == null || records.Count == 0)
+                return BadRequest("No records supplied.");
+
+            var mapped = records.Select(r => MapToEntity(r)).ToList();
+
+            var keys = mapped.Select(e => e.ComputedUniqueKey).Distinct().ToList();
+            var existingKeys = (await _context.Proformas
+                .Where(p => keys.Contains(p.ComputedUniqueKey))
+                .Select(p => p.ComputedUniqueKey)
+                .ToListAsync())
+                .ToHashSet();
+
+            var toInsert = new List<DmsProforma>();
+            var skipped = new List<string>();
+
+            foreach (var entity in mapped)
             {
-                result.SkippedDuplicates++;
-                result.SkippedKeys.Add(serialNo);
-                continue;
+                if (existingKeys.Contains(entity.ComputedUniqueKey))
+                {
+                    skipped.Add(entity.ComputedUniqueKey);
+                    continue;
+                }
+                toInsert.Add(entity);
+                existingKeys.Add(entity.ComputedUniqueKey); // guard against dupes within the same batch
             }
 
-            var entity = MapToEntity(dto);
-            entity.CreatedAt = now;
-            entity.UpdatedAt = now;
-            _db.DmsProformas.Add(entity);
-            result.Inserted++;
-        }
-
-        await _db.SaveChangesAsync();
-
-        _logger.LogInformation("Bulk proforma insert: {inserted} inserted, {skipped} skipped",
-            result.Inserted, result.SkippedDuplicates);
-
-        return Ok(result);
-    }
-
-    // ── PUT /api/proforma/bulk — update only, skip if SerialNo not found ──
-    [HttpPut("bulk")]
-    public async Task<IActionResult> BulkUpdate([FromBody] List<ProformaDto> dtos)
-    {
-        if (dtos == null || dtos.Count == 0)
-            return BadRequest(new { error = "Request body must contain a non-empty array of proforma records." });
-
-        var result = new BulkUpdateResult();
-        var now = DateTime.UtcNow;
-
-        var seen = new HashSet<string>();
-        var toUpdate = new List<(string SerialNo, ProformaDto Dto)>();
-
-        foreach (var dto in dtos)
-        {
-            if (string.IsNullOrWhiteSpace(dto.SerialNo))
+            var inserted = 0;
+            try
             {
-                result.SkippedNotFound++;
-                result.SkippedKeys.Add("(missing SerialNo)");
-                continue;
+                await _context.Proformas.AddRangeAsync(toInsert);
+                await _context.SaveChangesAsync();
+                inserted = toInsert.Count;
             }
-            if (!seen.Add(dto.SerialNo)) continue; // last one in batch wins silently, or track if you prefer
-            toUpdate.Add((dto.SerialNo, dto));
-        }
-
-        var candidateSerials = toUpdate.Select(x => x.SerialNo).ToList();
-        var existingEntities = await _db.DmsProformas
-            .Where(x => candidateSerials.Contains(x.SerialNo))
-            .ToDictionaryAsync(x => x.SerialNo);
-
-        foreach (var (serialNo, dto) in toUpdate)
-        {
-            if (!existingEntities.TryGetValue(serialNo, out var existing))
+            catch (DbUpdateException)
             {
-                result.SkippedNotFound++;
-                result.SkippedKeys.Add(serialNo);
-                continue;
+                _context.ChangeTracker.Clear();
+                inserted = 0;
+                foreach (var entity in toInsert)
+                {
+                    try
+                    {
+                        _context.Proformas.Add(entity);
+                        await _context.SaveChangesAsync();
+                        inserted++;
+                    }
+                    catch (DbUpdateException)
+                    {
+                        _context.ChangeTracker.Clear();
+                        skipped.Add(entity.ComputedUniqueKey);
+                    }
+                }
             }
 
-            var updated = MapToEntity(dto);
-            existing.InvoiceNo         = updated.InvoiceNo;
-            existing.InvoiceDate       = updated.InvoiceDate;
-            existing.DealerName        = updated.DealerName;
-            existing.DealerLocation    = updated.DealerLocation;
-            existing.ModelName         = updated.ModelName;
-            existing.ChassisNo         = updated.ChassisNo;
-            existing.ItemCode          = updated.ItemCode;
-            existing.ItemDescription   = updated.ItemDescription;
-            existing.RBillNo           = updated.RBillNo;
-            existing.RBillDate         = updated.RBillDate;
-            existing.PartyName         = updated.PartyName;
-            existing.PartyState        = updated.PartyState;
-            existing.InsuranceType     = updated.InsuranceType;
-            existing.InsuranceDetails  = updated.InsuranceDetails;
-            existing.JobCardNo         = updated.JobCardNo;
-            existing.JobCardDate       = updated.JobCardDate;
-            existing.Cgst              = updated.Cgst;
-            existing.Sgst              = updated.Sgst;
-            existing.Igst              = updated.Igst;
-            existing.TotalAmount       = updated.TotalAmount;
-            existing.ItemRate          = updated.ItemRate;
-            existing.ItemQty           = updated.ItemQty;
-            existing.Mrp               = updated.Mrp;
-            existing.DiscountType      = updated.DiscountType;
-            existing.DiscountValue     = updated.DiscountValue;
-            existing.DiscountPercent   = updated.DiscountPercent;
-            existing.PartNo            = updated.PartNo;
-            existing.PartName          = updated.PartName;
-            existing.PartDescription   = updated.PartDescription;
-            existing.Labour            = updated.Labour;
-            existing.LabourDescription = updated.LabourDescription;
-            existing.UniqueKey         = updated.UniqueKey;
-            existing.MaterialCode      = updated.MaterialCode;
-            existing.MaterialDate      = updated.MaterialDate;
-            existing.DealerType        = updated.DealerType;
-            existing.UpdatedAt         = now;
-
-            result.Updated++;
+            return Ok(new { inserted, skipped = skipped.Count, skippedKeys = skipped });
         }
 
-        await _db.SaveChangesAsync();
+        // PUT api/proforma/bulk — insert new (uniqueId, uniqueKey) combinations, update existing ones (including their line items)
+        [HttpPut("bulk")]
+        public async Task<IActionResult> BulkUpsert([FromHeader(Name = "X-API-Key")] string? apiKey, [FromBody] List<ProformaRecordDto> records)
+        {
+            if (!IsValidApiKey(apiKey))
+                return Unauthorized(new { error = "Invalid or missing API key." });
 
-        _logger.LogInformation("Bulk proforma update: {updated} updated, {skipped} skipped (not found)",
-            result.Updated, result.SkippedNotFound);
+            if (records == null || records.Count == 0)
+                return BadRequest("No records supplied.");
 
-        return Ok(result);
-    }
+            var mapped = records.Select(r => MapToEntity(r)).ToList();
+            var keys = mapped.Select(e => e.ComputedUniqueKey).Distinct().ToList();
 
-    private static DmsProforma MapToEntity(ProformaDto dto) => new()
-    {
-        InvoiceNo         = dto.InvoiceNo,
-        InvoiceDate       = ParseDate(dto.InvoiceDate),
-        DealerName        = dto.DealerName,
-        DealerLocation    = dto.DealerLocation,
-        ModelName         = dto.ModelName,
-        ChassisNo         = dto.ChassisNo,
-        ItemCode          = dto.ItemCode,
-        ItemDescription   = dto.ItemDescription,
-        SerialNo          = dto.SerialNo,
-        RBillNo           = dto.RBillNo,
-        RBillDate         = ParseDate(dto.RBillDate),
-        PartyName         = dto.PartyName,
-        PartyState        = dto.PartyState,
-        InsuranceType     = dto.InsuranceType,
-        InsuranceDetails  = dto.InsuranceDetails,
-        JobCardNo         = dto.JobCardNo,
-        JobCardDate       = ParseDate(dto.JobCardDate),
-        Cgst              = ParseDecimal(dto.Cgst),
-        Sgst              = ParseDecimal(dto.Sgst),
-        Igst              = ParseDecimal(dto.Igst),
-        TotalAmount       = ParseDecimal(dto.TotalAmount),
-        ItemRate          = ParseDecimal(dto.ItemRate),
-        ItemQty           = ParseDecimal(dto.ItemQty),
-        Mrp               = ParseDecimal(dto.Mrp),
-        DiscountType      = dto.DiscountType,
-        DiscountValue     = ParseDecimal(dto.DiscountValue),
-        DiscountPercent   = ParseDecimal(dto.DiscountPercent),
-        PartNo            = dto.PartNo,
-        PartName          = dto.PartName,
-        PartDescription   = dto.PartDescription,
-        Labour            = ParseDecimal(dto.Labour),
-        LabourDescription = dto.LabourDescription,
-        UniqueKey         = dto.UniqueKey,
-        MaterialCode      = dto.MaterialCode,
-        MaterialDate      = ParseDate(dto.MaterialDate),
-        DealerType        = dto.DealerType
-    };
+            var existing = await _context.Proformas
+                .Include(p => p.Items)
+                .Where(p => keys.Contains(p.ComputedUniqueKey))
+                .ToDictionaryAsync(p => p.ComputedUniqueKey);
 
-    private static DateOnly? ParseDate(string? val)
-    {
-        if (string.IsNullOrWhiteSpace(val)) return null;
-        if (DateTime.TryParseExact(val, "dd-MM-yyyy",
-            System.Globalization.CultureInfo.InvariantCulture,
-            System.Globalization.DateTimeStyles.None, out var d))
-            return DateOnly.FromDateTime(d);
-        if (DateTime.TryParse(val, out var d2))
-            return DateOnly.FromDateTime(d2);
-        return null;
-    }
+            var toInsert = new List<DmsProforma>();
+            var updated = 0;
 
-    private static decimal? ParseDecimal(string? val)
-    {
-        if (string.IsNullOrWhiteSpace(val)) return 0;
-        return decimal.TryParse(val, System.Globalization.NumberStyles.Any,
-            System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : 0;
+            foreach (var entity in mapped)
+            {
+                if (existing.TryGetValue(entity.ComputedUniqueKey, out var current))
+                {
+                    ApplyHeaderFields(current, entity);
+                    _context.ProformaItems.RemoveRange(current.Items);
+                    current.Items = entity.Items;
+                    current.UpdatedAt = DateTime.UtcNow;
+                    updated++;
+                }
+                else
+                {
+                    toInsert.Add(entity);
+                }
+            }
+
+            var inserted = 0;
+            try
+            {
+                if (toInsert.Count > 0)
+                    await _context.Proformas.AddRangeAsync(toInsert);
+                await _context.SaveChangesAsync();
+                inserted = toInsert.Count;
+            }
+            catch (DbUpdateException)
+            {
+                _context.ChangeTracker.Clear();
+                foreach (var entity in toInsert)
+                {
+                    try
+                    {
+                        _context.Proformas.Add(entity);
+                        await _context.SaveChangesAsync();
+                        inserted++;
+                    }
+                    catch (DbUpdateException)
+                    {
+                        _context.ChangeTracker.Clear();
+                    }
+                }
+            }
+
+            return Ok(new { inserted, updated });
+        }
+
+        // DELETE api/proforma/5
+        [HttpDelete("{id:int}")]
+        public async Task<IActionResult> Delete(int id, [FromHeader(Name = "X-API-Key")] string? apiKey)
+        {
+            if (!IsValidApiKey(apiKey))
+                return Unauthorized(new { error = "Invalid or missing API key." });
+
+            var item = await _context.Proformas.FindAsync(id);
+            if (item == null) return NotFound();
+            _context.Proformas.Remove(item);
+            await _context.SaveChangesAsync();
+            return NoContent();
+        }
+
+        // DELETE api/proforma/bulk  — body: [ { "uniqueId": 19, "uniqueKey": 30263 }, ... ]
+        [HttpDelete("bulk")]
+        public async Task<IActionResult> BulkDelete([FromHeader(Name = "X-API-Key")] string? apiKey, [FromBody] List<ProformaDeleteRequestDto> requests)
+        {
+            if (!IsValidApiKey(apiKey))
+                return Unauthorized(new { error = "Invalid or missing API key." });
+
+            if (requests == null || requests.Count == 0)
+                return BadRequest("No records supplied.");
+
+            var keys = requests.Select(r => UniqueKeyBuilder.Proforma(r.UniqueId, r.UniqueKey)).ToList();
+
+            var toDelete = await _context.Proformas
+                .Where(p => keys.Contains(p.ComputedUniqueKey))
+                .ToListAsync();
+
+            _context.Proformas.RemoveRange(toDelete);
+            await _context.SaveChangesAsync();
+
+            return Ok(new { deleted = toDelete.Count });
+        }
+
+        private static DmsProforma MapToEntity(ProformaRecordDto r)
+        {
+            return new DmsProforma
+            {
+                DealerName = r.DealerName,
+                DealerCode = r.DealerCode,
+                UniqueKey = r.UniqueKey,
+                UniqueId = r.UniqueId,
+                InvoiceNo = r.InvoiceNo,
+                InvoiceDate = r.InvoiceDate,
+                Location = r.Location,
+                PartyName = r.PartyName,
+                BillType = r.BillType,
+                CashType = r.CashType,
+                CashAccount = r.CashAccount,
+                RegNo = r.RegNo,
+                ChassisNo = r.ChassisNo,
+                ComputedUniqueKey = UniqueKeyBuilder.Proforma(r.UniqueId, r.UniqueKey),
+                Items = (r.ProformaDetl ?? new List<ProformaDetailDto>()).Select(d => new DmsProformaItem
+                {
+                    SourceItemId = d.Id,
+                    ItemIdno = d.ItemIdno,
+                    ItemCode = d.ItemCode,
+                    ItemDesc = d.ItemDesc,
+                    ItemType = d.ItemType,
+                    Qty = d.Qty,
+                    Rate = d.Rate,
+                    IssueType = d.IssueType,
+                    SgstPer = d.SgstPer,
+                    SgstAmount = d.SgstAmount,
+                    CgstPer = d.CgstPer,
+                    CgstAmount = d.CgstAmount,
+                    IgstPer = d.IgstPer,
+                    IgstAmount = d.IgstAmount,
+                    WavRate = d.WavRate,
+                    TotAmnt = d.TotAmnt,
+                    MtrlIssue = d.MtrlIssue
+                }).ToList()
+            };
+        }
+
+        private static void ApplyHeaderFields(DmsProforma target, DmsProforma source)
+        {
+            target.DealerName = source.DealerName;
+            target.DealerCode = source.DealerCode;
+            target.UniqueKey = source.UniqueKey;
+            target.UniqueId = source.UniqueId;
+            target.InvoiceNo = source.InvoiceNo;
+            target.InvoiceDate = source.InvoiceDate;
+            target.Location = source.Location;
+            target.PartyName = source.PartyName;
+            target.BillType = source.BillType;
+            target.CashType = source.CashType;
+            target.CashAccount = source.CashAccount;
+            target.RegNo = source.RegNo;
+            target.ChassisNo = source.ChassisNo;
+        }
     }
 }

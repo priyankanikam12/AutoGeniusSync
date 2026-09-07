@@ -1,50 +1,151 @@
+using System;
+using System.Collections.Generic;
+using System.Text.Json.Serialization;
 using Newtonsoft.Json;
 
-namespace AutoGeniusSync.DTOs;
-
-// ─────────────────────────────────────────────
-// Proforma — POST/PUT request body
-// Unique key: SerialNo (or UniqueKey, if supplied)
-// ─────────────────────────────────────────────
-public class ProformaDto
+namespace AutoGeniusSync.DTOs
 {
-    [JsonProperty("Invoice No")]      public string? InvoiceNo { get; set; }
-    [JsonProperty("Invoice Date")]    public string? InvoiceDate { get; set; }   // dd-MM-yyyy
-    [JsonProperty("Dealer Name")]     public string? DealerName { get; set; }
-    [JsonProperty("Dealer Location")] public string? DealerLocation { get; set; }
-    [JsonProperty("Model Name")]      public string? ModelName { get; set; }
-    [JsonProperty("Chasis No")]       public string? ChassisNo { get; set; }
-    [JsonProperty("Item Code")]       public string? ItemCode { get; set; }
-    [JsonProperty("Item Description")] public string? ItemDescription { get; set; }
-    [JsonProperty("Serial No")]       public string SerialNo { get; set; } = "";
-    [JsonProperty("RBill No")]        public string? RBillNo { get; set; }
-    [JsonProperty("RBill Date")]      public string? RBillDate { get; set; }
-    [JsonProperty("Party Name")]      public string? PartyName { get; set; }
-    [JsonProperty("Party State")]     public string? PartyState { get; set; }
+    // Matches one entry of the payload's "ProformaDetl" array exactly.
+    public class ProformaDetailDto
+    {
+        [JsonPropertyName("id")]
+        [JsonProperty("id")]
+        public long? Id { get; set; }
 
-    [JsonProperty("Insurance Type")]    public string? InsuranceType { get; set; }
-    [JsonProperty("Insurance Details")] public string? InsuranceDetails { get; set; }
-    [JsonProperty("Job Card No")]       public string? JobCardNo { get; set; }
-    [JsonProperty("Job Card Date")]     public string? JobCardDate { get; set; }   // dd-MM-yyyy
-    [JsonProperty("CGST")]              public string? Cgst { get; set; }
-    [JsonProperty("SGST")]              public string? Sgst { get; set; }
-    [JsonProperty("IGST")]              public string? Igst { get; set; }
-    [JsonProperty("Total Amount")]      public string? TotalAmount { get; set; }
+        [JsonPropertyName("Item_Idno")]
+        [JsonProperty("Item_Idno")]
+        public long? ItemIdno { get; set; }
 
-    [JsonProperty("Item Rate")]         public string? ItemRate { get; set; }
-    [JsonProperty("Item Qty")]          public string? ItemQty { get; set; }
-    [JsonProperty("MRP")]               public string? Mrp { get; set; }
-    [JsonProperty("Amount")]            public string? Amount { get; set; }
-    [JsonProperty("Discount Type")]     public string? DiscountType { get; set; }  // '%' / 'Value'
-    [JsonProperty("Discount Value")]    public string? DiscountValue { get; set; }
-    [JsonProperty("Discount Percent")]  public string? DiscountPercent { get; set; }
-    [JsonProperty("Part No")]           public string? PartNo { get; set; }
-    [JsonProperty("Part Name")]         public string? PartName { get; set; }
-    [JsonProperty("Part Description")]  public string? PartDescription { get; set; }
-    [JsonProperty("Labour")]            public string? Labour { get; set; }
-    [JsonProperty("Labour Description")] public string? LabourDescription { get; set; }
-    [JsonProperty("Material Code")] public string? MaterialCode { get; set; }
-    [JsonProperty("Material Date")] public string? MaterialDate { get; set; }   // dd-MM-yyyy
-    [JsonProperty("Dealer Type")]    public string? DealerType { get; set; }
-    [JsonProperty("Unique Key")]        public string? UniqueKey { get; set; }
+        [JsonPropertyName("itemCode")]
+        [JsonProperty("itemCode")]
+        public string? ItemCode { get; set; }
+
+        [JsonPropertyName("itemDesc")]
+        [JsonProperty("itemDesc")]
+        public string? ItemDesc { get; set; }
+
+        [JsonPropertyName("itemType")]
+        [JsonProperty("itemType")]
+        public string? ItemType { get; set; }
+
+        [JsonPropertyName("qty")]
+        [JsonProperty("qty")]
+        public int? Qty { get; set; }
+
+        [JsonPropertyName("rate")]
+        [JsonProperty("rate")]
+        public decimal? Rate { get; set; }
+
+        [JsonPropertyName("issueType")]
+        [JsonProperty("issueType")]
+        public string? IssueType { get; set; }
+
+        [JsonPropertyName("sgstPer")]
+        [JsonProperty("sgstPer")]
+        public decimal? SgstPer { get; set; }
+
+        [JsonPropertyName("sgstAmount")]
+        [JsonProperty("sgstAmount")]
+        public decimal? SgstAmount { get; set; }
+
+        [JsonPropertyName("cgstPer")]
+        [JsonProperty("cgstPer")]
+        public decimal? CgstPer { get; set; }
+
+        [JsonPropertyName("cgstAmount")]
+        [JsonProperty("cgstAmount")]
+        public decimal? CgstAmount { get; set; }
+
+        [JsonPropertyName("igstPer")]
+        [JsonProperty("igstPer")]
+        public decimal? IgstPer { get; set; }
+
+        [JsonPropertyName("igstAmount")]
+        [JsonProperty("igstAmount")]
+        public decimal? IgstAmount { get; set; }
+
+        [JsonPropertyName("wavRate")]
+        [JsonProperty("wavRate")]
+        public decimal? WavRate { get; set; }
+
+        [JsonPropertyName("Tot_Amnt")]
+        [JsonProperty("Tot_Amnt")]
+        public decimal? TotAmnt { get; set; }
+
+        [JsonPropertyName("Mtrl_Issue")]
+        [JsonProperty("Mtrl_Issue")]
+        public string? MtrlIssue { get; set; }
+    }
+
+    // Matches one header object of the payload array exactly.
+    public class ProformaRecordDto
+    {
+        [JsonPropertyName("dealerName")]
+        [JsonProperty("dealerName")]
+        public string? DealerName { get; set; }
+
+        [JsonPropertyName("dealerCode")]
+        [JsonProperty("dealerCode")]
+        public string? DealerCode { get; set; }
+
+        [JsonPropertyName("uniqueKey")]
+        [JsonProperty("uniqueKey")]
+        public long? UniqueKey { get; set; }
+
+        [JsonPropertyName("uniqueId")]
+        [JsonProperty("uniqueId")]
+        public long? UniqueId { get; set; }
+
+        [JsonPropertyName("invoiceNo")]
+        [JsonProperty("invoiceNo")]
+        public long? InvoiceNo { get; set; }
+
+        [JsonPropertyName("invoiceDate")]
+        [JsonProperty("invoiceDate")]
+        public DateTime? InvoiceDate { get; set; }
+
+        [JsonPropertyName("location")]
+        [JsonProperty("location")]
+        public string? Location { get; set; }
+
+        [JsonPropertyName("partyName")]
+        [JsonProperty("partyName")]
+        public string? PartyName { get; set; }
+
+        [JsonPropertyName("billType")]
+        [JsonProperty("billType")]
+        public int? BillType { get; set; }
+
+        [JsonPropertyName("Cash_Type")]
+        [JsonProperty("Cash_Type")]
+        public string? CashType { get; set; }
+
+        [JsonPropertyName("cashAccount")]
+        [JsonProperty("cashAccount")]
+        public string? CashAccount { get; set; }
+
+        [JsonPropertyName("regNo")]
+        [JsonProperty("regNo")]
+        public string? RegNo { get; set; }
+
+        [JsonPropertyName("chassisNo")]
+        [JsonProperty("chassisNo")]
+        public string? ChassisNo { get; set; }
+
+        [JsonPropertyName("ProformaDetl")]
+        [JsonProperty("ProformaDetl")]
+        public List<ProformaDetailDto> ProformaDetl { get; set; } = new();
+    }
+
+    // Body for DELETE api/proforma/bulk — identifies rows by the same 2-field key used to dedupe on insert.
+    public class ProformaDeleteRequestDto
+    {
+        [JsonPropertyName("uniqueId")]
+        [JsonProperty("uniqueId")]
+        public long? UniqueId { get; set; }
+
+        [JsonPropertyName("uniqueKey")]
+        [JsonProperty("uniqueKey")]
+        public long? UniqueKey { get; set; }
+    }
 }

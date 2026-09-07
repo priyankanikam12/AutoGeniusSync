@@ -1,45 +1,34 @@
-namespace AutoGeniusSync.Models;
+using System;
+using System.Collections.Generic;
+using Newtonsoft.Json;
 
-public class DmsProforma
+namespace AutoGeniusSync.Models
 {
-    public int Id { get; set; }
-    public string? InvoiceNo { get; set; }
-    public DateOnly? InvoiceDate { get; set; }
-    public string? DealerName { get; set; }
-    public string? DealerLocation { get; set; }
-    public string? ModelName { get; set; }
-    public string? ChassisNo { get; set; }
-    public string? ItemCode { get; set; }
-    public string? ItemDescription { get; set; }
-    public string SerialNo { get; set; } = null!;
-    public string? RBillNo { get; set; }
-    public DateOnly? RBillDate { get; set; }
-    public string? PartyName { get; set; }
-    public string? PartyState { get; set; }
-    public DateTime CreatedAt { get; set; }
-    public DateTime UpdatedAt { get; set; }
-    public string? InsuranceType { get; set; }      // 'Paid' / 'Unpaid'
-    public string? InsuranceDetails { get; set; }
-    public string? JobCardNo { get; set; }
-    public DateOnly? JobCardDate { get; set; }
-    public decimal? Cgst { get; set; }
-    public decimal? Sgst { get; set; }
-    public decimal? Igst { get; set; }
-    public decimal? TotalAmount { get; set; }
+    // Header record — one row per Proforma document.
+    public class DmsProforma
+    {
+        public int Id { get; set; }
 
-    public decimal? ItemRate { get; set; }
-    public decimal? ItemQty { get; set; }
-    public decimal? Mrp { get; set; }               
-    public string? DiscountType { get; set; }        // '%' / 'Value'
-    public decimal? DiscountValue { get; set; }      
-    public decimal? DiscountPercent { get; set; }
-    public string? PartNo { get; set; }
-    public string? PartName { get; set; }
-    public string? PartDescription { get; set; }
-    public decimal? Labour { get; set; }
-    public string? LabourDescription { get; set; }
-    public string? MaterialCode { get; set; }
-    public DateOnly? MaterialDate { get; set; }
-    public string? DealerType { get; set; }
-    public string? UniqueKey { get; set; }
+        public string? DealerName { get; set; }
+        public string? DealerCode { get; set; }
+        public long? UniqueKey { get; set; }
+        public long? UniqueId { get; set; }
+        public long? InvoiceNo { get; set; }
+        public DateTime? InvoiceDate { get; set; }
+        public string? Location { get; set; }
+        public string? PartyName { get; set; }
+        public int? BillType { get; set; }
+        public string? CashType { get; set; }       // payload "Cash_Type"
+        public string? CashAccount { get; set; }
+        public string? RegNo { get; set; }
+        public string? ChassisNo { get; set; }
+
+        // Server-computed dedup key: "{UniqueId}_{UniqueKey}" — see Helpers/UniqueKeyBuilder.Proforma
+        public string ComputedUniqueKey { get; set; } = string.Empty;
+
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+        public DateTime? UpdatedAt { get; set; }
+
+        public ICollection<DmsProformaItem> Items { get; set; } = new List<DmsProformaItem>();
+    }
 }

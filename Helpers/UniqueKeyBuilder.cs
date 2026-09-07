@@ -22,4 +22,6 @@ public static class UniqueKeyBuilder
     
     public static string MaterialTransfer(long? uniqueId, long? jobId)
         => $"{uniqueId}_{jobId}";
+   public static string Proforma(long? uniqueId, long? uniqueKey) => $"{uniqueId}_{uniqueKey}";
+   public static string RepairBill(long? uniqueId, long? uniqueKey) => $"{uniqueId}_{uniqueKey}";
 }

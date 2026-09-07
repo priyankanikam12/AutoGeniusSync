@@ -36,8 +36,10 @@ public partial class AppDbContext : DbContext
     public DbSet<DmsLineOrderReport> DmsLineOrderReports { get; set; }
     public DbSet<DmsShadowfaxChassisMaster> DmsShadowfaxChassisMasters { get; set; }
     public DbSet<DmsJobReport> DmsJobReports { get; set; }
-    public DbSet<DmsRepairBill> DmsRepairBills { get; set; }
-    public DbSet<DmsProforma> DmsProformas { get; set; }
+    public DbSet<DmsProforma> Proformas => Set<DmsProforma>();
+    public DbSet<DmsProformaItem> ProformaItems => Set<DmsProformaItem>();
+    public DbSet<DmsRepairBill> RepairBills => Set<DmsRepairBill>();
+    public DbSet<DmsRepairBillItem> RepairBillItems => Set<DmsRepairBillItem>();
     public DbSet<DmsJobReportComplaint> DmsJobReportComplaints => Set<DmsJobReportComplaint>();
     public DbSet<DmsMaterialTransfer> DmsMaterialTransfers => Set<DmsMaterialTransfer>();
     public DbSet<DmsMaterialTransferItem> DmsMaterialTransferItems => Set<DmsMaterialTransferItem>();
@@ -586,118 +588,32 @@ public partial class AppDbContext : DbContext
             .HasDatabaseName("UX_DMS_JobReport_UniqueKey");
         });
 
-        modelBuilder.Entity<DmsRepairBill>(entity =>
+        modelBuilder.Entity<DmsProforma>(e =>
         {
-            entity.ToTable("DMS_RepairBill");
-
-            entity.HasKey(e => e.Id);
-
-            // Unique key: (Location, BillNo)
-            entity.HasIndex(e => new { e.Location, e.BillNo })
-                .IsUnique()
-                .HasDatabaseName("UQ_DMS_RepairBill_Location_BillNo");
-
-            entity.HasIndex(e => e.ChassisNo).HasDatabaseName("IX_DMS_RepairBill_ChassisNo");
-            entity.HasIndex(e => e.BillDate).HasDatabaseName("IX_DMS_RepairBill_BillDate");
-            entity.HasIndex(e => e.JobNo).HasDatabaseName("IX_DMS_RepairBill_JobNo");
-
-            entity.Property(e => e.BillNo).HasMaxLength(50).IsRequired();
-            entity.Property(e => e.Location).HasMaxLength(500).IsRequired();
-            entity.Property(e => e.PartyName).HasMaxLength(500);
-            entity.Property(e => e.RegNo).HasMaxLength(100);
-            entity.Property(e => e.BillType).HasMaxLength(100);
-            entity.Property(e => e.JobNo).HasMaxLength(50);
-            entity.Property(e => e.NetAmount).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
-            entity.Property(e => e.UserName).HasMaxLength(200);
-            entity.Property(e => e.UserNameEdit).HasMaxLength(200);
-            entity.Property(e => e.ChassisNo).HasMaxLength(100);
-
-            entity.Property(e => e.CreatedAt).HasDefaultValueSql("(getutcdate())");
-            entity.Property(e => e.UpdatedAt).HasDefaultValueSql("(getutcdate())");
-            entity.Property(e => e.InsuranceType).HasMaxLength(20);
-            entity.Property(e => e.InsuranceDetails).HasMaxLength(500);
-            entity.Property(e => e.JobCardNo).HasMaxLength(50);
-            entity.Property(e => e.Cgst).HasColumnType("decimal(18,2)").HasColumnName("CGST").HasDefaultValue(0m);
-            entity.Property(e => e.Sgst).HasColumnType("decimal(18,2)").HasColumnName("SGST").HasDefaultValue(0m);
-            entity.Property(e => e.Igst).HasColumnType("decimal(18,2)").HasColumnName("IGST").HasDefaultValue(0m);
-            entity.Property(e => e.TotalAmount).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
-            entity.Property(e => e.ItemRate).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
-            entity.Property(e => e.ItemQty).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
-            entity.Property(e => e.Mrp).HasColumnType("decimal(18,2)").HasColumnName("MRP").HasDefaultValue(0m);
-            entity.Property(e => e.DiscountType).HasMaxLength(20);
-            entity.Property(e => e.DiscountValue).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
-            entity.Property(e => e.DiscountPercent).HasColumnType("decimal(8,2)").HasDefaultValue(0m);
-            entity.Property(e => e.PartNo).HasMaxLength(100);
-            entity.Property(e => e.PartName).HasMaxLength(300);
-            entity.Property(e => e.PartDescription).HasMaxLength(500);
-            entity.Property(e => e.Labour).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
-            entity.Property(e => e.LabourDescription).HasMaxLength(500);
-            entity.Property(e => e.MaterialCode).HasMaxLength(100);
-            entity.Property(e => e.DealerType).HasMaxLength(100);
-            entity.Property(e => e.UniqueKey).HasMaxLength(150);
-
-            entity.HasIndex(e => e.UniqueKey)
-                .IsUnique()
-                .HasFilter("[UniqueKey] IS NOT NULL")
-                .HasDatabaseName("UQ_DMS_RepairBill_UniqueKey");
+            e.ToTable("DMS_Proforma");
+            e.HasIndex(p => p.ComputedUniqueKey).IsUnique();
+            e.HasMany(p => p.Items)
+            .WithOne(i => i.Proforma)
+            .HasForeignKey(i => i.ProformaId)
+            .OnDelete(DeleteBehavior.Cascade);
+        });
+        modelBuilder.Entity<DmsProformaItem>(e =>
+        {
+            e.ToTable("DMS_ProformaItem");
         });
 
-        modelBuilder.Entity<DmsProforma>(entity =>
+        modelBuilder.Entity<DmsRepairBill>(e =>
         {
-            entity.ToTable("DMS_Proforma");
-
-            entity.HasKey(e => e.Id);
-
-            // Unique key: SerialNo
-            entity.HasIndex(e => e.SerialNo)
-                .IsUnique()
-                .HasDatabaseName("UQ_DMS_Proforma_SerialNo");
-
-            entity.HasIndex(e => e.ChassisNo).HasDatabaseName("IX_DMS_Proforma_ChassisNo");
-            entity.HasIndex(e => e.InvoiceNo).HasDatabaseName("IX_DMS_Proforma_InvoiceNo");
-            entity.HasIndex(e => e.RBillNo).HasDatabaseName("IX_DMS_Proforma_RBillNo");
-            entity.HasIndex(e => e.InvoiceDate).HasDatabaseName("IX_DMS_Proforma_InvoiceDate");
-
-            entity.Property(e => e.InvoiceNo).HasMaxLength(100);
-            entity.Property(e => e.DealerName).HasMaxLength(500);
-            entity.Property(e => e.DealerLocation).HasMaxLength(500);
-            entity.Property(e => e.ModelName).HasMaxLength(300);
-            entity.Property(e => e.ChassisNo).HasMaxLength(100);
-            entity.Property(e => e.ItemCode).HasMaxLength(100);
-            entity.Property(e => e.ItemDescription).HasMaxLength(500);
-            entity.Property(e => e.SerialNo).HasMaxLength(100).IsRequired();
-            entity.Property(e => e.RBillNo).HasMaxLength(50);
-            entity.Property(e => e.PartyName).HasMaxLength(500);
-            entity.Property(e => e.PartyState).HasMaxLength(200);
-
-            entity.Property(e => e.CreatedAt).HasDefaultValueSql("(getutcdate())");
-            entity.Property(e => e.UpdatedAt).HasDefaultValueSql("(getutcdate())");
-            entity.Property(e => e.InsuranceType).HasMaxLength(20);
-            entity.Property(e => e.InsuranceDetails).HasMaxLength(500);
-            entity.Property(e => e.JobCardNo).HasMaxLength(50);
-            entity.Property(e => e.Cgst).HasColumnType("decimal(18,2)").HasColumnName("CGST").HasDefaultValue(0m);
-            entity.Property(e => e.Sgst).HasColumnType("decimal(18,2)").HasColumnName("SGST").HasDefaultValue(0m);
-            entity.Property(e => e.Igst).HasColumnType("decimal(18,2)").HasColumnName("IGST").HasDefaultValue(0m);
-            entity.Property(e => e.TotalAmount).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
-            entity.Property(e => e.ItemRate).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
-            entity.Property(e => e.ItemQty).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
-            entity.Property(e => e.Mrp).HasColumnType("decimal(18,2)").HasColumnName("MRP").HasDefaultValue(0m);
-            entity.Property(e => e.DiscountType).HasMaxLength(20);
-            entity.Property(e => e.DiscountValue).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
-            entity.Property(e => e.DiscountPercent).HasColumnType("decimal(8,2)").HasDefaultValue(0m);
-            entity.Property(e => e.PartNo).HasMaxLength(100);
-            entity.Property(e => e.PartName).HasMaxLength(300);
-            entity.Property(e => e.PartDescription).HasMaxLength(500);
-            entity.Property(e => e.Labour).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
-            entity.Property(e => e.LabourDescription).HasMaxLength(500);
-            entity.Property(e => e.MaterialCode).HasMaxLength(100);
-            entity.Property(e => e.DealerType).HasMaxLength(100);
-            entity.Property(e => e.UniqueKey).HasMaxLength(150);
-
-            entity.HasIndex(e => e.UniqueKey)
-                .IsUnique()
-                .HasFilter("[UniqueKey] IS NOT NULL")
-                .HasDatabaseName("UQ_DMS_Proforma_UniqueKey");
+            e.ToTable("DMS_RepairBill");
+            e.HasIndex(p => p.ComputedUniqueKey).IsUnique();
+            e.HasMany(p => p.Items)
+            .WithOne(i => i.RepairBill)
+            .HasForeignKey(i => i.RepairBillId)
+            .OnDelete(DeleteBehavior.Cascade);
+        });
+        modelBuilder.Entity<DmsRepairBillItem>(e =>
+        {
+            e.ToTable("DMS_RepairBillItem");
         });
 
         modelBuilder.Entity<DmsJobReportComplaint>(entity =>
