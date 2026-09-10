@@ -2,6 +2,7 @@ using AutoGeniusSync.Data;
 using AutoGeniusSync.Services;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using AutoGeniusSync.DTOs;
 using AutoGeniusSync.Helpers;
 using AutoGeniusSync.Models;
@@ -14,11 +15,21 @@ public class VehicleSalesController : ControllerBase
 {
     private readonly AppDbContext _db;
     private readonly DataSyncService _sync;
+    private readonly IConfiguration _config;
 
-    public VehicleSalesController(AppDbContext db, DataSyncService sync)
+    public VehicleSalesController(AppDbContext db, DataSyncService sync, IConfiguration config)
     {
         _db = db;
         _sync = sync;
+        _config = config;
+    }
+
+    // Shared gate for the partner-facing endpoints below — reads appsettings "ApiKeys:<keyName>".
+    // Reuses the same "ANVWeb" key already configured for the ServiceHistory/LineOrderReport endpoints.
+    private bool IsValidApiKey(string? apiKey, string keyName)
+    {
+        var expected = _config[$"ApiKeys:{keyName}"];
+        return !string.IsNullOrEmpty(expected) && string.Equals(apiKey, expected, StringComparison.Ordinal);
     }
 
     // ── GET /api/vehiclesales ────────────────────────────────
@@ -102,6 +113,49 @@ public class VehicleSalesController : ControllerBase
             .ToListAsync();
 
         return Ok(summary);
+    }
+
+    // ── GET /api/vehiclesales/anvweb ──────────────────────────
+    // Partner-facing feed for ANV Web Ventures Private Limited's own dashboard.
+    // Hard-filtered server-side to vehicles sold to them (SoldTo LIKE '%ANV Web Ventures%') —
+    // the caller cannot widen this with query params, only narrow it (date range / chassis / paging).
+    // Gated by header "X-API-Key" against appsettings "ApiKeys:ANVWeb" (same key already used
+    // for the ServiceHistory and LineOrderReport partner endpoints).
+    [HttpGet("anvweb")]
+    public async Task<IActionResult> GetAnvWeb(
+        [FromHeader(Name = "X-API-Key")] string? apiKey,
+        [FromQuery] string? from,
+        [FromQuery] string? to,
+        [FromQuery] string? chassisNo,
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 100)
+    {
+        if (!IsValidApiKey(apiKey, "ANVWeb"))
+            return Unauthorized(new { error = "Invalid or missing API key." });
+
+        if (page < 1) page = 1;
+        if (pageSize < 1 || pageSize > 1000) pageSize = 100;
+
+        var q = _db.DmsVehicleSales
+            .Where(v => v.SoldTo != null && v.SoldTo.Contains("ANV Web Ventures"));
+
+        if (!string.IsNullOrEmpty(chassisNo))
+            q = q.Where(v => v.ChassisNo != null && v.ChassisNo.Contains(chassisNo));
+
+        if (!string.IsNullOrEmpty(from) && DateOnly.TryParse(from, out var f))
+            q = q.Where(v => v.InvoiceDate >= f);
+
+        if (!string.IsNullOrEmpty(to) && DateOnly.TryParse(to, out var t))
+            q = q.Where(v => v.InvoiceDate <= t);
+
+        var total = await q.CountAsync();
+        var records = await q
+            .OrderByDescending(v => v.InvoiceDate)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync();
+
+        return Ok(new { Total = total, Page = page, PageSize = pageSize, Records = records });
     }
 
     // ── POST /api/vehiclesales/sync/today ────────────────────
@@ -219,14 +273,6 @@ public class VehicleSalesController : ControllerBase
             Preview = raw[..Math.Min(2000, raw.Length)]
         });
     }
-
-    // ── POST /api/vehiclesales/backfill ──────────────────────
-    // [HttpPost("backfill")]
-    // public IActionResult StartBackfill()
-    // {
-    //     _ = Task.Run(() => _sync.BackfillVehicleSalesAsync());
-    //     return Accepted(new { message = "Full VSR backfill started. Check /api/sync/status." });
-    // }
 
     [HttpPost("bulk")]
     public async Task<IActionResult> BulkInsert([FromBody] List<VehicleSaleRecordDto> records)
