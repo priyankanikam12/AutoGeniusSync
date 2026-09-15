@@ -2,6 +2,7 @@ using AutoGeniusSync.Data;
 using AutoGeniusSync.Models;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using NPOI.SS.UserModel;
 
 namespace AutoGeniusSync.Controllers;
 
@@ -63,35 +64,58 @@ public class DealersController : ControllerBase
         int inserted = 0, updated = 0, skipped = 0;
         var errors = new List<string>();
 
-        using var reader = new StreamReader(file.OpenReadStream());
-        var header = await reader.ReadLineAsync(); // skip header row
-
-        int lineNo = 1;
-        while (!reader.EndOfStream)
+        IWorkbook workbook;
+        try
         {
-            lineNo++;
-            var line = await reader.ReadLineAsync();
-            if (string.IsNullOrWhiteSpace(line)) continue;
+            // Copy into a MemoryStream first — NPOI needs a seekable stream, and
+            // IFormFile's underlying stream isn't guaranteed to support seeking.
+            using var ms = new MemoryStream();
+            await file.CopyToAsync(ms);
+            ms.Position = 0;
+            workbook = WorkbookFactory.Create(ms); // auto-detects .xls (HSSF) vs .xlsx (XSSF)
+        }
+        catch (Exception ex)
+        {
+            return BadRequest(new { error = $"Could not read the file as an Excel workbook: {ex.Message}" });
+        }
 
-            var cols = SplitCsvLine(line);
-            if (cols.Length < 10) { skipped++; errors.Add($"Line {lineNo}: too few columns"); continue; }
+        var sheet = workbook.GetSheetAt(0);
+        if (sheet == null || sheet.LastRowNum < 1)
+            return BadRequest(new { error = "Sheet is empty or has no data rows." });
 
-            var dealerCode = cols[2].Trim(); // "Dealer Code" column
+        // Row 0 is the header — skip it, same as the old header = ReadLineAsync() did.
+        for (int rowIndex = 1; rowIndex <= sheet.LastRowNum; rowIndex++)
+        {
+            var row = sheet.GetRow(rowIndex);
+            if (row == null) continue; // NPOI can return null for fully blank rows
+
+            // LastCellNum is 1-based count of the highest cell index + 1; guard the
+            // same "too few columns" check the original code had.
+            if (row.LastCellNum < 10)
+            {
+                skipped++;
+                errors.Add($"Row {rowIndex + 1}: too few columns");
+                continue;
+            }
+
+            string Cell(int idx) => GetCellString(row, idx);
+
+            var dealerCode = Cell(2).Trim(); // "Dealer Code" column
             if (string.IsNullOrEmpty(dealerCode)) { skipped++; continue; }
 
-            var companyName = cols[1].Trim();
-            var email       = cols[3].Trim();
-            var mobileNo    = cols[4].Trim();
-            var state       = cols[5].Trim();
-            var city        = cols[6].Trim();
-            var cityTier    = cols.Length > 7 ? cols[7].Trim() : null;
-            var source      = cols.Length > 8 ? cols[8].Trim() : null;
-            var status      = cols.Length > 9 ? cols[9].Trim() : null;
-            var regDate     = cols.Length > 10 ? ParseDate(cols[10]) : null;
-            var modifiedBy  = cols.Length > 11 ? cols[11].Trim() : null;
-            var prevStatus  = cols.Length > 12 ? cols[12].Trim() : null;
-            var modDate     = cols.Length > 13 ? ParseDate(cols[13]) : null;
-            var remarks     = cols.Length > 14 ? cols[14].Trim() : null;
+            var companyName = Cell(1).Trim();
+            var email       = Cell(3).Trim();
+            var mobileNo    = Cell(4).Trim();
+            var state       = Cell(5).Trim();
+            var city        = Cell(6).Trim();
+            var cityTier    = row.LastCellNum > 7  ? Cell(7).Trim()  : null;
+            var source      = row.LastCellNum > 8  ? Cell(8).Trim()  : null;
+            var status      = row.LastCellNum > 9  ? Cell(9).Trim()  : null;
+            var regDate     = row.LastCellNum > 10 ? ParseDate(Cell(10)) : null;
+            var modifiedBy  = row.LastCellNum > 11 ? Cell(11).Trim() : null;
+            var prevStatus  = row.LastCellNum > 12 ? Cell(12).Trim() : null;
+            var modDate     = row.LastCellNum > 13 ? ParseDate(Cell(13)) : null;
+            var remarks     = row.LastCellNum > 14 ? Cell(14).Trim() : null;
 
             try
             {
@@ -147,9 +171,9 @@ public class DealersController : ControllerBase
             catch (Exception ex)
             {
                 skipped++;
-                errors.Add($"Line {lineNo} ({dealerCode}): {ex.Message}");
-                _logger.LogWarning("Dealer master upload: skipped {code} at line {line}: {msg}",
-                    dealerCode, lineNo, ex.Message);
+                errors.Add($"Row {rowIndex + 1} ({dealerCode}): {ex.Message}");
+                _logger.LogWarning("Dealer master upload: skipped {code} at row {row}: {msg}",
+                    dealerCode, rowIndex + 1, ex.Message);
             }
         }
 
@@ -167,6 +191,7 @@ public class DealersController : ControllerBase
             Errors   = errors.Take(20) // cap so response isn't huge
         });
     }
+
 
     // Splits a CSV line respecting quoted fields (handles commas inside
     // quotes, e.g. remarks that might contain commas).
@@ -191,6 +216,42 @@ public class DealersController : ControllerBase
         result.Add(current.ToString());
         return result.ToArray();
     }
+
+    // Reads any cell type (string, numeric, date, boolean, formula, blank) as a
+    // trimmed string. Excel date cells come back as DateTime — normalized to
+    // "dd-MM-yyyy" so it matches the text-date format your ParseDate(string)
+    // helper already expects (e.g. "19-01-2022"), regardless of whether the
+    // source cell was a real Excel date or plain text.
+    private static string GetCellString(IRow row, int index)
+    {
+        var cell = row.GetCell(index);
+        if (cell == null) return string.Empty;
+
+        switch (cell.CellType)
+        {
+            case CellType.Blank:
+                return string.Empty;
+            case CellType.String:
+                return cell.StringCellValue?.Trim() ?? string.Empty;
+            case CellType.Numeric:
+                if (DateUtil.IsCellDateFormatted(cell))
+                    return cell.DateCellValue?.ToString("dd-MM-yyyy") ?? string.Empty;
+                return cell.NumericCellValue.ToString();
+            case CellType.Boolean:
+                return cell.BooleanCellValue.ToString();
+            case CellType.Formula:
+                // Evaluate common formula result types rather than returning the formula text.
+                return cell.CachedFormulaResultType switch
+                {
+                    CellType.String => cell.StringCellValue?.Trim() ?? string.Empty,
+                    CellType.Numeric => cell.NumericCellValue.ToString(),
+                    _ => cell.ToString() ?? string.Empty
+                };
+            default:
+                return cell.ToString() ?? string.Empty;
+        }
+    }
+
 
     private static DateOnly? ParseDate(string? val)
     {

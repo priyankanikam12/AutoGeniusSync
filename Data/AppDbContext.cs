@@ -44,7 +44,7 @@ public partial class AppDbContext : DbContext
     public DbSet<DmsMaterialTransfer> DmsMaterialTransfers => Set<DmsMaterialTransfer>();
     public DbSet<DmsMaterialTransferItem> DmsMaterialTransferItems => Set<DmsMaterialTransferItem>();
     public DbSet<DmsMaterialTransferLabor> DmsMaterialTransferLabors => Set<DmsMaterialTransferLabor>();
-
+    public DbSet<DmsStockSummaryDetail> DmsStockSummaryDetails => Set<DmsStockSummaryDetail>();
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.Entity<DmsAuthToken>(entity =>
@@ -652,6 +652,56 @@ public partial class AppDbContext : DbContext
         modelBuilder.Entity<DmsMaterialTransferLabor>(e =>
         {
             e.ToTable("DMS_MaterialTransferLabor");
+        });
+
+        modelBuilder.Entity<DmsStockSummaryDetail>(entity =>
+        {
+            entity.ToTable("DMS_StockSummaryDetail");
+            entity.HasKey(e => e.Id);
+        
+            entity.HasIndex(e => e.UniqueKey)
+                .IsUnique()
+                .HasFilter("[UniqueKey] IS NOT NULL")
+                .HasDatabaseName("UQ_DMS_StockSummaryDetail_UniqueKey");
+        
+            entity.HasIndex(e => e.DealerCode).HasDatabaseName("IX_DMS_StockSummaryDetail_DealerCode");
+            entity.HasIndex(e => e.PartNo).HasDatabaseName("IX_DMS_StockSummaryDetail_PartNo");
+            entity.HasIndex(e => e.GroupName).HasDatabaseName("IX_DMS_StockSummaryDetail_GroupName");
+        
+            entity.Property(e => e.DealerCode).HasMaxLength(50);
+            entity.Property(e => e.DealerName).HasMaxLength(500);
+            entity.Property(e => e.LocCode).HasMaxLength(100);
+            entity.Property(e => e.ReportOption).HasMaxLength(50);
+            entity.Property(e => e.PartNo).HasMaxLength(100).IsRequired();
+            entity.Property(e => e.PartDescription).HasMaxLength(1000);
+            entity.Property(e => e.HSNSAC_Code).HasMaxLength(50);
+            entity.Property(e => e.GroupName).HasMaxLength(200);
+            entity.Property(e => e.ItemType).HasMaxLength(100);
+        
+            entity.Property(e => e.BalAmnt).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
+            entity.Property(e => e.BillPrice).HasColumnType("decimal(18,2)").HasDefaultValue(0m);
+        
+            entity.Property(e => e.OpenBal).HasDefaultValue(0);
+            entity.Property(e => e.Purchase).HasDefaultValue(0);
+            entity.Property(e => e.Receipt).HasDefaultValue(0);
+            entity.Property(e => e.PPurChln).HasDefaultValue(0);
+            entity.Property(e => e.Total).HasDefaultValue(0);
+            entity.Property(e => e.Sale).HasDefaultValue(0);
+            entity.Property(e => e.BrIss).HasDefaultValue(0);
+            entity.Property(e => e.MtrlIss).HasDefaultValue(0);
+            entity.Property(e => e.StAdj).HasDefaultValue(0);
+            entity.Property(e => e.PartsChln).HasDefaultValue(0);
+            entity.Property(e => e.PurReturn).HasDefaultValue(0);
+            entity.Property(e => e.SaleReturn).HasDefaultValue(0);
+            entity.Property(e => e.SaleChln).HasDefaultValue(0);
+            entity.Property(e => e.BalQty).HasDefaultValue(0);
+            entity.Property(e => e.QtyReqd).HasDefaultValue(0);
+            entity.Property(e => e.MinOrder).HasDefaultValue(0);
+        
+            entity.Property(e => e.UniqueKey).HasMaxLength(400);
+            entity.Property(e => e.RowHash).HasMaxLength(100);
+            entity.Property(e => e.CreatedAt).HasDefaultValueSql("(getutcdate())");
+            entity.Property(e => e.UpdatedAt).HasDefaultValueSql("(getutcdate())");
         });
 
         OnModelCreatingPartial(modelBuilder);

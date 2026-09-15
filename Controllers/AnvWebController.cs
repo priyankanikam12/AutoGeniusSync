@@ -261,5 +261,129 @@ namespace AutoGeniusSync.Controllers
             var result = byModel.Values.OrderByDescending(m => m.Repair.Total + m.Service.Total + m.Insurance.Total).ToList();
             return Ok(new { Models = result });
         }
+
+        // GET api/anvweb/lookup?chassisNo=...   (or ?registrationNo=...)
+        //
+        // Added in response to Balaji's (ANV Web Ventures) feedback that the three
+        // fleet-status endpoints above don't meet their requirement: they want to
+        // GET a single vehicle's data by searching on chassis number (registration
+        // number also supported), returning "the required fields" — i.e. the
+        // columns on their RIDEV dashboard (Bike Name, Location, Status, Chassis
+        // Number, Last Subscription Date, Date of Reporting, Actual/Expected Date
+        // of RFD, Days Delayed, Reason).
+        //
+        // READ THIS BEFORE TELLING BALAJI THIS IS DONE: AutoGeniusSync's schema does
+        // not contain most of those fields — there is no current_status enum
+        // (repair/service_center/insurance/un_allocated), no RFD target dates, no
+        // days-delayed calculation, and no subscription dates anywhere in this
+        // database, including in DmsLineOrderReport (checked below too — it's a
+        // job-card/invoice feed with RegNo/Model/Location/JobDate/JobCardType, not
+        // a status-tracking table). That data lives only in the separate RIDEV
+        // (admin.ridev.in) system, which this codebase has no access to. This
+        // endpoint returns the closest equivalents AutoGeniusSync actually has
+        // (see AnvWebLookupResponseDto for the exact mapping, and DmsLineOrderReport
+        // used below as an extra fallback source) and explicitly lists which
+        // requested fields it cannot supply in UnavailableFields/Note on every
+        // response, so this can be shared with Balaji/Priyanka as-is without
+        // overstating what it covers.
+        [HttpGet("lookup")]
+        public async Task<IActionResult> Lookup(
+            [FromHeader(Name = "X-API-Key")] string? apiKey,
+            [FromQuery] string? chassisNo,
+            [FromQuery] string? registrationNo)
+        {
+            if (!IsValidApiKey(apiKey))
+                return Unauthorized(new { error = "Invalid or missing API key." });
+
+            if (string.IsNullOrWhiteSpace(chassisNo) && string.IsNullOrWhiteSpace(registrationNo))
+                return BadRequest(new { error = "Provide chassisNo or registrationNo as a query parameter." });
+
+            string? chassis = string.IsNullOrWhiteSpace(chassisNo) ? null : chassisNo.Trim();
+
+            // Resolve registrationNo -> chassis when chassisNo wasn't given. RegNo
+            // lives directly on DmsLineOrderReport (per job card) as well as on
+            // DmsVehicleDispatch — check the dispatch master first (it's one row
+            // per vehicle), then fall back to the LOR job-card table, since a
+            // vehicle can have LOR rows even when it has no dispatch row yet.
+            if (chassis == null && !string.IsNullOrWhiteSpace(registrationNo))
+            {
+                var regNo = registrationNo.Trim();
+                var dispatchMatch = await _db.DmsVehicleDispatches
+                    .Where(d => d.ChassisNo != null &&
+                                ((d.RegNo != null && d.RegNo == regNo) ||
+                                 (d.RegNumber != null && d.RegNumber == regNo)))
+                    .FirstOrDefaultAsync();
+
+                chassis = dispatchMatch?.ChassisNo;
+
+                if (chassis == null)
+                {
+                    var lorMatch = await _db.DmsLineOrderReports
+                        .Where(l => l.ChassisNo != null && l.RegNo == regNo)
+                        .FirstOrDefaultAsync();
+                    chassis = lorMatch?.ChassisNo;
+                }
+
+                if (chassis == null)
+                    return NotFound(new { error = $"No vehicle found for registration number '{regNo}'." });
+            }
+
+            // Hard party scope, same as every other endpoint here — a caller can't
+            // use this to look up a chassis that isn't ANV Web Ventures' own.
+            var sale = await _db.DmsVehicleSales
+                .Where(v => v.ChassisNo == chassis && v.SoldTo != null && v.SoldTo.Contains(PartyMatch))
+                .FirstOrDefaultAsync();
+
+            if (sale == null)
+                return NotFound(new { error = $"No ANV Web Ventures vehicle found for chassis number '{chassis}'." });
+
+            var dispatch = await _db.DmsVehicleDispatches
+                .Where(d => d.ChassisNo == chassis)
+                .FirstOrDefaultAsync();
+
+            var latestJob = await _db.DmsServiceHistories
+                .Where(s => !s.IsRowTotal && s.ChassisNo == chassis)
+                .OrderByDescending(s => s.JobDate)
+                .FirstOrDefaultAsync();
+
+            // DmsLineOrderReport (LOR) is the job-card/invoice feed — it carries RegNo
+            // directly (no dispatch join needed) plus its own Model/Location/JobDate/
+            // JobCardType per job. Used here as a fallback wherever DmsServiceHistory
+            // or DmsVehicleDispatch don't have a value, and as a second date/reason
+            // candidate. NOTE: assumes the registered DbSet is "DmsLineOrderReports" —
+            // rename if your DbContext registers it differently.
+            var latestLor = await _db.DmsLineOrderReports
+                .Where(l => l.ChassisNo == chassis)
+                .OrderByDescending(l => l.JobDate ?? l.DocDate)
+                .FirstOrDefaultAsync();
+
+            var status = latestJob == null
+                ? "No service history"
+                : (latestJob.JobStatus == "Closed" ? "Closed" : "Open");
+
+            var response = new AnvWebLookupResponseDto
+            {
+                ChassisNumber = chassis,
+                RegistrationNo = dispatch?.RegNo ?? dispatch?.RegNumber ?? latestLor?.RegNo,
+                BikeName = latestJob?.Model ?? latestLor?.Model ?? sale.ItemModel ?? sale.Oemmodel,
+                Location = dispatch?.Location ?? latestLor?.Location ?? sale.Location,
+                Status = status,
+                LastSubscriptionDate = null,       // not tracked anywhere in AutoGeniusSync
+                DateOfReporting = latestJob?.JobDate ?? latestLor?.JobDate ?? latestLor?.DocDate,
+                ActualDateOfRfd = latestJob?.CompletionDate,
+                ExpectedDateOfRfd = null,           // not tracked anywhere in AutoGeniusSync
+                DaysDelayed = null,                 // not tracked anywhere in AutoGeniusSync
+                Reason = latestJob?.RepairType ?? latestJob?.JobType ?? latestLor?.JobCardType ?? latestLor?.DocType,
+                UnavailableFields = new[] { "lastSubscriptionDate", "expectedDateOfRfd", "daysDelayed" },
+                Note = "AutoGeniusSync does not track subscription dates, expected RFD dates, or a " +
+                       "days-delayed calculation — those fields are always null here. 'status' is only " +
+                       "Open/Closed/No service history (not the repair/service_center/insurance/" +
+                       "un_allocated categorization on your dashboard). 'actualDateOfRfd' is the service " +
+                       "job's completion date and 'reason' is its repair/job type — the closest " +
+                       "equivalents this system has, not the same underlying data."
+            };
+
+            return Ok(response);
+        }
     }
 }
