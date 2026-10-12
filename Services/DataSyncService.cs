@@ -513,6 +513,7 @@ public class DataSyncService
         var end   = toDate   ?? DateTime.UtcNow.Date;
 
         var totalResult = new SyncResult { SyncType = "BackfillHistorical" };
+        var failedChunks = new List<string>();
 
         try
         {
@@ -526,10 +527,39 @@ public class DataSyncService
                 totalResult.RecordsFetched  += r.RecordsFetched;
                 totalResult.RecordsInserted += r.RecordsInserted;
 
+                // FIX: a failed month used to be dropped silently (the loop never looked at
+                // r.Error), leaving a permanent gap in ServiceHistory after the nightly
+                // truncate while the run still reported "Success". Retry once (insert-only,
+                // so safe) and record anything that still fails — same pattern as VSR/VDR.
+                if (!string.IsNullOrEmpty(r.Error))
+                {
+                    _logger.LogWarning("ServiceHistory window {from}-{to} failed, retrying once: {err}",
+                        chunkStart.ToShortDateString(), chunkEnd.ToShortDateString(), r.Error);
+
+                    var retry = await SyncServiceHistoryForRangeAsync(chunkStart, chunkEnd);
+                    totalResult.RecordsFetched  += retry.RecordsFetched;
+                    totalResult.RecordsInserted += retry.RecordsInserted;
+
+                    if (!string.IsNullOrEmpty(retry.Error))
+                        failedChunks.Add($"{chunkStart:yyyy-MM-dd}..{chunkEnd:yyyy-MM-dd}: {retry.Error}");
+                }
+
                 chunkStart = chunkEnd.AddDays(1);
             }
 
-            topLog.Status = "Success";
+            if (failedChunks.Any())
+            {
+                topLog.Status = "PartialFailure";
+                topLog.ErrorMessage = $"{failedChunks.Count} window(s) failed after retry — ServiceHistory data is INCOMPLETE for: "
+                    + string.Join(" | ", failedChunks);
+                totalResult.Error = topLog.ErrorMessage;
+                _logger.LogError("DJR backfill finished with {n} unrecoverable window(s): {details}",
+                    failedChunks.Count, topLog.ErrorMessage);
+            }
+            else
+            {
+                topLog.Status = "Success";
+            }
         }
         catch (Exception ex)
         {
@@ -1227,10 +1257,13 @@ public class DataSyncService
     // LINE ORDER REPORT — INSERT ONLY (unchanged from your version)
     // ─────────────────────────────────────────────────────────
 
+    // failedDealers (optional, added last so existing callers are unaffected): every dealer whose
+    // fetch/insert threw is added here, so a caller can retry just those instead of losing them silently.
     public async Task<SyncResult> SyncLineOrderReportAsync(
         DateTime startDate, DateTime endDate,
         CancellationToken ct = default,
-        List<string>? dealerCodesOverride = null)
+        List<string>? dealerCodesOverride = null,
+        List<string>? failedDealers = null)
     {
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -1269,6 +1302,7 @@ public class DataSyncService
                 {
                     log.Status       = "Failed";
                     log.ErrorMessage = "No dealers in DMS_Dealers. Run dealer sync first.";
+                    result.Error     = log.ErrorMessage;
                     log.CompletedAt  = DateTime.UtcNow;
                     await db.SaveChangesAsync();
                     return result;
@@ -1364,6 +1398,7 @@ public class DataSyncService
                 catch (Exception ex)
                 {
                     _logger.LogWarning("LOR fetch failed for dealer {dc}: {msg}", dealerCode, ex.Message);
+                    failedDealers?.Add(dealerCode);
                 }
             }
 
@@ -1408,6 +1443,16 @@ public class DataSyncService
         return await SyncLineOrderReportAsync(from, today, ct, dealerCodesOverride: shadowfaxCodes);
     }
 
+    // NOTE: SyncLineOrderReportAsync puts its "Dropped: …" statistics into result.Error even on
+    // SUCCESS. Only treat Error as a failure when it is not that statistics string.
+    private static bool IsLorFailure(SyncResult r)
+        => !string.IsNullOrEmpty(r.Error) && !r.Error.StartsWith("Dropped:", StringComparison.Ordinal);
+
+    // LOR is fetched as ONE call per dealer for the whole range, which can time out for large
+    // dealers. Pass 1 does that and records the dealers that failed (they used to be dropped
+    // silently). Pass 2 re-fetches only those dealers in yearly slices. Anything still failing is
+    // returned in .Error so the nightly reload is marked PartialFailure, not "Success".
+    // .Error is only set on real failure here (never the statistics string).
     public async Task<SyncResult> BackfillLineOrderReportAsync(
         DateTime? fromDate = null, DateTime? toDate = null,
         CancellationToken ct = default)
@@ -1416,7 +1461,63 @@ public class DataSyncService
         var start = fromDate ?? DateTime.Parse(startDateStr);
         var end   = toDate   ?? DateTime.UtcNow.Date;
 
-        return await SyncLineOrderReportAsync(start, end, ct);
+        var failedDealers = new List<string>();
+        var pass1 = await SyncLineOrderReportAsync(start, end, ct, failedDealers: failedDealers);
+
+        var total = new SyncResult
+        {
+            SyncType        = "BackfillLineOrderReport",
+            Date            = end,
+            RecordsFetched  = pass1.RecordsFetched,
+            RecordsInserted = pass1.RecordsInserted
+        };
+
+        if (IsLorFailure(pass1))
+        {
+            total.Error = pass1.Error;
+            return total;
+        }
+
+        var stillFailed = new List<string>();
+
+        foreach (var dealer in failedDealers.Distinct(StringComparer.OrdinalIgnoreCase).ToList())
+        {
+            ct.ThrowIfCancellationRequested();
+            _logger.LogWarning("LOR: retrying dealer {dc} in yearly slices after a failed full-range fetch.", dealer);
+
+            var dealerFailed = false;
+            var sliceStart = start;
+            while (sliceStart <= end)
+            {
+                var sliceEnd = sliceStart.AddYears(1).AddDays(-1);
+                if (sliceEnd > end) sliceEnd = end;
+
+                var sliceFailed = new List<string>();
+                var r = await SyncLineOrderReportAsync(
+                    sliceStart, sliceEnd, ct, new List<string> { dealer }, sliceFailed);
+
+                total.RecordsFetched  += r.RecordsFetched;
+                total.RecordsInserted += r.RecordsInserted;
+
+                if (sliceFailed.Count > 0 || IsLorFailure(r))
+                    dealerFailed = true;
+
+                sliceStart = sliceEnd.AddDays(1);
+            }
+
+            if (dealerFailed) stillFailed.Add(dealer);
+        }
+
+        if (stillFailed.Count > 0)
+        {
+            total.Error = $"LineOrderReport INCOMPLETE for {stillFailed.Count} dealer(s) after retry: "
+                + string.Join(", ", stillFailed.Take(30))
+                + (stillFailed.Count > 30 ? ", …" : "");
+            _logger.LogError("LOR backfill finished with {n} dealer(s) still failing: {dealers}",
+                stillFailed.Count, string.Join(", ", stillFailed));
+        }
+
+        return total;
     }
 
     // ─────────────────────────────────────────────────────────
@@ -1466,49 +1567,185 @@ public class DataSyncService
 
     // ─────────────────────────────────────────────────────────
     // NIGHTLY FULL RELOAD — truncate everything, then re-fetch
-    // 2020→today fresh, insert-only. Runs once daily at 00:00 IST.
+    // HistoricalStartDate→today fresh. Started at Sync:DailyTimeIst by SyncHostedService (and on
+    // demand by NightlyReloadController) through NightlyReloadRunner, which guarantees only one
+    // reload runs at a time.
+    //
+    //  1. PREFLIGHT  — ERP login + one real DJR call must succeed BEFORE anything is truncated.
+    //                  If the ERP is down at midnight the existing data is left untouched (it
+    //                  re-checks every 10 min, up to 6 times) instead of being wiped and
+    //                  replaced with nothing.
+    //  2. TRUNCATE   — ServiceHistory, VehicleSales, VehicleDispatches, LineOrderReport.
+    //  3. RE-FETCH   — dealers, then each report; failed chunks/dealers are retried and
+    //                  reported, never swallowed.
+    //  4. VALIDATE   — every table must have rows. "Success" only when there were no failed
+    //                  chunks AND no empty tables; otherwise "PartialFailure".
+    //  Outcome is written to the sync log (DmsSyncLogs, SyncType = 'NightlyFullReload').
     // ─────────────────────────────────────────────────────────
     public async Task<SyncResult> RunNightlyFullReloadAsync(CancellationToken ct = default)
     {
-        var overallResult = new SyncResult { SyncType = "NightlyFullReload" };
+        var overall   = new SyncResult { SyncType = "NightlyFullReload" };
+        var problems  = new List<string>();
+        var truncated = false;
 
-        _logger.LogInformation("Nightly full reload starting: truncating all tables...");
-        await TruncateAllDataTablesAsync();
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
-        _logger.LogInformation("Truncate complete. Re-fetching dealers...");
-        await SyncAllDealersAsync();
-        await SyncCallCentreDealersAsync();
+        var log = new DmsSyncLog { SyncType = "NightlyFullReload", StartedAt = DateTime.UtcNow, Status = "Running" };
+        db.DmsSyncLogs.Add(log);
+        await db.SaveChangesAsync();
 
         var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2020-01-01";
         var start = DateTime.Parse(startDateStr);
         var end   = DateTime.UtcNow.Date;
 
-        _logger.LogInformation("Re-fetching ServiceHistory {from} → {to}...", start, end);
-        var djr = await BackfillHistoricalDataAsync(start, end, ct);
-        overallResult.RecordsFetched  += djr.RecordsFetched;
-        overallResult.RecordsInserted += djr.RecordsInserted;
+        async Task Step(string text)
+        {
+            _logger.LogInformation("Nightly full reload — {step}", text);
+            log.ErrorMessage = Trunc("Progress: " + text, 1800);
+            try { await db.SaveChangesAsync(CancellationToken.None); }
+            catch (Exception ex) { _logger.LogWarning("Could not save reload progress: {msg}", ex.Message); }
+        }
 
-        _logger.LogInformation("Re-fetching VehicleSales {from} → {to}...", start, end);
-        var vsr = await BackfillVehicleSalesAsync(start, end, ct);
-        overallResult.RecordsFetched  += vsr.RecordsFetched;
-        overallResult.RecordsInserted += vsr.RecordsInserted;
+        void Collect(string name, SyncResult r)
+        {
+            overall.RecordsFetched  += r.RecordsFetched;
+            overall.RecordsInserted += r.RecordsInserted;
+            if (!string.IsNullOrEmpty(r.Error)) problems.Add($"{name}: {r.Error}");
+        }
 
-        _logger.LogInformation("Re-fetching VehicleDispatches {from} → {to}...", start, end);
-        var vdr = await BackfillVehicleDispatchesAsync(start, end, ct);
-        overallResult.RecordsFetched  += vdr.RecordsFetched;
-        overallResult.RecordsInserted += vdr.RecordsInserted;
+        try
+        {
+            // 1 ── PREFLIGHT (nothing is changed until this passes)
+            await Step("preflight: checking ERP login and report API");
+            await WaitForErpHealthyAsync(end, ct);
 
-        _logger.LogInformation("Re-fetching LineOrderReport {from} → {to}...", start, end);
-        var lor = await BackfillLineOrderReportAsync(start, end, ct);
-        overallResult.RecordsFetched  += lor.RecordsFetched;
-        overallResult.RecordsInserted += lor.RecordsInserted;
+            // 2 ── TRUNCATE
+            await Step("truncating ServiceHistory, VehicleSales, VehicleDispatches, LineOrderReport");
+            truncated = true;   // set BEFORE the call: a failure part-way leaves the tables in an unknown state
+            await TruncateAllDataTablesAsync();
 
-        _logger.LogInformation(
-            "Nightly full reload complete: {fet} fetched, {ins} inserted across all report types.",
-            overallResult.RecordsFetched, overallResult.RecordsInserted);
+            // 3 ── RE-FETCH
+            await Step("dealers (pincode sync)");
+            Collect("Dealers", await SyncAllDealersAsync());
+            ct.ThrowIfCancellationRequested();
 
-        return overallResult;
+            await Step("call-centre dealers");
+            Collect("CallCentreDealers", await SyncCallCentreDealersAsync());
+            ct.ThrowIfCancellationRequested();
+
+            await Step($"ServiceHistory {start:yyyy-MM-dd} → {end:yyyy-MM-dd}");
+            Collect("ServiceHistory", await BackfillHistoricalDataAsync(start, end, ct));
+            ct.ThrowIfCancellationRequested();
+
+            await Step($"VehicleSales {start:yyyy-MM-dd} → {end:yyyy-MM-dd}");
+            Collect("VehicleSales", await BackfillVehicleSalesAsync(start, end, ct));
+            ct.ThrowIfCancellationRequested();
+
+            await Step($"VehicleDispatches {start:yyyy-MM-dd} → {end:yyyy-MM-dd}");
+            Collect("VehicleDispatches", await BackfillVehicleDispatchesAsync(start, end, ct));
+            ct.ThrowIfCancellationRequested();
+
+            await Step($"LineOrderReport {start:yyyy-MM-dd} → {end:yyyy-MM-dd}");
+            Collect("LineOrderReport", await BackfillLineOrderReportAsync(start, end, ct));
+            ct.ThrowIfCancellationRequested();
+
+            // 4 ── VALIDATE
+            await Step("validating row counts");
+            var nService  = await db.DmsServiceHistories.CountAsync(CancellationToken.None);
+            var nSales    = await db.DmsVehicleSales.CountAsync(CancellationToken.None);
+            var nDispatch = await db.DmsVehicleDispatches.CountAsync(CancellationToken.None);
+            var nLor      = await db.DmsLineOrderReports.CountAsync(CancellationToken.None);
+
+            if (nService  == 0) problems.Add("ServiceHistory table is EMPTY after reload");
+            if (nSales    == 0) problems.Add("VehicleSales table is EMPTY after reload");
+            if (nDispatch == 0) problems.Add("VehicleDispatches table is EMPTY after reload");
+            if (nLor      == 0) problems.Add("LineOrderReport table is EMPTY after reload");
+
+            var counts = $"rows: ServiceHistory={nService}, VehicleSales={nSales}, VehicleDispatches={nDispatch}, LineOrderReport={nLor}";
+
+            if (problems.Count == 0)
+            {
+                log.Status       = "Success";
+                log.ErrorMessage = Trunc("OK — " + counts, 1800);
+                _logger.LogInformation("Nightly full reload complete: {fet} fetched, {ins} inserted. {counts}",
+                    overall.RecordsFetched, overall.RecordsInserted, counts);
+            }
+            else
+            {
+                log.Status       = "PartialFailure";
+                log.ErrorMessage = Trunc(string.Join(" | ", problems) + " || " + counts, 1800);
+                overall.Error    = log.ErrorMessage;
+                _logger.LogError("Nightly full reload finished WITH PROBLEMS: {problems} || {counts}",
+                    string.Join(" | ", problems), counts);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            log.Status = "Interrupted";
+            log.ErrorMessage = truncated
+                ? "INTERRUPTED (app shutting down) AFTER truncate — tables are only partly loaded. Run the reload again."
+                : "Interrupted before truncate — no data was changed.";
+            overall.Error = log.ErrorMessage;
+            _logger.LogWarning("Nightly full reload interrupted: {msg}", log.ErrorMessage);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            var reason = ex.InnerException?.Message ?? ex.Message;
+            log.Status = "Failed";
+            log.ErrorMessage = Trunc(
+                (truncated
+                    ? "FAILED AFTER truncate — tables may be empty or partial. "
+                    : "FAILED BEFORE truncate — existing data untouched. ") + reason, 1800);
+            overall.Error = log.ErrorMessage;
+            _logger.LogError(ex, "Nightly full reload failed ({where} truncate)", truncated ? "after" : "before");
+        }
+        finally
+        {
+            log.CompletedAt     = DateTime.UtcNow;
+            log.RecordsFetched  = overall.RecordsFetched;
+            log.RecordsInserted = overall.RecordsInserted;
+            log.RecordsUpdated  = 0;
+            try { await db.SaveChangesAsync(CancellationToken.None); }
+            catch (Exception saveEx) { _logger.LogError(saveEx, "Could not write the NightlyFullReload sync-log row"); }
+        }
+
+        return overall;
     }
+
+    // Do not truncate until the ERP can actually serve data: login must work and one real DJR
+    // call (the latest day) must come back without error. Re-checks every 10 minutes, 6 times.
+    private async Task WaitForErpHealthyAsync(DateTime probeDate, CancellationToken ct)
+    {
+        const int maxAttempts = 6;
+        var waitBetween = TimeSpan.FromMinutes(10);
+        Exception? last = null;
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                var token = await _erpApi.GetValidTokenAsync();
+                await _erpApi.FetchDjrAsync(probeDate, token, "");   // throws if the call fails after its own retries
+                _logger.LogInformation("ERP preflight OK (attempt {a}/{max}).", attempt, maxAttempts);
+                return;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                last = ex;
+                _logger.LogWarning("ERP preflight failed (attempt {a}/{max}): {msg}", attempt, maxAttempts, ex.Message);
+                if (attempt < maxAttempts)
+                    await Task.Delay(waitBetween, ct);
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"ERP not healthy after {maxAttempts} preflight attempts — NOTHING was truncated. Last error: {last?.Message}", last);
+    }
+
+    private static string Trunc(string s, int max) => s.Length <= max ? s : s[..max];
 
     // ─────────────────────────────────────────────────────────
     // UPSERT VARIANTS — used only by the PUT endpoints in

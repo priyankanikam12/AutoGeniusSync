@@ -3,6 +3,7 @@ using AutoGeniusSync.DTOs;
 using AutoGeniusSync.Models;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using AutoGeniusSync.Helpers;
 
 namespace AutoGeniusSync.Controllers;
@@ -13,11 +14,25 @@ public class JobReportController : ControllerBase
 {
     private readonly AppDbContext _db;
     private readonly ILogger<JobReportController> _logger;
+    private readonly IConfiguration _config;
 
-    public JobReportController(AppDbContext db, ILogger<JobReportController> logger)
+    public JobReportController(AppDbContext db, ILogger<JobReportController> logger, IConfiguration config)
     {
         _db = db;
         _logger = logger;
+        _config = config;
+    }
+
+    // The doc you've already handed Shadowfax (page 15/17, section 8) shows
+    // "X-API-Key: sfx-bgauss-2024-xK9mP3nQ7rL2vW8t" on every curl example, but
+    // nothing in this controller actually checked it — meaning that key did
+    // nothing and every endpoint here was wide open. Wired it up for real now,
+    // against appsettings "ApiKeys:Shadowfax". Add to appsettings.json:
+    //   "ApiKeys": { "Shadowfax": "sfx-bgauss-2024-xK9mP3nQ7rL2vW8t", ... }
+    private bool IsValidApiKey(string? apiKey)
+    {
+        var expected = _config["ApiKeys:Shadowfax"];
+        return !string.IsNullOrEmpty(expected) && string.Equals(apiKey, expected, StringComparison.Ordinal);
     }
 
     private static string BuildKey(string? dealerCode, string? jobNo, DateOnly? jobDate, string? chassisNo)
@@ -185,8 +200,11 @@ public class JobReportController : ControllerBase
     // ═══════════════════════════════════════════════════════
 
     [HttpPost("upload")]
-    public async Task<IActionResult> Upload(IFormFile file)
+    public async Task<IActionResult> Upload([FromHeader(Name = "X-API-Key")] string? apiKey, IFormFile file)
     {
+        if (!IsValidApiKey(apiKey))
+            return Unauthorized(new { error = "Invalid or missing API key." });
+
         if (file == null || file.Length == 0)
             return BadRequest(new { error = "No file uploaded." });
 
@@ -266,8 +284,11 @@ public class JobReportController : ControllerBase
     }
 
     [HttpPut("upload")]
-    public async Task<IActionResult> UpsertUpload(IFormFile file)
+    public async Task<IActionResult> UpsertUpload([FromHeader(Name = "X-API-Key")] string? apiKey, IFormFile file)
     {
+        if (!IsValidApiKey(apiKey))
+            return Unauthorized(new { error = "Invalid or missing API key." });
+
         if (file == null || file.Length == 0)
             return BadRequest(new { error = "No file uploaded." });
 
@@ -395,13 +416,30 @@ public class JobReportController : ControllerBase
     // STANDARD CRUD — single-record JSON API
     // ═══════════════════════════════════════════════════════
 
+    // GET api/jobreport?fromDate=2026-09-01&toDate=2026-09-17&dealerCode=...&chassisNo=...&page=1&pageSize=100
+    //
+    // fromDate/toDate filter on JobDate (inclusive on both ends) — this is what
+    // "fetch it live with a date range" means once Cogzim's bulk push has synced
+    // data in: you don't call their POST endpoint to read anything back (POST/PUT
+    // on /api/jobreport/bulk only ever accepts writes) — you call THIS GET
+    // endpoint against your own now-populated table. See the reply below for a
+    // ready-to-run example.
     [HttpGet]
     public async Task<IActionResult> GetAll(
+        [FromHeader(Name = "X-API-Key")] string? apiKey,
         [FromQuery] string? dealerCode = null,
         [FromQuery] string? chassisNo = null,
+        [FromQuery] DateOnly? fromDate = null,
+        [FromQuery] DateOnly? toDate = null,
         [FromQuery] int page = 1,
         [FromQuery] int pageSize = 100)
     {
+        if (!IsValidApiKey(apiKey))
+            return Unauthorized(new { error = "Invalid or missing API key." });
+
+        if (page < 1) page = 1;
+        if (pageSize < 1 || pageSize > 1000) pageSize = 100;
+
         var q = _db.DmsJobReports.Include(x => x.Complaints).AsQueryable();
 
         if (!string.IsNullOrEmpty(dealerCode))
@@ -409,6 +447,12 @@ public class JobReportController : ControllerBase
 
         if (!string.IsNullOrEmpty(chassisNo))
             q = q.Where(x => x.ChassisNo == chassisNo);
+
+        if (fromDate.HasValue)
+            q = q.Where(x => x.JobDate >= fromDate.Value);
+
+        if (toDate.HasValue)
+            q = q.Where(x => x.JobDate <= toDate.Value);
 
         var total = await q.CountAsync();
         var records = await q
@@ -421,8 +465,11 @@ public class JobReportController : ControllerBase
     }
 
     [HttpGet("{id:int}")]
-    public async Task<IActionResult> GetById(int id)
+    public async Task<IActionResult> GetById([FromHeader(Name = "X-API-Key")] string? apiKey, int id)
     {
+        if (!IsValidApiKey(apiKey))
+            return Unauthorized(new { error = "Invalid or missing API key." });
+
         var row = await _db.DmsJobReports.Include(x => x.Complaints).FirstOrDefaultAsync(x => x.Id == id);
         return row == null ? NotFound(new { error = $"JobReport with Id {id} not found." }) : Ok(row);
     }
@@ -430,8 +477,11 @@ public class JobReportController : ControllerBase
     // POST /api/jobreport — CREATE. Body has NO Id field — the client
     // never sends one, since Id is generated by the database.
     [HttpPost]
-    public async Task<IActionResult> Create([FromBody] JobReportInput input)
+    public async Task<IActionResult> Create([FromHeader(Name = "X-API-Key")] string? apiKey, [FromBody] JobReportInput input)
     {
+        if (!IsValidApiKey(apiKey))
+            return Unauthorized(new { error = "Invalid or missing API key." });
+
         if (input == null)
             return BadRequest(new { error = "Request body is required." });
 
@@ -510,8 +560,11 @@ public class JobReportController : ControllerBase
     // PUT /api/jobreport/{id} — full update. Id comes from the ROUTE,
     // never from the body — the body has no Id field to send.
     [HttpPut("{id:int}")]
-    public async Task<IActionResult> Update(int id, [FromBody] JobReportInput input)
+    public async Task<IActionResult> Update([FromHeader(Name = "X-API-Key")] string? apiKey, int id, [FromBody] JobReportInput input)
     {
+        if (!IsValidApiKey(apiKey))
+            return Unauthorized(new { error = "Invalid or missing API key." });
+
         if (input == null)
             return BadRequest(new { error = "Request body is required." });
 
@@ -573,8 +626,11 @@ public class JobReportController : ControllerBase
     // dedicated endpoint (e.g. POST/DELETE /api/jobreport/{id}/complaints) —
     // happy to add that if you want it; flagging it rather than guessing at the shape.
     [HttpPatch("{id:int}")]
-    public async Task<IActionResult> PartialUpdate(int id, [FromBody] Dictionary<string, object?> updates)
+    public async Task<IActionResult> PartialUpdate([FromHeader(Name = "X-API-Key")] string? apiKey, int id, [FromBody] Dictionary<string, object?> updates)
     {
+        if (!IsValidApiKey(apiKey))
+            return Unauthorized(new { error = "Invalid or missing API key." });
+
         var existing = await _db.DmsJobReports.FirstOrDefaultAsync(x => x.Id == id);
         if (existing == null)
             return NotFound(new { error = $"JobReport with Id {id} not found." });
@@ -632,8 +688,11 @@ public class JobReportController : ControllerBase
     }
 
     [HttpDelete("{id:int}")]
-    public async Task<IActionResult> Delete(int id)
+    public async Task<IActionResult> Delete([FromHeader(Name = "X-API-Key")] string? apiKey, int id)
     {
+        if (!IsValidApiKey(apiKey))
+            return Unauthorized(new { error = "Invalid or missing API key." });
+
         var existing = await _db.DmsJobReports.FirstOrDefaultAsync(x => x.Id == id);
         if (existing == null)
             return NotFound(new { error = $"JobReport with Id {id} not found." });
@@ -649,8 +708,11 @@ public class JobReportController : ControllerBase
 
     // ── POST /api/jobreport/bulk — insert-only ──
     [HttpPost("bulk")]
-    public async Task<IActionResult> BulkInsert([FromBody] List<JobReportRecordDto> records)
+    public async Task<IActionResult> BulkInsert([FromHeader(Name = "X-API-Key")] string? apiKey, [FromBody] List<JobReportRecordDto> records)
     {
+        if (!IsValidApiKey(apiKey))
+            return Unauthorized(new { error = "Invalid or missing API key." });
+
         if (records is null || records.Count == 0)
             return BadRequest(new { error = "Payload must be a non-empty array of records." });
 
@@ -722,8 +784,11 @@ public class JobReportController : ControllerBase
 
     // ── PUT /api/jobreport/bulk — upsert ──
     [HttpPut("bulk")]
-    public async Task<IActionResult> BulkUpsert([FromBody] List<JobReportRecordDto> records)
+    public async Task<IActionResult> BulkUpsert([FromHeader(Name = "X-API-Key")] string? apiKey, [FromBody] List<JobReportRecordDto> records)
     {
+        if (!IsValidApiKey(apiKey))
+            return Unauthorized(new { error = "Invalid or missing API key." });
+
         if (records is null || records.Count == 0)
             return BadRequest(new { error = "Payload must be a non-empty array of records." });
 

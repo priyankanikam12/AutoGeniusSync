@@ -66,12 +66,25 @@ builder.Services.AddSingleton<ErpApiService>();
 // ─────────────────────────────────────────────────────────────
 // BACKGROUND SERVICE
 // ─────────────────────────────────────────────────────────────
+// Single entry point for the nightly full reload (daily timer + manual/Task-Scheduler endpoint share it,
+// so two reloads can never run at once). Must be registered BEFORE the hosted service that uses it.
+builder.Services.AddSingleton<NightlyReloadRunner>();
 builder.Services.AddHostedService<SyncHostedService>();
 
 // ─────────────────────────────────────────────────────────────
 // API / SWAGGER
 // ─────────────────────────────────────────────────────────────
-builder.Services.AddControllers().AddNewtonsoftJson();
+// ReferenceLoopHandling.Ignore added as a safety net: DmsJobReportComplaint
+// was missing [JsonIgnore] on its back-reference to DmsJobReport, which
+// caused a "Self referencing loop detected" 500 on GET /api/jobreport (fixed
+// separately in DmsJobReportComplaint.cs). This setting means any similar
+// missed back-reference elsewhere in the app degrades to "loop member
+// omitted" instead of a hard 500 — it does not replace fixing the model,
+// just prevents this exact class of bug from taking an endpoint down again.
+builder.Services.AddControllers().AddNewtonsoftJson(options =>
+{
+    options.SerializerSettings.ReferenceLoopHandling = Newtonsoft.Json.ReferenceLoopHandling.Ignore;
+});
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
     c.SwaggerDoc("v1", new() { Title = "AutoGenius DMS Sync API", Version = "v1" }));
