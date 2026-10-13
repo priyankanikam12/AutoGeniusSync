@@ -2,7 +2,14 @@ using AutoGeniusSync.Services;
 
 namespace AutoGeniusSync.BackgroundServices;
 
-// Daily timer for the nightly FULL reload (ERP check → truncate → re-fetch → validate).
+// Daily scheduler for the FULL reload (ERP check → truncate → re-fetch → validate) of
+// ServiceHistory, VehicleSales, VehicleDispatches and LineOrderReport, from
+// SyncSettings:HistoricalStartDate up to today (IST) — no from/to dates to enter anywhere.
+//
+// SELF-HEALING: it does not rely on hitting an exact minute. Every few minutes it asks
+// NightlyReloadRunner.CheckCatchUpAsync (database-based): "has today's reload completed, and are all
+// 4 tables non-empty?". If today's reload is missing and the scheduled time has passed — or a table
+// is empty — it starts the reload automatically, e.g. right after a deploy/restart.
 // The reload itself lives in DataSyncService.RunNightlyFullReloadAsync and is started through
 // NightlyReloadRunner so the timer and the manual endpoint can never overlap.
 //
@@ -27,8 +34,12 @@ public class SyncHostedService : BackgroundService
     // process was not running then (idle/recycled app pool) — that is why a run was missed.
     private static readonly TimeSpan HeartbeatEvery = TimeSpan.FromHours(1);
 
-    private DateTime _lastReloadDateIst = DateTime.MinValue;
-    private DateTime _lastHeartbeatUtc  = DateTime.MinValue;
+    // How often the database check runs, and the first check after start-up (lets the host settle).
+    private static readonly TimeSpan CheckEvery     = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan FirstCheckWait = TimeSpan.FromSeconds(20);
+
+    private DateTime _lastHeartbeatUtc = DateTime.MinValue;
+    private DateTime _nextCheckUtc     = DateTime.MinValue;
 
     public SyncHostedService(
         NightlyReloadRunner runner,
@@ -58,13 +69,17 @@ public class SyncHostedService : BackgroundService
         // return empty/partial data until it finishes. Keep it false in production.
         var runOnStartup = _config.GetValue("Sync:RunOnStartup", false);
 
+        // Catch-up (self-healing) — default ON. Set "Sync:CatchUp": false to use the exact-time window only.
+        var catchUp     = _config.GetValue("Sync:CatchUp", true);
+        var maxAttempts = Math.Max(1, _config.GetValue("Sync:MaxAttemptsPerDay", 3));
+
         var startIst = DateTime.UtcNow.Add(IstOffset);
         _logger.LogInformation(
-            "SyncHostedService starting at {now} IST — daily FULL reload at {time} IST. RunOnStartup={startup}. Next scheduled run: {next} IST.",
+            "SyncHostedService starting at {now} IST — daily FULL reload at {time} IST (history from SyncSettings:HistoricalStartDate to today). " +
+            "RunOnStartup={startup}, CatchUp={catchUp}, MaxAttemptsPerDay={max}.",
             startIst.ToString("dd.MM.yyyy HH:mm:ss"),
             dailyTimeIst.ToString(@"hh\:mm"),
-            runOnStartup,
-            NextRunIst(startIst, dailyTimeIst).ToString("dd.MM.yyyy HH:mm"));
+            runOnStartup, catchUp, maxAttempts);
 
         try
         {
@@ -72,39 +87,47 @@ public class SyncHostedService : BackgroundService
             if (runOnStartup)
             {
                 var nowIst = DateTime.UtcNow.Add(IstOffset);
-                _lastReloadDateIst = nowIst.Date;   // today counts as done → no second run in today's window
                 await TriggerAsync("startup", nowIst, ct);
             }
 
-            // ── Daily schedule ────────────────────────────────────────────────
+            _nextCheckUtc = DateTime.UtcNow + FirstCheckWait;
+
+            // ── Scheduler loop ────────────────────────────────────────────────
             while (!ct.IsCancellationRequested)
             {
                 try
                 {
-                    var nowIst = DateTime.UtcNow.Add(IstOffset);
-                    var t      = nowIst.TimeOfDay;
-
-                    bool inWindow = t >= dailyTimeIst && t < dailyTimeIst + TriggerWindow;
-
-                    if (inWindow && _lastReloadDateIst != nowIst.Date)
+                    if (DateTime.UtcNow >= _nextCheckUtc)
                     {
-                        _lastReloadDateIst = nowIst.Date;
-                        await TriggerAsync("scheduled", nowIst, ct);
-                    }
-                    else if (DateTime.UtcNow - _lastHeartbeatUtc >= HeartbeatEvery)
-                    {
-                        _lastHeartbeatUtc = DateTime.UtcNow;
-                        _logger.LogInformation(
-                            "SyncHostedService alive — now {now} IST, next scheduled reload {next} IST.",
-                            nowIst.ToString("dd.MM.yyyy HH:mm"),
-                            NextRunIst(nowIst, dailyTimeIst).ToString("dd.MM.yyyy HH:mm"));
+                        _nextCheckUtc = DateTime.UtcNow + CheckEvery;
+                        var nowIst = DateTime.UtcNow.Add(IstOffset);
+
+                        var decision = await _runner.CheckCatchUpAsync(nowIst, dailyTimeIst, maxAttempts, ct);
+
+                        if (decision.Run && catchUp)
+                        {
+                            await TriggerAsync(nowIst.TimeOfDay >= dailyTimeIst ? "scheduled" : "catch-up", nowIst, ct, decision.Reason);
+                        }
+                        else if (decision.Run && !catchUp)
+                        {
+                            // Exact-time mode: only fire inside the window after the scheduled time.
+                            if (nowIst.TimeOfDay >= dailyTimeIst && nowIst.TimeOfDay < dailyTimeIst + TriggerWindow)
+                                await TriggerAsync("scheduled", nowIst, ct, decision.Reason);
+                        }
+                        else if (DateTime.UtcNow - _lastHeartbeatUtc >= HeartbeatEvery)
+                        {
+                            _lastHeartbeatUtc = DateTime.UtcNow;
+                            _logger.LogInformation(
+                                "SyncHostedService alive — now {now} IST. No reload needed: {reason}.",
+                                nowIst.ToString("dd.MM.yyyy HH:mm"), decision.Reason);
+                        }
                     }
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
-                    // An unexpected error must NOT end this loop (an unhandled exception in a
-                    // BackgroundService stops the whole host by default).
-                    _logger.LogError(ex, "SyncHostedService loop error — continuing.");
+                    // An unexpected error (e.g. database briefly unreachable) must NOT end this loop —
+                    // an unhandled exception in a BackgroundService stops the whole host by default.
+                    _logger.LogError(ex, "SyncHostedService check error — will retry in {min} min.", CheckEvery.TotalMinutes);
                 }
 
                 await Task.Delay(TimeSpan.FromSeconds(30), ct);
@@ -116,20 +139,11 @@ public class SyncHostedService : BackgroundService
         }
     }
 
-    // Next time the scheduled reload will fire, in IST (for log lines only).
-    private DateTime NextRunIst(DateTime nowIst, TimeSpan dailyTimeIst)
-    {
-        var next = nowIst.Date + dailyTimeIst;
-        if (_lastReloadDateIst == nowIst.Date || nowIst.TimeOfDay >= dailyTimeIst + TriggerWindow)
-            next = next.AddDays(1);
-        return next;
-    }
-
-    private async Task TriggerAsync(string trigger, DateTime nowIst, CancellationToken ct)
+    private async Task TriggerAsync(string trigger, DateTime nowIst, CancellationToken ct, string? reason = null)
     {
         _logger.LogInformation(
-            "Reload trigger '{trigger}' fired at {time} IST — FULL reload (ERP check, truncate, re-fetch, validate).",
-            trigger, nowIst.ToString("dd.MM.yyyy HH:mm:ss"));
+            "Reload trigger '{trigger}' fired at {time} IST — FULL reload (ERP check, truncate, re-fetch, validate). Reason: {reason}",
+            trigger, nowIst.ToString("dd.MM.yyyy HH:mm:ss"), reason ?? "n/a");
 
         var started = await _runner.RunAsync(trigger, ct);
         if (!started)

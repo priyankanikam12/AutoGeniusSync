@@ -1597,7 +1597,7 @@ public class DataSyncService
 
         var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2020-01-01";
         var start = DateTime.Parse(startDateStr);
-        var end   = DateTime.UtcNow.Date;
+        var end   = DateTime.UtcNow.AddMinutes(330).Date;   // "till today" in IST (UTC+5:30)
 
         async Task Step(string text)
         {
