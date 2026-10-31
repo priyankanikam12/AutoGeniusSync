@@ -10,7 +10,8 @@ namespace AutoGeniusSync.Services;
 
 // Result of one read-only ERP probe call (no business data — counts, status and the ERP's own message only).
 public sealed record ErpProbeResult(
-    int HttpStatus, bool? Valid, string? Description, int Rows, int BodyChars, long Ms, string? TopLevelKeys, string? Error);
+    int HttpStatus, bool? Valid, string? Description, int Rows, int BodyChars, long Ms, string? TopLevelKeys, string? Error,
+    string? RequestJson = null);   // the exact JSON body the app sent (no token, no password) — to compare with Postman
 
 // Thrown when the ERP answers HTTP 200 with Valid=false and a description such as "Unauthorized".
 // That is an access problem (wrong/limited token or login), NOT "no data" — it must never be loaded as 0 rows.
@@ -560,6 +561,7 @@ public class ErpApiService
 
         await Task.Delay(_delayMs);
         var sw = System.Diagnostics.Stopwatch.StartNew();
+        var requestJson = JsonConvert.SerializeObject(req);
         await _erpCallThrottle.WaitAsync();
         try
         {
@@ -581,21 +583,21 @@ public class ErpApiService
                 var rows  = (root["Value"] as JArray)?.Count ?? 0;
                 var keys  = string.Join(",", root.Properties().Select(p => p.Name));
                 return new ErpProbeResult(status, valid, desc == null ? null : Trunc(desc, 200),
-                                          rows, body.Length, sw.ElapsedMilliseconds, keys, null);
+                                          rows, body.Length, sw.ElapsedMilliseconds, keys, null, requestJson);
             }
             catch (Exception pex)
             {
                 return new ErpProbeResult(status, null, null, 0, body.Length, sw.ElapsedMilliseconds, null,
-                                          "response is not parseable JSON: " + Trunc(pex.Message, 200));
+                                          "response is not parseable JSON: " + Trunc(pex.Message, 200), requestJson);
             }
         }
         catch (OperationCanceledException)
         {
-            return new ErpProbeResult(0, null, null, 0, 0, sw.ElapsedMilliseconds, null, "timed out");
+            return new ErpProbeResult(0, null, null, 0, 0, sw.ElapsedMilliseconds, null, "timed out", requestJson);
         }
         catch (Exception ex)
         {
-            return new ErpProbeResult(0, null, null, 0, 0, sw.ElapsedMilliseconds, null, Trunc(ex.Message, 200));
+            return new ErpProbeResult(0, null, null, 0, 0, sw.ElapsedMilliseconds, null, Trunc(ex.Message, 200), requestJson);
         }
         finally
         {

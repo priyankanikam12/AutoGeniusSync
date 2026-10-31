@@ -1854,7 +1854,7 @@ public class DataSyncService
     // ─────────────────────────────────────────────────────────
     public sealed record ProbeRow(string Report, string Window, string From, string To, string Dealer,
                                   int HttpStatus, bool? Valid, int Rows, int BodyChars, long Ms,
-                                  string? ErpDescription, string? TopLevelKeys, string? Error);
+                                  string? ErpDescription, string? TopLevelKeys, string? Error, string? RequestJson);
 
     public async Task<List<ProbeRow>> ProbeErpReportsAsync(CancellationToken ct = default)
     {
@@ -1880,7 +1880,7 @@ public class DataSyncService
             var r = await _erpApi.ProbeReportAsync(report, dealer, a, b, token);
             rows.Add(new ProbeRow(report.ToUpperInvariant(), window, a.ToString("yyyy-MM-dd"), b.ToString("yyyy-MM-dd"),
                                   string.IsNullOrEmpty(dealer) ? "(all)" : dealer,
-                                  r.HttpStatus, r.Valid, r.Rows, r.BodyChars, r.Ms, r.Description, r.TopLevelKeys, r.Error));
+                                  r.HttpStatus, r.Valid, r.Rows, r.BodyChars, r.Ms, r.Description, r.TopLevelKeys, r.Error, r.RequestJson));
         }
 
         // Control: DJR, last 7 days (known to work).
@@ -1891,6 +1891,16 @@ public class DataSyncService
             var a = end.AddDays(-days);
             await Probe("vsr", name, a, end, "");
             await Probe("vdr", name, a, end, "");
+        }
+
+        // VSR / VDR for ONE named dealer (the all-dealer call above uses an empty dealer code). If the
+        // all-dealer call is refused but these work, the ERP only blocks the "all dealers" form.
+        foreach (var dealer in dealers.Take(1))
+        {
+            await Probe("vsr", "last 30 days, one dealer", end.AddDays(-29), end, dealer);
+            await Probe("vsr", "last 365 days, one dealer", end.AddDays(-364), end, dealer);
+            await Probe("vdr", "last 30 days, one dealer", end.AddDays(-29), end, dealer);
+            await Probe("vdr", "last 365 days, one dealer", end.AddDays(-364), end, dealer);
         }
 
         foreach (var dealer in dealers)
