@@ -75,10 +75,12 @@ public class SyncHostedService : BackgroundService
 
         var startIst = DateTime.UtcNow.Add(IstOffset);
         _logger.LogInformation(
-            "SyncHostedService starting at {now} IST — daily FULL reload at {time} IST (history from SyncSettings:HistoricalStartDate to today). " +
+            "SyncHostedService starting at {now} IST — daily sync at {time} IST, Mode={mode} (Window = last {months} months upsert, no truncate; Full = truncate + reload from SyncSettings:HistoricalStartDate). " +
             "RunOnStartup={startup}, CatchUp={catchUp}, MaxAttemptsPerDay={max}.",
             startIst.ToString("dd.MM.yyyy HH:mm:ss"),
             dailyTimeIst.ToString(@"hh\:mm"),
+            NightlyReloadRunner.IsFullMode(_config["Sync:Mode"]) ? "Full" : "Window",
+            _config.GetValue("Sync:RollingMonths", 6),
             runOnStartup, catchUp, maxAttempts);
 
         try
@@ -106,13 +108,13 @@ public class SyncHostedService : BackgroundService
 
                         if (decision.Run && catchUp)
                         {
-                            await TriggerAsync(nowIst.TimeOfDay >= dailyTimeIst ? "scheduled" : "catch-up", nowIst, ct, decision.Reason);
+                            await TriggerAsync(nowIst.TimeOfDay >= dailyTimeIst ? "scheduled" : "catch-up", nowIst, ct, decision.Reason, decision.Full, decision.Missing);
                         }
                         else if (decision.Run && !catchUp)
                         {
                             // Exact-time mode: only fire inside the window after the scheduled time.
                             if (nowIst.TimeOfDay >= dailyTimeIst && nowIst.TimeOfDay < dailyTimeIst + TriggerWindow)
-                                await TriggerAsync("scheduled", nowIst, ct, decision.Reason);
+                                await TriggerAsync("scheduled", nowIst, ct, decision.Reason, decision.Full, decision.Missing);
                         }
                         else if (DateTime.UtcNow - _lastHeartbeatUtc >= HeartbeatEvery)
                         {
@@ -139,14 +141,16 @@ public class SyncHostedService : BackgroundService
         }
     }
 
-    private async Task TriggerAsync(string trigger, DateTime nowIst, CancellationToken ct, string? reason = null)
+    private async Task TriggerAsync(string trigger, DateTime nowIst, CancellationToken ct, string? reason = null, bool? full = null, bool missing = false)
     {
-        _logger.LogInformation(
-            "Reload trigger '{trigger}' fired at {time} IST — FULL reload (ERP check, truncate, re-fetch, validate). Reason: {reason}",
-            trigger, nowIst.ToString("dd.MM.yyyy HH:mm:ss"), reason ?? "n/a");
+        var mode = missing ? "MISSING-TABLES load (only empty tables, insert-only, NO truncate)"
+                 : (full ?? NightlyReloadRunner.IsFullMode(_config["Sync:Mode"])) ? "FULL reload (ERP check, truncate, re-fetch from HistoricalStartDate)"
+                                                                                  : "WINDOW sync (rolling months, upsert, no truncate)";
+        _logger.LogInformation("Sync trigger '{trigger}' fired at {time} IST — {mode}. Reason: {reason}",
+            trigger, nowIst.ToString("dd.MM.yyyy HH:mm:ss"), mode, reason ?? "n/a");
 
-        var started = await _runner.RunAsync(trigger, ct);
+        var started = await _runner.RunAsync(trigger, ct, full, missing ? new MissingRequest() : null);
         if (!started)
-            _logger.LogWarning("Reload ({trigger}) skipped — a reload is already running.", trigger);
+            _logger.LogWarning("Sync ({trigger}) skipped — a sync is already running.", trigger);
     }
 }

@@ -496,6 +496,63 @@ public class DataSyncService
         return result;
     }
 
+    // DJR window with fallback. The ERP's DJR call is slow and getting slower (13–36 s per month in
+    // the production log, and some months time out 3 x 180 s). Order of attempts for a window:
+    //   1. whole window   2. same window once more   3. split into halves and repeat, down to
+    //      Sync:DjrMinWindowDays (default 1 day). Only a window that still fails at the minimum
+    //      size (default 1 day) is recorded in failedChunks (=> PartialFailure with exact dates).
+    // Insert-only SyncServiceHistoryForRangeAsync is used, so repeating a window cannot duplicate rows.
+    // The ERP sometimes returns malformed JSON (e.g. an unescaped quote inside 'Coupon No'). Retrying the
+    // same window returns the same bytes, so a parse error is not retried — the window is split
+    // straight away to pin down the exact day instead.
+    private static bool IsDeterministicParseError(string? err)
+        => err != null && (err.Contains("After parsing a value", StringComparison.OrdinalIgnoreCase)
+                        || err.Contains("unexpected character", StringComparison.OrdinalIgnoreCase)
+                        || err.Contains("Unterminated string", StringComparison.OrdinalIgnoreCase)
+                        || err.Contains("Path '", StringComparison.Ordinal));
+
+    private async Task SyncDjrAdaptiveAsync(DateTime from, DateTime to, SyncResult total,
+                                            List<string> failedChunks, CancellationToken ct)
+    {
+        var minDays = Math.Clamp(_config.GetValue("Sync:DjrMinWindowDays", 1), 1, 31);
+
+        async Task<string?> Attempt(DateTime a, DateTime b)
+        {
+            var r = await SyncServiceHistoryForRangeAsync(a, b);
+            total.RecordsFetched  += r.RecordsFetched;
+            total.RecordsInserted += r.RecordsInserted;
+            return string.IsNullOrEmpty(r.Error) ? null : r.Error;
+        }
+
+        async Task Solve(DateTime a, DateTime b)
+        {
+            ct.ThrowIfCancellationRequested();
+            var err = await Attempt(a, b);
+            if (err == null) return;
+
+            if (!IsDeterministicParseError(err))
+            {
+                _logger.LogWarning("ServiceHistory window {a:yyyy-MM-dd}..{b:yyyy-MM-dd} failed, retrying once: {err}", a, b, err);
+                err = await Attempt(a, b);
+                if (err == null) return;
+            }
+
+            var days = (b - a).Days + 1;
+            if (days <= minDays)
+            {
+                failedChunks.Add($"{a:yyyy-MM-dd}..{b:yyyy-MM-dd}: {err}");
+                return;
+            }
+
+            var mid = a.AddDays(days / 2 - 1);                // first half a..mid, second half mid+1..b
+            _logger.LogWarning("ServiceHistory window {a:yyyy-MM-dd}..{b:yyyy-MM-dd} still failing — splitting at {m:yyyy-MM-dd}", a, b, mid);
+            await Solve(a, mid);
+            await Solve(mid.AddDays(1), b);
+        }
+
+        await Solve(from, to);
+    }
+
     public async Task<SyncResult> BackfillHistoricalDataAsync(
         DateTime? fromDate = null, DateTime? toDate = null,
         CancellationToken ct = default,
@@ -517,32 +574,22 @@ public class DataSyncService
 
         try
         {
-            var chunkStart = start;
+            var chunkStart = start.Date;
+            end = end.Date;
             while (chunkStart <= end && !ct.IsCancellationRequested)
             {
-                var chunkEnd = chunkStart.AddMonths(1).AddDays(-1);
+                // Month-aligned window: chunkStart .. last day of that same month (never longer than
+                // one calendar month, never beyond 'end', never end < start).
+                var chunkEnd = new DateTime(chunkStart.Year, chunkStart.Month, 1).AddMonths(1).AddDays(-1);
                 if (chunkEnd > end) chunkEnd = end;
-
-                var r = await SyncServiceHistoryForRangeAsync(chunkStart, chunkEnd);
-                totalResult.RecordsFetched  += r.RecordsFetched;
-                totalResult.RecordsInserted += r.RecordsInserted;
+                if (chunkEnd < chunkStart) chunkEnd = chunkStart;   // defensive; cannot normally happen
 
                 // FIX: a failed month used to be dropped silently (the loop never looked at
                 // r.Error), leaving a permanent gap in ServiceHistory after the nightly
-                // truncate while the run still reported "Success". Retry once (insert-only,
-                // so safe) and record anything that still fails — same pattern as VSR/VDR.
-                if (!string.IsNullOrEmpty(r.Error))
-                {
-                    _logger.LogWarning("ServiceHistory window {from}-{to} failed, retrying once: {err}",
-                        chunkStart.ToShortDateString(), chunkEnd.ToShortDateString(), r.Error);
-
-                    var retry = await SyncServiceHistoryForRangeAsync(chunkStart, chunkEnd);
-                    totalResult.RecordsFetched  += retry.RecordsFetched;
-                    totalResult.RecordsInserted += retry.RecordsInserted;
-
-                    if (!string.IsNullOrEmpty(retry.Error))
-                        failedChunks.Add($"{chunkStart:yyyy-MM-dd}..{chunkEnd:yyyy-MM-dd}: {retry.Error}");
-                }
+                // truncate while the run still reported "Success". Each window is retried,
+                // and a month that keeps timing out is split into smaller pieces (see
+                // SyncDjrAdaptiveAsync) instead of being given up on.
+                await SyncDjrAdaptiveAsync(chunkStart, chunkEnd, totalResult, failedChunks, ct);
 
                 chunkStart = chunkEnd.AddDays(1);
             }
@@ -715,6 +762,7 @@ public class DataSyncService
             var token = await _erpApi.GetValidTokenAsync();
             var sales = await _erpApi.FetchVsrAsync("", startDate, endDate, token);
             result.RecordsFetched = sales.Count;
+            _logger.LogInformation("VSR {from:yyyy-MM-dd}..{to:yyyy-MM-dd}: ERP returned {n} row(s).", startDate, endDate, sales.Count);
 
             var droppedAsBlank = sales.Count(s => string.IsNullOrEmpty(s.ChassisNo));
             var afterBlankFilter = sales
@@ -1001,6 +1049,7 @@ public class DataSyncService
             var token = await _erpApi.GetValidTokenAsync();
             var dispatches = await _erpApi.FetchVdrAsync(startDate, endDate, token);
             result.RecordsFetched = dispatches.Count;
+            _logger.LogInformation("VDR {from:yyyy-MM-dd}..{to:yyyy-MM-dd}: ERP returned {n} row(s).", startDate, endDate, dispatches.Count);
 
             var droppedAsBlank = dispatches.Count(d => string.IsNullOrEmpty(d.ChassisNo));
             var afterBlankFilter = dispatches
@@ -1478,6 +1527,24 @@ public class DataSyncService
             return total;
         }
 
+        // ZERO-ROW CHECK: every dealer answered (HTTP 200, no error) but not one row came back for the
+        // whole 2020→today range. The ERP may refuse or silently empty very long ranges, so re-fetch every
+        // dealer in yearly slices before accepting "no data".
+        var zeroProbe = false;
+        if (pass1.RecordsFetched == 0 && failedDealers.Count == 0)
+        {
+            using var probeScope = _scopeFactory.CreateScope();
+            var probeDb = probeScope.ServiceProvider.GetRequiredService<AppDbContext>();
+            failedDealers = await probeDb.DmsDealers
+                .Where(d => d.DealerCode != null)
+                .Select(d => d.DealerCode!)
+                .Distinct()
+                .ToListAsync(CancellationToken.None);
+            zeroProbe = failedDealers.Count > 0;
+            if (zeroProbe)
+                _logger.LogWarning("LOR: full-range fetch returned 0 rows for all {n} dealers — retrying every dealer in yearly slices.", failedDealers.Count);
+        }
+
         var stillFailed = new List<string>();
 
         foreach (var dealer in failedDealers.Distinct(StringComparer.OrdinalIgnoreCase).ToList())
@@ -1506,6 +1573,13 @@ public class DataSyncService
             }
 
             if (dealerFailed) stillFailed.Add(dealer);
+        }
+
+        if (zeroProbe && total.RecordsFetched == 0 && stillFailed.Count == 0)
+        {
+            total.Error = "LineOrderReport: the ERP returned 0 rows for every dealer, for the full range AND for yearly slices " +
+                          "(HTTP 200, no error) — the ERP LOR API returned no data; this is not a database problem.";
+            _logger.LogError("{msg}", total.Error);
         }
 
         if (stillFailed.Count > 0)
@@ -1575,8 +1649,10 @@ public class DataSyncService
     //                  If the ERP is down at midnight the existing data is left untouched (it
     //                  re-checks every 10 min, up to 6 times) instead of being wiped and
     //                  replaced with nothing.
-    //  2. TRUNCATE   — ServiceHistory, VehicleSales, VehicleDispatches, LineOrderReport.
-    //  3. RE-FETCH   — dealers, then each report; failed chunks/dealers are retried and
+    //  2. DEALERS    — dealer + call-centre dealer sync BEFORE the truncate (long step; DMS_Dealers
+    //                  is not truncated), so a stopped process cannot leave the data tables empty here.
+    //  3. TRUNCATE + RE-FETCH — ServiceHistory, VehicleSales, VehicleDispatches, LineOrderReport are
+    //                  truncated, then each report is fetched; failed chunks/dealers are retried and
     //                  reported, never swallowed.
     //  4. VALIDATE   — every table must have rows. "Success" only when there were no failed
     //                  chunks AND no empty tables; otherwise "PartialFailure".
@@ -1607,12 +1683,20 @@ public class DataSyncService
             catch (Exception ex) { _logger.LogWarning("Could not save reload progress: {msg}", ex.Message); }
         }
 
+        var fetchedBy = new Dictionary<string, long>();
+
         void Collect(string name, SyncResult r)
         {
             overall.RecordsFetched  += r.RecordsFetched;
             overall.RecordsInserted += r.RecordsInserted;
+            fetchedBy[name] = fetchedBy.GetValueOrDefault(name) + r.RecordsFetched;
             if (!string.IsNullOrEmpty(r.Error)) problems.Add($"{name}: {r.Error}");
         }
+
+        // Tells "the ERP sent nothing" apart from "rows were received but not saved".
+        string EmptyWhy(string name) => fetchedBy.GetValueOrDefault(name) == 0
+            ? $"{name} table is EMPTY after reload — ERP returned 0 rows (fetched=0): ERP/API side, not a DB write problem"
+            : $"{name} table is EMPTY after reload — {fetchedBy[name]} rows were fetched but none saved: DB write problem, check 'Skipping' warnings";
 
         try
         {
@@ -1620,24 +1704,35 @@ public class DataSyncService
             await Step("preflight: checking ERP login and report API");
             await WaitForErpHealthyAsync(end, ct);
 
-            // 2 ── TRUNCATE
+            // 2 ── DEALERS: the per-pincode ERP sync (GET /V1/callcenter/pin, ~900 calls) is SKIPPED by
+            //      default so the four reports start loading straight after the preflight. It runs only
+            //      when DMS_Dealers is empty (LOR needs dealer codes) or Sync:RefreshDealers = true.
+            //      DMS_Dealers is never truncated, so this step cannot lose report data either way.
+            var dealersEmpty = !await db.DmsDealers.AnyAsync(CancellationToken.None);
+            if (dealersEmpty || _config.GetValue("Sync:RefreshDealers", false))
+            {
+                await Step(dealersEmpty
+                    ? "dealers (pincode sync) — DMS_Dealers is empty, required for LOR — data tables NOT truncated yet"
+                    : "dealers (pincode sync) — Sync:RefreshDealers=true — data tables NOT truncated yet");
+                Collect("Dealers", await SyncAllDealersAsync());
+                ct.ThrowIfCancellationRequested();
+
+                await Step("call-centre dealers — data tables NOT truncated yet");
+                Collect("CallCentreDealers", await SyncCallCentreDealersAsync());
+                ct.ThrowIfCancellationRequested();
+            }
+            else
+            {
+                _logger.LogInformation("Nightly full reload — dealer pincode sync skipped (Sync:RefreshDealers=false, DMS_Dealers has rows).");
+            }
+
+            // 3 ── TRUNCATE, then immediately re-fetch the reports
             await Step("truncating ServiceHistory, VehicleSales, VehicleDispatches, LineOrderReport");
             truncated = true;   // set BEFORE the call: a failure part-way leaves the tables in an unknown state
             await TruncateAllDataTablesAsync();
 
-            // 3 ── RE-FETCH
-            await Step("dealers (pincode sync)");
-            Collect("Dealers", await SyncAllDealersAsync());
-            ct.ThrowIfCancellationRequested();
-
-            await Step("call-centre dealers");
-            Collect("CallCentreDealers", await SyncCallCentreDealersAsync());
-            ct.ThrowIfCancellationRequested();
-
-            await Step($"ServiceHistory {start:yyyy-MM-dd} → {end:yyyy-MM-dd}");
-            Collect("ServiceHistory", await BackfillHistoricalDataAsync(start, end, ct));
-            ct.ThrowIfCancellationRequested();
-
+            // ORDER: the three faster reports first, the slow ServiceHistory (DJR, hours) LAST. Before this
+            // change DJR ran first and a stop or ERP slowness during it left VSR/VDR/LOR at 0 rows.
             await Step($"VehicleSales {start:yyyy-MM-dd} → {end:yyyy-MM-dd}");
             Collect("VehicleSales", await BackfillVehicleSalesAsync(start, end, ct));
             ct.ThrowIfCancellationRequested();
@@ -1650,6 +1745,10 @@ public class DataSyncService
             Collect("LineOrderReport", await BackfillLineOrderReportAsync(start, end, ct));
             ct.ThrowIfCancellationRequested();
 
+            await Step($"ServiceHistory {start:yyyy-MM-dd} → {end:yyyy-MM-dd}");
+            Collect("ServiceHistory", await BackfillHistoricalDataAsync(start, end, ct));
+            ct.ThrowIfCancellationRequested();
+
             // 4 ── VALIDATE
             await Step("validating row counts");
             var nService  = await db.DmsServiceHistories.CountAsync(CancellationToken.None);
@@ -1657,10 +1756,10 @@ public class DataSyncService
             var nDispatch = await db.DmsVehicleDispatches.CountAsync(CancellationToken.None);
             var nLor      = await db.DmsLineOrderReports.CountAsync(CancellationToken.None);
 
-            if (nService  == 0) problems.Add("ServiceHistory table is EMPTY after reload");
-            if (nSales    == 0) problems.Add("VehicleSales table is EMPTY after reload");
-            if (nDispatch == 0) problems.Add("VehicleDispatches table is EMPTY after reload");
-            if (nLor      == 0) problems.Add("LineOrderReport table is EMPTY after reload");
+            if (nService  == 0) problems.Add(EmptyWhy("ServiceHistory"));
+            if (nSales    == 0) problems.Add(EmptyWhy("VehicleSales"));
+            if (nDispatch == 0) problems.Add(EmptyWhy("VehicleDispatches"));
+            if (nLor      == 0) problems.Add(EmptyWhy("LineOrderReport"));
 
             var counts = $"rows: ServiceHistory={nService}, VehicleSales={nSales}, VehicleDispatches={nDispatch}, LineOrderReport={nLor}";
 
@@ -1712,6 +1811,412 @@ public class DataSyncService
         }
 
         return overall;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // LOAD MISSING TABLES — NO TRUNCATE
+    // Loads only the report tables that are EMPTY (or the ones you name), from
+    // SyncSettings:HistoricalStartDate (or the given from/to) up to today (IST). Nothing is deleted:
+    // the Backfill* methods are insert-only (rows that already exist are skipped), so a table that
+    // already holds data — e.g. ServiceHistory with 4,59,465 rows — is left untouched and is not re-fetched.
+    //
+    //   onlyTables : any of "djr", "vsr", "vdr", "lor" (null/empty = every table that is empty now)
+    //   from / to  : optional range (e.g. to repair two failed months after an ERP/parser fix)
+    //
+    // Dealers (pincode API) are called only if LOR is selected and DMS_Dealers is empty.
+    // Outcome is written to the sync log (SyncType = 'MissingTablesLoad').
+    // ─────────────────────────────────────────────────────────
+    public async Task<SyncResult> RunMissingTablesLoadAsync(
+        IReadOnlyCollection<string>? onlyTables = null, DateTime? from = null, DateTime? to = null,
+        CancellationToken ct = default)
+    {
+        var overall  = new SyncResult { SyncType = "MissingTablesLoad" };
+        var problems = new List<string>();
+
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var log = new DmsSyncLog { SyncType = "MissingTablesLoad", StartedAt = DateTime.UtcNow, Status = "Running" };
+        db.DmsSyncLogs.Add(log);
+        await db.SaveChangesAsync();
+
+        var start = (from ?? DateTime.Parse(_config["SyncSettings:HistoricalStartDate"] ?? "2020-01-01")).Date;
+        var end   = (to   ?? DateTime.UtcNow.AddMinutes(330).Date).Date;   // today in IST (UTC+5:30)
+        var fetchedBy = new Dictionary<string, long>();
+
+        async Task Step(string text)
+        {
+            _logger.LogInformation("Missing-tables load — {step}", text);
+            log.ErrorMessage = Trunc("Progress: " + text, 1800);
+            try { await db.SaveChangesAsync(CancellationToken.None); }
+            catch (Exception ex) { _logger.LogWarning("Could not save load progress: {msg}", ex.Message); }
+        }
+
+        void Collect(string name, SyncResult r)
+        {
+            overall.RecordsFetched  += r.RecordsFetched;
+            overall.RecordsInserted += r.RecordsInserted;
+            fetchedBy[name] = fetchedBy.GetValueOrDefault(name) + r.RecordsFetched;
+            if (!string.IsNullOrEmpty(r.Error)) problems.Add($"{name}: {r.Error}");
+        }
+
+        string EmptyWhy(string name) => fetchedBy.GetValueOrDefault(name) == 0
+            ? $"{name} table is EMPTY — ERP returned 0 rows (fetched=0): ERP/API side, not a DB write problem"
+            : $"{name} table is EMPTY — {fetchedBy[name]} rows were fetched but none saved: DB write problem, check 'Skipping' warnings";
+
+        try
+        {
+            if (end < start)
+                throw new InvalidOperationException($"Invalid range: to ({end:yyyy-MM-dd}) is before from ({start:yyyy-MM-dd}).");
+
+            // Which tables to load
+            var want = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (onlyTables != null && onlyTables.Count > 0)
+            {
+                foreach (var t in onlyTables)
+                {
+                    var k = t.Trim().ToLowerInvariant();
+                    if (k is "djr" or "vsr" or "vdr" or "lor") want.Add(k);
+                    else throw new InvalidOperationException($"Unknown table '{t}'. Use djr, vsr, vdr, lor.");
+                }
+            }
+            else
+            {
+                if (!await db.DmsServiceHistories.AnyAsync(CancellationToken.None))    want.Add("djr");
+                if (!await db.DmsVehicleSales.AnyAsync(CancellationToken.None))        want.Add("vsr");
+                if (!await db.DmsVehicleDispatches.AnyAsync(CancellationToken.None))   want.Add("vdr");
+                if (!await db.DmsLineOrderReports.AnyAsync(CancellationToken.None))    want.Add("lor");
+            }
+
+            if (want.Count == 0)
+            {
+                log.Status       = "Success";
+                log.ErrorMessage = "Nothing to load — all four tables already have data.";
+                _logger.LogInformation("Missing-tables load: nothing to do, all four tables have data.");
+                return overall;
+            }
+
+            var label = string.Join(", ", new[] { "vsr", "vdr", "lor", "djr" }.Where(want.Contains).Select(x => x.ToUpperInvariant()));
+            await Step($"loading {label} for {start:yyyy-MM-dd} → {end:yyyy-MM-dd} (no truncate); preflight: checking ERP");
+            await WaitForErpHealthyAsync(end, ct);
+
+            // Dealers only when LOR needs them and the table is empty.
+            if (want.Contains("lor") && !await db.DmsDealers.AnyAsync(CancellationToken.None))
+            {
+                await Step("dealers (pincode sync) — DMS_Dealers is empty, required for LOR");
+                Collect("Dealers", await SyncAllDealersAsync());
+                ct.ThrowIfCancellationRequested();
+            }
+
+            // Faster reports first, slow ServiceHistory last.
+            if (want.Contains("vsr"))
+            {
+                await Step($"VehicleSales {start:yyyy-MM-dd} → {end:yyyy-MM-dd}");
+                Collect("VehicleSales", await BackfillVehicleSalesAsync(start, end, ct));
+                ct.ThrowIfCancellationRequested();
+            }
+            if (want.Contains("vdr"))
+            {
+                await Step($"VehicleDispatches {start:yyyy-MM-dd} → {end:yyyy-MM-dd}");
+                Collect("VehicleDispatches", await BackfillVehicleDispatchesAsync(start, end, ct));
+                ct.ThrowIfCancellationRequested();
+            }
+            if (want.Contains("lor"))
+            {
+                await Step($"LineOrderReport {start:yyyy-MM-dd} → {end:yyyy-MM-dd}");
+                Collect("LineOrderReport", await BackfillLineOrderReportAsync(start, end, ct));
+                ct.ThrowIfCancellationRequested();
+            }
+            if (want.Contains("djr"))
+            {
+                await Step($"ServiceHistory {start:yyyy-MM-dd} → {end:yyyy-MM-dd}");
+                Collect("ServiceHistory", await BackfillHistoricalDataAsync(start, end, ct));
+                ct.ThrowIfCancellationRequested();
+            }
+
+            // Validate: every table that was requested must have rows now.
+            await Step("validating row counts");
+            var nService  = await db.DmsServiceHistories.CountAsync(CancellationToken.None);
+            var nSales    = await db.DmsVehicleSales.CountAsync(CancellationToken.None);
+            var nDispatch = await db.DmsVehicleDispatches.CountAsync(CancellationToken.None);
+            var nLor      = await db.DmsLineOrderReports.CountAsync(CancellationToken.None);
+
+            if (want.Contains("djr") && nService  == 0) problems.Add(EmptyWhy("ServiceHistory"));
+            if (want.Contains("vsr") && nSales    == 0) problems.Add(EmptyWhy("VehicleSales"));
+            if (want.Contains("vdr") && nDispatch == 0) problems.Add(EmptyWhy("VehicleDispatches"));
+            if (want.Contains("lor") && nLor      == 0) problems.Add(EmptyWhy("LineOrderReport"));
+
+            var counts = $"loaded {label}, {start:yyyy-MM-dd}..{end:yyyy-MM-dd}; fetched={overall.RecordsFetched}, inserted={overall.RecordsInserted}; "
+                       + $"rows: ServiceHistory={nService}, VehicleSales={nSales}, VehicleDispatches={nDispatch}, LineOrderReport={nLor}";
+
+            if (problems.Count == 0)
+            {
+                log.Status       = "Success";
+                log.ErrorMessage = Trunc("OK — " + counts, 1800);
+                _logger.LogInformation("Missing-tables load complete: {counts}", counts);
+            }
+            else
+            {
+                log.Status       = "PartialFailure";
+                log.ErrorMessage = Trunc(string.Join(" | ", problems) + " || " + counts, 1800);
+                overall.Error    = log.ErrorMessage;
+                _logger.LogError("Missing-tables load finished WITH PROBLEMS: {problems} || {counts}",
+                    string.Join(" | ", problems), counts);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            log.Status       = "Interrupted";
+            log.ErrorMessage = "INTERRUPTED (app shutting down). Nothing was deleted; run it again — rows already loaded are skipped.";
+            overall.Error    = log.ErrorMessage;
+            _logger.LogWarning("Missing-tables load interrupted: {msg}", log.ErrorMessage);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            log.Status       = "Failed";
+            log.ErrorMessage = Trunc("FAILED (nothing deleted): " + (ex.InnerException?.Message ?? ex.Message), 1800);
+            overall.Error    = log.ErrorMessage;
+            _logger.LogError(ex, "Missing-tables load failed");
+        }
+        finally
+        {
+            log.CompletedAt     = DateTime.UtcNow;
+            log.RecordsFetched  = overall.RecordsFetched;
+            log.RecordsInserted = overall.RecordsInserted;
+            log.RecordsUpdated  = 0;
+            try { await db.SaveChangesAsync(CancellationToken.None); }
+            catch (Exception saveEx) { _logger.LogError(saveEx, "Could not write the MissingTablesLoad sync-log row"); }
+        }
+
+        return overall;
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // DAILY ROLLING-WINDOW SYNC — NO TRUNCATE
+    // Fetches the last Sync:RollingMonths months (default 6) up to today (IST) for all four ERP
+    // reports, date range by date range, and UPSERTS them: new rows are inserted, changed rows are
+    // updated, nothing is deleted. The tables are never empty and older history is left alone, so
+    // it is safe to run at any hour and a stopped process loses nothing.
+    //
+    //   ServiceHistory (DJR)  monthly windows        VehicleSales (VSR)       7-day windows
+    //   VehicleDispatches     7-day windows          LineOrderReport (LOR)    per dealer, whole window
+    //
+    // A failed window is retried once; anything still failing is listed in the sync-log row
+    // (SyncType = 'DailyWindowSync') and the run ends "PartialFailure" instead of a silent "Success".
+    // Dealers are refreshed LAST (long pincode step) unless DMS_Dealers is empty, in which case they
+    // are loaded first because LOR needs them.
+    // ─────────────────────────────────────────────────────────
+    public async Task<SyncResult> RunDailyWindowSyncAsync(CancellationToken ct = default)
+    {
+        var overall  = new SyncResult { SyncType = "DailyWindowSync" };
+        var problems = new List<string>();
+        var notes    = new List<string>();
+
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var log = new DmsSyncLog { SyncType = "DailyWindowSync", StartedAt = DateTime.UtcNow, Status = "Running" };
+        db.DmsSyncLogs.Add(log);
+        await db.SaveChangesAsync();
+
+        var months = Math.Clamp(_config.GetValue("Sync:RollingMonths", 6), 1, 36);
+        var end    = DateTime.UtcNow.AddMinutes(330).Date;   // today in IST (UTC+5:30)
+        var start  = end.AddMonths(-months);
+
+        async Task Step(string text)
+        {
+            _logger.LogInformation("Daily window sync — {step}", text);
+            log.ErrorMessage = Trunc("Progress: " + text, 1800);
+            try { await db.SaveChangesAsync(CancellationToken.None); }
+            catch (Exception ex) { _logger.LogWarning("Could not save sync progress: {msg}", ex.Message); }
+        }
+
+        void Add(SyncResult r)
+        {
+            overall.RecordsFetched  += r.RecordsFetched;
+            overall.RecordsInserted += r.RecordsInserted;
+            overall.RecordsUpdated  += r.RecordsUpdated;
+        }
+
+        // One report, split into date windows. Each window is retried once if it fails.
+        async Task Windows(string name, Func<DateTime, DateTime> windowEnd, Func<DateTime, DateTime, Task<SyncResult>> run)
+        {
+            var failed = new List<string>();
+            var ws = start;
+            while (ws <= end)
+            {
+                ct.ThrowIfCancellationRequested();
+                var we = windowEnd(ws);
+                if (we > end) we = end;
+
+                await Step($"{name} {ws:yyyy-MM-dd}..{we:yyyy-MM-dd}");
+                var r = await run(ws, we);
+                Add(r);
+                if (!string.IsNullOrEmpty(r.Error))
+                {
+                    _logger.LogWarning("{name} window {a}..{b} failed, retrying once: {err}", name, ws, we, r.Error);
+                    r = await run(ws, we);
+                    Add(r);
+                    if (!string.IsNullOrEmpty(r.Error))
+                        failed.Add($"{ws:yyyy-MM-dd}..{we:yyyy-MM-dd}: {r.Error}");
+                }
+                ws = we.AddDays(1);
+            }
+            if (failed.Count > 0)
+                problems.Add($"{name}: {failed.Count} window(s) failed after retry — INCOMPLETE for " + string.Join(" | ", failed));
+        }
+
+        try
+        {
+            await Step($"window {start:yyyy-MM-dd} → {end:yyyy-MM-dd} ({months} months), upsert, no truncate");
+
+            // Dealers first ONLY when the table is empty (LOR needs them).
+            var dealersEmpty = !await db.DmsDealers.AnyAsync(CancellationToken.None);
+            if (dealersEmpty)
+            {
+                await Step("dealers (pincode sync) — DMS_Dealers was empty");
+                var d = await SyncAllDealersAsync();
+                Add(d);
+                if (!string.IsNullOrEmpty(d.Error)) problems.Add("Dealers: " + d.Error);
+                ct.ThrowIfCancellationRequested();
+            }
+
+            await Windows("ServiceHistory",    s => new DateTime(s.Year, s.Month, 1).AddMonths(1).AddDays(-1), (a, b) => UpsertDjrAdaptiveAsync(a, b));
+            await Windows("VehicleSales",      s => s.AddDays(6),               (a, b) => UpsertVehicleSalesForRangeAsync(a, b));
+            await Windows("VehicleDispatches", s => s.AddDays(6),               (a, b) => UpsertVehicleDispatchesForRangeAsync(a, b));
+
+            // LOR: one ERP call per dealer for the whole window; failed dealers are retried once.
+            await Step($"LineOrderReport {start:yyyy-MM-dd}..{end:yyyy-MM-dd} (all dealers)");
+            var failedDealers = new List<string>();
+            var lor = await UpsertLineOrderReportAsync(start, end, failedDealers);
+            Add(lor);
+            if (!string.IsNullOrEmpty(lor.Error)) problems.Add("LineOrderReport: " + lor.Error);
+            ct.ThrowIfCancellationRequested();
+
+            if (failedDealers.Count > 0)
+            {
+                await Step($"LineOrderReport retry for {failedDealers.Count} failed dealer(s)");
+                var stillFailed = new List<string>();
+                Add(await UpsertLineOrderReportAsync(start, end, stillFailed, failedDealers.ToList()));
+                if (stillFailed.Count > 0)
+                    problems.Add($"LineOrderReport: {stillFailed.Count} dealer(s) failed after retry: "
+                                 + string.Join(", ", stillFailed.Take(20)));
+            }
+
+            // Dealer refresh (GET /V1/callcenter/pin, ~900 calls) only when explicitly enabled.
+            // OFF by default: the four reports are what the business needs every morning.
+            if (_config.GetValue("Sync:RefreshDealers", false))
+            {
+                if (!dealersEmpty)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await Step("dealers refresh (pincode sync)");
+                    var d = await SyncAllDealersAsync();
+                    Add(d);
+                    if (!string.IsNullOrEmpty(d.Error)) notes.Add("Dealers refresh: " + d.Error);
+                }
+                ct.ThrowIfCancellationRequested();
+                await Step("call-centre dealers refresh");
+                var cc = await SyncCallCentreDealersAsync();
+                Add(cc);
+                if (!string.IsNullOrEmpty(cc.Error)) notes.Add("CallCentreDealers: " + cc.Error);
+            }
+            else
+            {
+                notes.Add("dealer pincode refresh skipped (Sync:RefreshDealers=false)");
+            }
+
+            // Validate
+            await Step("validating row counts");
+            var nService  = await db.DmsServiceHistories.CountAsync(CancellationToken.None);
+            var nSales    = await db.DmsVehicleSales.CountAsync(CancellationToken.None);
+            var nDispatch = await db.DmsVehicleDispatches.CountAsync(CancellationToken.None);
+            var nLor      = await db.DmsLineOrderReports.CountAsync(CancellationToken.None);
+
+            if (nService  == 0) problems.Add("ServiceHistory table is EMPTY");
+            if (nSales    == 0) problems.Add("VehicleSales table is EMPTY");
+            if (nDispatch == 0) problems.Add("VehicleDispatches table is EMPTY");
+            if (nLor      == 0) problems.Add("LineOrderReport table is EMPTY");
+
+            var counts = $"window {start:yyyy-MM-dd}..{end:yyyy-MM-dd}; fetched={overall.RecordsFetched}, inserted={overall.RecordsInserted}, updated={overall.RecordsUpdated}; "
+                       + $"rows: ServiceHistory={nService}, VehicleSales={nSales}, VehicleDispatches={nDispatch}, LineOrderReport={nLor}";
+            var noteText = notes.Count > 0 ? " | NOTES: " + string.Join(" | ", notes) : "";
+
+            if (problems.Count == 0)
+            {
+                log.Status       = "Success";
+                log.ErrorMessage = Trunc("OK — " + counts + noteText, 1800);
+                _logger.LogInformation("Daily window sync complete: {counts}", counts);
+            }
+            else
+            {
+                log.Status       = "PartialFailure";
+                log.ErrorMessage = Trunc(string.Join(" | ", problems) + " || " + counts + noteText, 1800);
+                overall.Error    = log.ErrorMessage;
+                _logger.LogError("Daily window sync finished WITH PROBLEMS: {problems} || {counts}",
+                    string.Join(" | ", problems), counts);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            log.Status       = "Interrupted";
+            log.ErrorMessage = "INTERRUPTED (app shutting down). Nothing was deleted; the next run upserts the same window again.";
+            overall.Error    = log.ErrorMessage;
+            _logger.LogWarning("Daily window sync interrupted: {msg}", log.ErrorMessage);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            log.Status       = "Failed";
+            log.ErrorMessage = Trunc("FAILED (nothing deleted): " + (ex.InnerException?.Message ?? ex.Message), 1800);
+            overall.Error    = log.ErrorMessage;
+            _logger.LogError(ex, "Daily window sync failed");
+        }
+        finally
+        {
+            log.CompletedAt     = DateTime.UtcNow;
+            log.RecordsFetched  = overall.RecordsFetched;
+            log.RecordsInserted = overall.RecordsInserted;
+            log.RecordsUpdated  = overall.RecordsUpdated;
+            try { await db.SaveChangesAsync(CancellationToken.None); }
+            catch (Exception saveEx) { _logger.LogError(saveEx, "Could not write the DailyWindowSync sync-log row"); }
+        }
+
+        return overall;
+    }
+
+    // Upsert variant of the DJR fallback: if a window fails, split it into halves (down to
+    // Sync:DjrMinWindowDays) and upsert each piece. Returns a combined result; Error is set only if a
+    // piece still fails at the minimum size. Upsert is idempotent, so repeating a window is safe.
+    private async Task<SyncResult> UpsertDjrAdaptiveAsync(DateTime from, DateTime to)
+    {
+        var minDays = Math.Clamp(_config.GetValue("Sync:DjrMinWindowDays", 1), 1, 31);
+        var total   = new SyncResult { SyncType = "ServiceHistoryUpsert" };
+        var errors  = new List<string>();
+
+        async Task Solve(DateTime a, DateTime b, bool retried)
+        {
+            var r = await UpsertServiceHistoryForRangeAsync(a, b);
+            total.RecordsFetched  += r.RecordsFetched;
+            total.RecordsInserted += r.RecordsInserted;
+            total.RecordsUpdated  += r.RecordsUpdated;
+            if (string.IsNullOrEmpty(r.Error)) return;
+
+            if (!retried && !IsDeterministicParseError(r.Error)) { await Solve(a, b, true); return; }
+
+            var days = (b - a).Days + 1;
+            if (days <= minDays) { errors.Add($"{a:yyyy-MM-dd}..{b:yyyy-MM-dd}: {r.Error}"); return; }
+
+            var mid = a.AddDays(days / 2 - 1);
+            _logger.LogWarning("DJR upsert window {a:yyyy-MM-dd}..{b:yyyy-MM-dd} still failing — splitting at {m:yyyy-MM-dd}", a, b, mid);
+            await Solve(a, mid, false);
+            await Solve(mid.AddDays(1), b, false);
+        }
+
+        await Solve(from, to, false);
+        if (errors.Count > 0) total.Error = string.Join(" | ", errors);
+        return total;
     }
 
     // Do not truncate until the ERP can actually serve data: login must work and one real DJR
@@ -2045,7 +2550,13 @@ public class DataSyncService
         return result;
     }
 
-    public async Task<SyncResult> UpsertLineOrderReportAsync(DateTime startDate, DateTime endDate)
+    // failedDealers (optional): receives the dealer codes whose ERP fetch failed, so a caller can retry
+    // just those. onlyDealers (optional): restrict the run to these dealer codes. Both default to null,
+    // which keeps the behaviour of the existing PUT endpoint unchanged.
+    public async Task<SyncResult> UpsertLineOrderReportAsync(
+        DateTime startDate, DateTime endDate,
+        List<string>? failedDealers = null,
+        IReadOnlyCollection<string>? onlyDealers = null)
     {
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -2070,10 +2581,14 @@ public class DataSyncService
                 .Distinct()
                 .ToListAsync();
 
+            if (onlyDealers != null)
+                dealerCodes = dealerCodes.Where(c => onlyDealers.Contains(c)).ToList();
+
             if (!dealerCodes.Any())
             {
                 log.Status = "Failed";
                 log.ErrorMessage = "No dealers in DMS_Dealers. Run dealer sync first.";
+                result.Error = log.ErrorMessage;
                 log.CompletedAt = DateTime.UtcNow;
                 await db.SaveChangesAsync();
                 return result;
@@ -2153,10 +2668,12 @@ public class DataSyncService
                 catch (Exception ex)
                 {
                     _logger.LogWarning("LOR upsert fetch failed for dealer {dc}: {msg}", dealerCode, ex.Message);
+                    failedDealers?.Add(dealerCode);
                 }
             }
 
-            log.ErrorMessage = $"{skippedOnError} per-record error(s). UPSERT mode.";
+            log.ErrorMessage = $"{skippedOnError} per-record error(s). UPSERT mode."
+                + (failedDealers is { Count: > 0 } ? $" {failedDealers.Count} dealer fetch(es) failed." : "");
             log.Status = "Success";
         }
         catch (Exception ex)
