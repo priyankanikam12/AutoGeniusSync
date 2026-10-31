@@ -12,6 +12,13 @@ namespace AutoGeniusSync.Services;
 public sealed record ErpProbeResult(
     int HttpStatus, bool? Valid, string? Description, int Rows, int BodyChars, long Ms, string? TopLevelKeys, string? Error);
 
+// Thrown when the ERP answers HTTP 200 with Valid=false and a description such as "Unauthorized".
+// That is an access problem (wrong/limited token or login), NOT "no data" — it must never be loaded as 0 rows.
+public sealed class ErpAuthorizationException : Exception
+{
+    public ErpAuthorizationException(string message) : base(message) { }
+}
+
 public class ErpApiService
 {
     private readonly IHttpClientFactory _httpFactory;
@@ -40,6 +47,17 @@ public class ErpApiService
     // Number of ERP records that were cut out of a response because they were malformed beyond repair
     // (see DeserializeTolerant). Process-wide; DataSyncService reads the difference before/after a run and
     // prints it in the sync log, so skipped records are never silent.
+    // Time of the last forced re-login (avoids a login storm if the ERP keeps refusing).
+    private static DateTime _lastForcedRefreshUtc = DateTime.MinValue;
+
+    private static bool LooksLikeAuthRefusal(string? description)
+    {
+        if (string.IsNullOrWhiteSpace(description)) return false;
+        var d = description.ToLowerInvariant();
+        return d.Contains("unauthor") || d.Contains("forbidden") || d.Contains("access denied")
+            || d.Contains("invalid token") || d.Contains("token expired") || d.Contains("not authori");
+    }
+
     private static long _malformedRecordsDropped;
     public static long MalformedRecordsDropped => Interlocked.Read(ref _malformedRecordsDropped);
 
@@ -484,6 +502,16 @@ public class ErpApiService
         return await resp.Content.ReadAsStringAsync();
     }
 
+    // Deactivates every stored token and logs in again with THIS server's own configured ERP credentials.
+    // Used when the ERP answers "Unauthorized": the stored token may have been created by another
+    // instance (e.g. a desktop copy with different credentials) that shares the same database.
+    private async Task<string> ForceRefreshTokenAsync()
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        return await RefreshTokenAsync(db);
+    }
+
     // ─────────────────────────────────────────────────────────
     // READ-ONLY PROBE — one call, no retry, nothing stored.
     // Returns what the ERP actually answered: HTTP status, Valid flag, the ERP's own Description
@@ -601,6 +629,7 @@ public class ErpApiService
         {
             var timeoutSeconds = _config.GetValue<int>("AutoGeniusERP:HttpTimeoutSeconds", 120);
             Exception? lastException = null;
+            var tokenRefreshed = false;
 
             for (int attempt = 1; attempt <= maxRetries; attempt++)
             {
@@ -676,6 +705,23 @@ public class ErpApiService
                 {
                     // Bubble parse failures straight up — no point retrying
                     // identical malformed content from the same request.
+                    throw;
+                }
+                catch (ErpAuthorizationException authEx)
+                {
+                    // "Unauthorized": try ONCE with a fresh login from this server's own credentials
+                    // (the stored token may belong to another instance/login). Not counted as a retry.
+                    if (!tokenRefreshed && DateTime.UtcNow - _lastForcedRefreshUtc > TimeSpan.FromMinutes(2))
+                    {
+                        tokenRefreshed = true;
+                        _lastForcedRefreshUtc = DateTime.UtcNow;
+                        _logger.LogWarning(
+                            "{msg} — refreshing the ERP token with this server's own credentials and retrying once.",
+                            authEx.Message);
+                        token = await ForceRefreshTokenAsync();
+                        attempt--;
+                        continue;
+                    }
                     throw;
                 }
                 catch (Exception ex)
@@ -1076,9 +1122,10 @@ public class ErpApiService
 
                 if (result?.Valid != true)
                 {
-                    _logger.LogWarning(
-                        "ERP replied Valid=false for {url}: {desc}",
-                        url, Trunc(result?.Description ?? "(no description)", 200));
+                    var desc = Trunc(result?.Description ?? "(no description)", 200);
+                    _logger.LogWarning("ERP replied Valid=false for {url}: {desc}", url, desc);
+                    if (LooksLikeAuthRefusal(result?.Description))
+                        throw new ErpAuthorizationException($"ERP authorization refused ('{desc}') for {url}");
                     return new();
                 }
 
@@ -1120,9 +1167,10 @@ public class ErpApiService
             var valid = root["Valid"]?.Value<bool>() ?? false;
             if (!valid)
             {
-                _logger.LogWarning(
-                    "Tolerant parse: API returned Valid=false for {url}: {desc}",
-                    url, Trunc((root["Description"] ?? root["description"])?.ToString() ?? "(no description)", 200));
+                var tdesc = Trunc((root["Description"] ?? root["description"])?.ToString() ?? "(no description)", 200);
+                _logger.LogWarning("Tolerant parse: API returned Valid=false for {url}: {desc}", url, tdesc);
+                if (LooksLikeAuthRefusal(tdesc))
+                    throw new ErpAuthorizationException($"ERP authorization refused ('{tdesc}') for {url}");
                 return new();
             }
 
@@ -1167,6 +1215,10 @@ public class ErpApiService
                 "Tolerant parse recovered {n} items from {url}", items.Count, url);
 
             return items;
+        }
+        catch (ErpAuthorizationException)
+        {
+            throw;   // keep the type so PostWithRetryAsync can re-login once
         }
         catch (Exception ex)
         {

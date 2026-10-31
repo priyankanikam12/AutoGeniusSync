@@ -530,6 +530,12 @@ public class DataSyncService
             var err = await Attempt(a, b);
             if (err == null) return;
 
+            if (IsErpAuthError(err))
+            {
+                failedChunks.Add($"{a:yyyy-MM-dd}..{b:yyyy-MM-dd}: {err} — load STOPPED, remaining windows not attempted");
+                return;
+            }
+
             if (!IsDeterministicParseError(err))
             {
                 _logger.LogWarning("ServiceHistory window {a:yyyy-MM-dd}..{b:yyyy-MM-dd} failed, retrying once: {err}", a, b, err);
@@ -590,6 +596,7 @@ public class DataSyncService
                 // and a month that keeps timing out is split into smaller pieces (see
                 // SyncDjrAdaptiveAsync) instead of being given up on.
                 await SyncDjrAdaptiveAsync(chunkStart, chunkEnd, totalResult, failedChunks, ct);
+                if (failedChunks.Any(IsErpAuthError)) break;   // ERP refuses access: stop, do not call it for every month
 
                 chunkStart = chunkEnd.AddDays(1);
             }
@@ -874,6 +881,12 @@ public class DataSyncService
                 var r = await SyncVehicleSalesForRangeAsync(chunkStart, chunkEnd);
                 totalResult.RecordsFetched  += r.RecordsFetched;
                 totalResult.RecordsInserted += r.RecordsInserted;
+
+                if (IsErpAuthError(r.Error))
+                {
+                    failedChunks.Add($"{chunkStart:yyyy-MM-dd}..: {r.Error} — load STOPPED, remaining windows not attempted");
+                    break;
+                }
 
                 if (!string.IsNullOrEmpty(r.Error))
                 {
@@ -1255,6 +1268,12 @@ public class DataSyncService
                 totalResult.RecordsFetched  += r.RecordsFetched;
                 totalResult.RecordsInserted += r.RecordsInserted;
 
+                if (IsErpAuthError(r.Error))
+                {
+                    failedChunks.Add($"{chunkStart:yyyy-MM-dd}..: {r.Error} — load STOPPED, remaining windows not attempted");
+                    break;
+                }
+
                 if (!string.IsNullOrEmpty(r.Error))
                 {
                     _logger.LogWarning("VehicleDispatches window {from}-{to} failed, retrying once: {err}",
@@ -1446,6 +1465,7 @@ public class DataSyncService
                 }
                 catch (Exception ex)
                 {
+                    if (IsErpAuthError(ex.Message)) throw;   // access refused: stop, do not try every dealer
                     _logger.LogWarning("LOR fetch failed for dealer {dc}: {msg}", dealerCode, ex.Message);
                     failedDealers?.Add(dealerCode);
                 }
@@ -1494,6 +1514,11 @@ public class DataSyncService
 
     // NOTE: SyncLineOrderReportAsync puts its "Dropped: …" statistics into result.Error even on
     // SUCCESS. Only treat Error as a failure when it is not that statistics string.
+    // ERP answered "Unauthorized" (see ErpAuthorizationException): an access problem, not "no data".
+    // Loops stop at the first such error instead of calling the ERP hundreds of times.
+    private static bool IsErpAuthError(string? error)
+        => error != null && error.Contains("ERP authorization refused", StringComparison.OrdinalIgnoreCase);
+
     private static bool IsLorFailure(SyncResult r)
         => !string.IsNullOrEmpty(r.Error) && !r.Error.StartsWith("Dropped:", StringComparison.Ordinal);
 
@@ -2123,6 +2148,11 @@ public class DataSyncService
                 await Step($"{name} {ws:yyyy-MM-dd}..{we:yyyy-MM-dd}");
                 var r = await run(ws, we);
                 Add(r);
+                if (IsErpAuthError(r.Error))
+                {
+                    failed.Add($"{ws:yyyy-MM-dd}..: {r.Error} — {name} STOPPED, remaining windows not attempted");
+                    break;
+                }
                 if (!string.IsNullOrEmpty(r.Error))
                 {
                     _logger.LogWarning("{name} window {a}..{b} failed, retrying once: {err}", name, ws, we, r.Error);
@@ -2274,6 +2304,8 @@ public class DataSyncService
             total.RecordsInserted += r.RecordsInserted;
             total.RecordsUpdated  += r.RecordsUpdated;
             if (string.IsNullOrEmpty(r.Error)) return;
+
+            if (IsErpAuthError(r.Error)) { errors.Add($"{a:yyyy-MM-dd}..{b:yyyy-MM-dd}: {r.Error}"); return; }
 
             if (!retried && !IsDeterministicParseError(r.Error)) { await Solve(a, b, true); return; }
 
@@ -2739,6 +2771,7 @@ public class DataSyncService
                 }
                 catch (Exception ex)
                 {
+                    if (IsErpAuthError(ex.Message)) throw;   // access refused: stop, do not try every dealer
                     _logger.LogWarning("LOR upsert fetch failed for dealer {dc}: {msg}", dealerCode, ex.Message);
                     failedDealers?.Add(dealerCode);
                 }
