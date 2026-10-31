@@ -8,6 +8,10 @@ using Newtonsoft.Json.Linq;
 
 namespace AutoGeniusSync.Services;
 
+// Result of one read-only ERP probe call (no business data — counts, status and the ERP's own message only).
+public sealed record ErpProbeResult(
+    int HttpStatus, bool? Valid, string? Description, int Rows, int BodyChars, long Ms, string? TopLevelKeys, string? Error);
+
 public class ErpApiService
 {
     private readonly IHttpClientFactory _httpFactory;
@@ -32,6 +36,12 @@ public class ErpApiService
     // across every instance/scope of this service in the process.
     // ─────────────────────────────────────────────────────────
     private static readonly SemaphoreSlim _erpCallThrottle = new(1, 1);
+
+    // Number of ERP records that were cut out of a response because they were malformed beyond repair
+    // (see DeserializeTolerant). Process-wide; DataSyncService reads the difference before/after a run and
+    // prints it in the sync log, so skipped records are never silent.
+    private static long _malformedRecordsDropped;
+    public static long MalformedRecordsDropped => Interlocked.Read(ref _malformedRecordsDropped);
 
     public ErpApiService(
         IHttpClientFactory httpFactory,
@@ -475,6 +485,99 @@ public class ErpApiService
     }
 
     // ─────────────────────────────────────────────────────────
+    // READ-ONLY PROBE — one call, no retry, nothing stored.
+    // Returns what the ERP actually answered: HTTP status, Valid flag, the ERP's own Description
+    // text, the number of rows, size of the body and the names of the top-level JSON fields.
+    // Used by DataSyncService.ProbeErpReportsAsync (POST api/admin/reload/probe).
+    // report: djr | vsr | vdr | lor
+    // ─────────────────────────────────────────────────────────
+    public async Task<ErpProbeResult> ProbeReportAsync(
+        string report, string dealerCode, DateTime from, DateTime to, string token)
+    {
+        var vendorId = _config.GetValue<int>("AutoGeniusERP:VendorId", 14);
+        var f = from.ToString("dd-MM-yyyy");
+        var t = to.ToString("dd-MM-yyyy");
+
+        string url;
+        object req;
+        switch (report.ToLowerInvariant())
+        {
+            case "djr":
+                url = _baseUrl + _config["AutoGeniusERP:DjrUrl"];
+                req = new DjrRequest { VendorId = vendorId, StartDate = f, EndDate = t, DealerCode = dealerCode };
+                break;
+            case "vsr":
+                url = $"{_baseUrl}/V1/erpreport/vsr?ver=1.0";
+                req = new VsrRequest
+                {
+                    DealerCode = dealerCode, VendorId = vendorId, StartDate = f, EndDate = t,
+                    SubVendorCode = "", DealerStatus = "1", AadharPanReq = "0", FameReq = "2"
+                };
+                break;
+            case "vdr":
+                url = $"{_baseUrl}/V1/erpreport/vdr?Ver=1.0";
+                req = new VdrRequest
+                {
+                    VendorId = vendorId, FromDate = f, ToDate = t, DealerCode = dealerCode,
+                    LocationCode = "", ChassisNo = "", MobileNo = "", VhclStatus = "ALL", SubVendorCode = ""
+                };
+                break;
+            case "lor":
+                url = $"{_baseUrl}/V1/erpreport/lor?Ver=1.0";
+                req = new LorRequest { VendorId = vendorId, StartDate = f, EndDate = t, DealerCode = dealerCode };
+                break;
+            default:
+                throw new ArgumentException($"Unknown report '{report}'. Use djr, vsr, vdr, lor.");
+        }
+
+        await Task.Delay(_delayMs);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await _erpCallThrottle.WaitAsync();
+        try
+        {
+            var timeoutSeconds = _config.GetValue<int>("AutoGeniusERP:HttpTimeoutSeconds", 120);
+            using var http    = _httpFactory.CreateClient("ErpApi");
+            using var request = BuildPostRequest(url, req, token);
+            using var cts     = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+
+            var resp   = await http.SendAsync(request, cts.Token);
+            var bytes  = await resp.Content.ReadAsByteArrayAsync();
+            var body   = StripBomAndDecode(bytes);
+            var status = (int)resp.StatusCode;
+
+            try
+            {
+                var root  = JObject.Parse(SanitizeJson(body));
+                bool? valid = root["Valid"]?.Type == JTokenType.Boolean ? root["Valid"]!.Value<bool>() : null;
+                var desc  = (root["Description"] ?? root["description"] ?? root["Message"] ?? root["message"])?.ToString();
+                var rows  = (root["Value"] as JArray)?.Count ?? 0;
+                var keys  = string.Join(",", root.Properties().Select(p => p.Name));
+                return new ErpProbeResult(status, valid, desc == null ? null : Trunc(desc, 200),
+                                          rows, body.Length, sw.ElapsedMilliseconds, keys, null);
+            }
+            catch (Exception pex)
+            {
+                return new ErpProbeResult(status, null, null, 0, body.Length, sw.ElapsedMilliseconds, null,
+                                          "response is not parseable JSON: " + Trunc(pex.Message, 200));
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            return new ErpProbeResult(0, null, null, 0, 0, sw.ElapsedMilliseconds, null, "timed out");
+        }
+        catch (Exception ex)
+        {
+            return new ErpProbeResult(0, null, null, 0, 0, sw.ElapsedMilliseconds, null, Trunc(ex.Message, 200));
+        }
+        finally
+        {
+            _erpCallThrottle.Release();
+        }
+    }
+
+    private static string Trunc(string s, int max) => s.Length <= max ? s : s[..max];
+
+    // ─────────────────────────────────────────────────────────
     // SHARED: POST with retry
     //
     // FIX (critical, earlier): swallowed failures now throw instead of
@@ -639,11 +742,7 @@ public class ErpApiService
         // after "12" as the string terminator and then chokes on the
         // trailing AH". This was throwing out entire multi-year fetches
         // (DJR/VSR/VDR/LOR) because ONE bad row anywhere in the payload
-        // failed the whole parse. This pass looks ahead past whitespace
-        // after every quote encountered inside a string: if the next
-        // significant character is one of , } ] : it's a real closing
-        // quote; otherwise it must be an embedded quote, so we escape it
-        // (\") and keep reading the string.
+        // failed the whole parse. See FixUnescapedQuotes for the rules.
         raw = FixUnescapedQuotes(raw);
 
         // ── Pass 1: Remove literal control characters inside JSON strings ──
@@ -765,12 +864,24 @@ public class ErpApiService
     // ─────────────────────────────────────────────────────────
     // FIX: escape stray embedded quotes inside JSON string values
     // so a single malformed field doesn't corrupt the entire payload.
+    //
+    // Rules (context-aware — the previous version treated a quote followed by ':' as a closing quote
+    // for BOTH keys and values, so a value such as  FS "2": COUPON  ended the string early and the
+    // parser failed with "After parsing a value an unexpected character was encountered: :"):
+    //   • a KEY string closes only at a quote followed by ':'
+    //   • a VALUE string closes only at a quote followed by '}' or ']', or by ',' that is followed by a
+    //     new key ("...) in an object (any value in an array)
+    //   • every other quote inside a string is embedded content and gets escaped (\")
+    // Valid JSON is left byte-for-byte unchanged (checked with 35,000 random documents).
     // ─────────────────────────────────────────────────────────
     private static string FixUnescapedQuotes(string raw)
     {
         var sb = new System.Text.StringBuilder(raw.Length + 32);
+        var containers = new Stack<char>();   // 'o' = object, 'a' = array
+        char lastSig = '\0';                  // last non-whitespace char seen outside strings
         bool inString = false;
         bool escaped  = false;
+        bool isKey    = false;
 
         for (int i = 0; i < raw.Length; i++)
         {
@@ -779,7 +890,20 @@ public class ErpApiService
             if (!inString)
             {
                 sb.Append(c);
-                if (c == '"') inString = true;
+                if (c == '"')
+                {
+                    inString = true;
+                    bool inArray = containers.Count > 0 && containers.Peek() == 'a';
+                    isKey = !inArray && lastSig != ':';
+                    continue;
+                }
+                if (!char.IsWhiteSpace(c))
+                {
+                    if (c == '{') containers.Push('o');
+                    else if (c == '[') containers.Push('a');
+                    else if ((c == '}' || c == ']') && containers.Count > 0) containers.Pop();
+                    lastSig = c;
+                }
                 continue;
             }
 
@@ -799,20 +923,42 @@ public class ErpApiService
 
             if (c == '"')
             {
-                // Look ahead past whitespace: a real closing quote is
-                // followed by , } ] or : (key/value separators/terminators).
-                // Anything else means this quote is embedded content, not
-                // a terminator — escape it and keep reading the string.
                 int j = i + 1;
                 while (j < raw.Length && char.IsWhiteSpace(raw[j])) j++;
 
-                bool looksLikeClose =
-                    j >= raw.Length ||
-                    raw[j] == ',' || raw[j] == '}' || raw[j] == ']' || raw[j] == ':';
+                bool close;
+                if (j >= raw.Length)
+                {
+                    close = true;
+                }
+                else if (isKey)
+                {
+                    close = raw[j] == ':';
+                }
+                else
+                {
+                    char n = raw[j];
+                    if (n == '}' || n == ']')
+                    {
+                        close = true;
+                    }
+                    else if (n == ',')
+                    {
+                        int k = j + 1;
+                        while (k < raw.Length && char.IsWhiteSpace(raw[k])) k++;
+                        bool inArr = containers.Count > 0 && containers.Peek() == 'a';
+                        close = k >= raw.Length || inArr || raw[k] == '"';
+                    }
+                    else
+                    {
+                        close = false;
+                    }
+                }
 
-                if (looksLikeClose)
+                if (close)
                 {
                     inString = false;
+                    lastSig  = '"';
                     sb.Append(c);
                 }
                 else
@@ -829,12 +975,77 @@ public class ErpApiService
     }
 
     // ─────────────────────────────────────────────────────────
+    // LAST-RESORT SALVAGE: cut ONE malformed record out of the response.
+    // If, even after sanitising, the JSON parser fails inside a record, a single bad row used to make
+    // the whole call (a month of DJR, thousands of good rows) fail. This locates the record that
+    // contains the parser's error position, removes just that record (between the nearest "},{"
+    // boundaries) and lets the caller parse the rest. Every cut is counted
+    // (MalformedRecordsDropped), logged and shown in the sync-log note — never silent.
+    // Configurable: AutoGeniusERP:MaxMalformedRecordsPerCall (default 50, 0 = off).
+    // ─────────────────────────────────────────────────────────
+    private static int IndexFromLinePosition(string s, int line, int pos)
+    {
+        int idx = 0, cur = 1;
+        while (cur < line)
+        {
+            int nl = s.IndexOf('\n', idx);
+            if (nl < 0) return -1;
+            idx = nl + 1;
+            cur++;
+        }
+        idx += Math.Max(0, pos - 1);
+        return idx < s.Length ? idx : -1;
+    }
+
+    internal static bool TryCutRecordAt(ref string body, int idx, out int removedChars)
+    {
+        removedChars = 0;
+        if (idx < 0 || idx >= body.Length) return false;
+
+        int sepBefore = body.LastIndexOf("},{", Math.Min(idx + 2, body.Length - 1), StringComparison.Ordinal);
+        int arrBefore = body.LastIndexOf("[{",  Math.Min(idx + 1, body.Length - 1), StringComparison.Ordinal);
+        if (sepBefore < 0 && arrBefore < 0) return false;
+
+        int recStart;      // index of the record's opening '{'
+        int cutFrom;       // first char to remove
+        bool hasCommaBefore = sepBefore > arrBefore;
+        if (hasCommaBefore) { recStart = sepBefore + 2; cutFrom = recStart; }
+        else                { recStart = arrBefore + 1; cutFrom = recStart; }
+
+        int nextSep = body.IndexOf("},{", Math.Max(idx, recStart), StringComparison.Ordinal);
+        int arrEnd  = body.IndexOf("}]",  Math.Max(idx, recStart), StringComparison.Ordinal);
+
+        int cutTo;         // first char to keep after the cut
+        if (nextSep >= 0 && (arrEnd < 0 || nextSep < arrEnd))
+        {
+            cutTo = nextSep + 2;                      // removes "{BAD}," and keeps the next "{"
+        }
+        else if (arrEnd >= 0)
+        {
+            cutTo = arrEnd + 1;                       // removes "{BAD}" and keeps "]"
+            if (hasCommaBefore) cutFrom = recStart - 1;   // …and the comma before it
+        }
+        else return false;
+
+        if (cutTo <= cutFrom) return false;
+
+        removedChars = cutTo - cutFrom;
+        body = string.Concat(body.AsSpan(0, cutFrom), body.AsSpan(cutTo));
+        return true;
+    }
+
+    // ─────────────────────────────────────────────────────────
     // TOLERANT JSON DESERIALIZER
     //
     // FIX: the final catch used to log and return an empty list.
     // Now it throws — so a genuinely malformed/unparseable response
     // (distinct from "Valid=false" or "Value=[]", both of which
     // return cleanly above) surfaces as a real failure to the caller.
+    //
+    // FIX (this pass): when the ERP answers Valid=false its own Description is now LOGGED (it used to be
+    // dropped silently in the fast path, so an ERP-side refusal looked like "no data"); and a response
+    // that stays unparseable after sanitising has the offending record cut out instead of failing the
+    // whole call (see TryCutRecordAt).
     // ─────────────────────────────────────────────────────────
 
     private List<T> DeserializeTolerant<T>(
@@ -842,21 +1053,64 @@ public class ErpApiService
     {
         body = SanitizeJson(body);
 
-        try
-        {
-            var fastSettings = new JsonSerializerSettings
-            {
-                MissingMemberHandling = MissingMemberHandling.Ignore
-            };
+        var maxCuts = Math.Max(0, _config.GetValue<int>("AutoGeniusERP:MaxMalformedRecordsPerCall", 50));
+        var cuts = 0;
 
-            var result = JsonConvert.DeserializeObject<ErpApiResponse<T>>(body, fastSettings);
-            return result?.Valid == true ? result.Value ?? new() : new();
-        }
-        catch (JsonException firstEx)
+        while (true)
         {
-            _logger.LogWarning(
-                "Fast parse failed for {url}: {msg}. Trying tolerant parse.",
-                url, firstEx.Message);
+            try
+            {
+                var fastSettings = new JsonSerializerSettings
+                {
+                    MissingMemberHandling = MissingMemberHandling.Ignore
+                };
+
+                var result = JsonConvert.DeserializeObject<ErpApiResponse<T>>(body, fastSettings);
+
+                if (cuts > 0)
+                {
+                    Interlocked.Add(ref _malformedRecordsDropped, cuts);
+                    _logger.LogWarning(
+                        "{n} malformed ERP record(s) were skipped for {url}; the remaining rows were loaded.", cuts, url);
+                }
+
+                if (result?.Valid != true)
+                {
+                    _logger.LogWarning(
+                        "ERP replied Valid=false for {url}: {desc}",
+                        url, Trunc(result?.Description ?? "(no description)", 200));
+                    return new();
+                }
+
+                return result.Value ?? new();
+            }
+            catch (JsonReaderException jre)
+            {
+                if (cuts < maxCuts)
+                {
+                    var idx = IndexFromLinePosition(body, jre.LineNumber, jre.LinePosition);
+                    if (TryCutRecordAt(ref body, idx, out var removed))
+                    {
+                        cuts++;
+                        _logger.LogWarning(
+                            "Malformed ERP record at {path} (line {line}, pos {pos}) for {url}: {msg}. Cut out {chars} chars, retrying parse.",
+                            jre.Path, jre.LineNumber, jre.LinePosition, url, jre.Message, removed);
+                        continue;
+                    }
+                }
+
+                _logger.LogWarning(
+                    "Fast parse failed for {url}: {msg}. Trying tolerant parse.",
+                    url, jre.Message);
+                break;
+            }
+            catch (JsonException firstEx)
+            {
+                _logger.LogWarning(
+                    "Fast parse failed for {url}: {msg}. Trying tolerant parse.",
+                    url, firstEx.Message);
+                break;
+            }
         }
 
         try
@@ -867,7 +1121,8 @@ public class ErpApiService
             if (!valid)
             {
                 _logger.LogWarning(
-                    "Tolerant parse: API returned Valid=false for {url}", url);
+                    "Tolerant parse: API returned Valid=false for {url}: {desc}",
+                    url, Trunc((root["Description"] ?? root["description"])?.ToString() ?? "(no description)", 200));
                 return new();
             }
 

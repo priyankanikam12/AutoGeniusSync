@@ -1684,6 +1684,12 @@ public class DataSyncService
         }
 
         var fetchedBy = new Dictionary<string, long>();
+        var skippedAtStart = ErpApiService.MalformedRecordsDropped;
+        string SkipNote()
+        {
+            var n = ErpApiService.MalformedRecordsDropped - skippedAtStart;
+            return n > 0 ? $" | NOTE: {n} malformed ERP record(s) were skipped (see 'Malformed ERP record' warnings)" : "";
+        }
 
         void Collect(string name, SyncResult r)
         {
@@ -1766,14 +1772,14 @@ public class DataSyncService
             if (problems.Count == 0)
             {
                 log.Status       = "Success";
-                log.ErrorMessage = Trunc("OK — " + counts, 1800);
+                log.ErrorMessage = Trunc("OK — " + counts + SkipNote(), 1800);
                 _logger.LogInformation("Nightly full reload complete: {fet} fetched, {ins} inserted. {counts}",
                     overall.RecordsFetched, overall.RecordsInserted, counts);
             }
             else
             {
                 log.Status       = "PartialFailure";
-                log.ErrorMessage = Trunc(string.Join(" | ", problems) + " || " + counts, 1800);
+                log.ErrorMessage = Trunc(string.Join(" | ", problems) + " || " + counts + SkipNote(), 1800);
                 overall.Error    = log.ErrorMessage;
                 _logger.LogError("Nightly full reload finished WITH PROBLEMS: {problems} || {counts}",
                     string.Join(" | ", problems), counts);
@@ -1814,6 +1820,63 @@ public class DataSyncService
     }
 
     // ─────────────────────────────────────────────────────────
+    // ERP PROBE — READ-ONLY DIAGNOSTIC (writes nothing to the database)
+    // Calls each ERP report API on windows of growing size and returns ONLY row counts, timings and
+    // errors (no business data), so "ERP returned nothing" can be told apart from "ERP rejects long
+    // ranges" from "ERP answers fast with an error body". Control: DJR (known to work).
+    //   VSR / VDR : all dealers, last 7 / 30 / 90 / 365 days
+    //   LOR       : the 3 most active dealers (by ServiceHistory rows), last 7 / 90 / 365 days and the FULL range
+    // ─────────────────────────────────────────────────────────
+    public sealed record ProbeRow(string Report, string Window, string From, string To, string Dealer,
+                                  int HttpStatus, bool? Valid, int Rows, int BodyChars, long Ms,
+                                  string? ErpDescription, string? TopLevelKeys, string? Error);
+
+    public async Task<List<ProbeRow>> ProbeErpReportsAsync(CancellationToken ct = default)
+    {
+        var rows  = new List<ProbeRow>();
+        var end   = DateTime.UtcNow.AddMinutes(330).Date;   // today in IST
+        var full  = DateTime.Parse(_config["SyncSettings:HistoricalStartDate"] ?? "2020-01-01").Date;
+
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var dealers = await db.DmsServiceHistories
+            .Where(x => x.DealerCode != null)
+            .GroupBy(x => x.DealerCode!)
+            .OrderByDescending(g => g.Count())
+            .Select(g => g.Key)
+            .Take(3)
+            .ToListAsync(ct);
+
+        async Task Probe(string report, string window, DateTime a, DateTime b, string dealer)
+        {
+            ct.ThrowIfCancellationRequested();
+            var token = await _erpApi.GetValidTokenAsync();
+            var r = await _erpApi.ProbeReportAsync(report, dealer, a, b, token);
+            rows.Add(new ProbeRow(report.ToUpperInvariant(), window, a.ToString("yyyy-MM-dd"), b.ToString("yyyy-MM-dd"),
+                                  string.IsNullOrEmpty(dealer) ? "(all)" : dealer,
+                                  r.HttpStatus, r.Valid, r.Rows, r.BodyChars, r.Ms, r.Description, r.TopLevelKeys, r.Error));
+        }
+
+        // Control: DJR, last 7 days (known to work).
+        await Probe("djr", "last 7 days", end.AddDays(-6), end, "");
+
+        foreach (var (name, days) in new[] { ("last 7 days", 6), ("last 30 days", 29), ("last 90 days", 89), ("last 365 days", 364) })
+        {
+            var a = end.AddDays(-days);
+            await Probe("vsr", name, a, end, "");
+            await Probe("vdr", name, a, end, "");
+        }
+
+        foreach (var dealer in dealers)
+            foreach (var (name, a) in new[] { ("last 7 days", end.AddDays(-6)), ("last 90 days", end.AddDays(-89)),
+                                              ("last 365 days", end.AddDays(-364)), ("full range", full) })
+                await Probe("lor", name, a, end, dealer);
+
+        return rows;
+    }
+
+    // ─────────────────────────────────────────────────────────
     // LOAD MISSING TABLES — NO TRUNCATE
     // Loads only the report tables that are EMPTY (or the ones you name), from
     // SyncSettings:HistoricalStartDate (or the given from/to) up to today (IST). Nothing is deleted:
@@ -1843,6 +1906,12 @@ public class DataSyncService
         var start = (from ?? DateTime.Parse(_config["SyncSettings:HistoricalStartDate"] ?? "2020-01-01")).Date;
         var end   = (to   ?? DateTime.UtcNow.AddMinutes(330).Date).Date;   // today in IST (UTC+5:30)
         var fetchedBy = new Dictionary<string, long>();
+        var skippedAtStart = ErpApiService.MalformedRecordsDropped;
+        string SkipNote()
+        {
+            var n = ErpApiService.MalformedRecordsDropped - skippedAtStart;
+            return n > 0 ? $" | NOTE: {n} malformed ERP record(s) were skipped (see 'Malformed ERP record' warnings)" : "";
+        }
 
         async Task Step(string text)
         {
@@ -1952,13 +2021,13 @@ public class DataSyncService
             if (problems.Count == 0)
             {
                 log.Status       = "Success";
-                log.ErrorMessage = Trunc("OK — " + counts, 1800);
+                log.ErrorMessage = Trunc("OK — " + counts + SkipNote(), 1800);
                 _logger.LogInformation("Missing-tables load complete: {counts}", counts);
             }
             else
             {
                 log.Status       = "PartialFailure";
-                log.ErrorMessage = Trunc(string.Join(" | ", problems) + " || " + counts, 1800);
+                log.ErrorMessage = Trunc(string.Join(" | ", problems) + " || " + counts + SkipNote(), 1800);
                 overall.Error    = log.ErrorMessage;
                 _logger.LogError("Missing-tables load finished WITH PROBLEMS: {problems} || {counts}",
                     string.Join(" | ", problems), counts);
@@ -2012,6 +2081,7 @@ public class DataSyncService
         var overall  = new SyncResult { SyncType = "DailyWindowSync" };
         var problems = new List<string>();
         var notes    = new List<string>();
+        var skippedAtStart = ErpApiService.MalformedRecordsDropped;
 
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -2141,6 +2211,8 @@ public class DataSyncService
 
             var counts = $"window {start:yyyy-MM-dd}..{end:yyyy-MM-dd}; fetched={overall.RecordsFetched}, inserted={overall.RecordsInserted}, updated={overall.RecordsUpdated}; "
                        + $"rows: ServiceHistory={nService}, VehicleSales={nSales}, VehicleDispatches={nDispatch}, LineOrderReport={nLor}";
+            var skippedNow = ErpApiService.MalformedRecordsDropped - skippedAtStart;
+            if (skippedNow > 0) notes.Add($"{skippedNow} malformed ERP record(s) were skipped (see 'Malformed ERP record' warnings)");
             var noteText = notes.Count > 0 ? " | NOTES: " + string.Join(" | ", notes) : "";
 
             if (problems.Count == 0)

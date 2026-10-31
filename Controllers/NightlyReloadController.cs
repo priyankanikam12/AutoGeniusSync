@@ -21,13 +21,22 @@ public class NightlyReloadController : ControllerBase
     private readonly NightlyReloadRunner _runner;
     private readonly IConfiguration _config;
     private readonly IHostApplicationLifetime _lifetime;
+    private readonly IServiceScopeFactory _scopeFactory;
 
-    public NightlyReloadController(NightlyReloadRunner runner, IConfiguration config, IHostApplicationLifetime lifetime)
+    public NightlyReloadController(NightlyReloadRunner runner, IConfiguration config, IHostApplicationLifetime lifetime,
+                                   IServiceScopeFactory scopeFactory)
     {
         _runner = runner;
         _config = config;
         _lifetime = lifetime;
+        _scopeFactory = scopeFactory;
     }
+
+    // Result of the last ERP probe (in memory only).
+    private sealed record ProbeState(bool Running, DateTime? StartedUtc, DateTime? FinishedUtc,
+                                     List<DataSyncService.ProbeRow>? Rows, string? Error);
+    private static ProbeState? _probe;
+    private static readonly object _probeLock = new();
 
     private bool IsValidApiKey(string? apiKey)
     {
@@ -129,6 +138,50 @@ public class NightlyReloadController : ControllerBase
                 ? "Full reload requested (ERP check → truncate → re-fetch → validate). Poll GET api/admin/reload/status."
                 : "Window sync requested (rolling months, upsert, no truncate). Poll GET api/admin/reload/status.",
         });
+    }
+
+    // POST /api/admin/reload/probe  → starts a READ-ONLY check of the ERP report APIs (VSR, VDR, LOR; DJR as control).
+    // GET  /api/admin/reload/probe  → result: row count, milliseconds and error per call. No business data, nothing is written.
+    [HttpPost("probe")]
+    public IActionResult StartProbe([FromHeader(Name = "X-API-Key")] string? apiKey)
+    {
+        if (!IsValidApiKey(apiKey))
+            return Unauthorized(new { error = "Invalid or missing API key." });
+
+        lock (_probeLock)
+        {
+            if (_probe is { Running: true })
+                return Conflict(new { error = "A probe is already running." });
+            _probe = new ProbeState(true, DateTime.UtcNow, null, null, null);
+        }
+
+        var started = DateTime.UtcNow;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var scope = _scopeFactory.CreateScope();
+                var svc  = scope.ServiceProvider.GetRequiredService<DataSyncService>();
+                var rows = await svc.ProbeErpReportsAsync(_lifetime.ApplicationStopping);
+                lock (_probeLock) _probe = new ProbeState(false, started, DateTime.UtcNow, rows, null);
+            }
+            catch (Exception ex)
+            {
+                lock (_probeLock) _probe = new ProbeState(false, started, DateTime.UtcNow, null, ex.InnerException?.Message ?? ex.Message);
+            }
+        });
+
+        return Accepted(new { message = "ERP probe started (read-only). Poll GET api/admin/reload/probe." });
+    }
+
+    [HttpGet("probe")]
+    public IActionResult GetProbe([FromHeader(Name = "X-API-Key")] string? apiKey)
+    {
+        if (!IsValidApiKey(apiKey))
+            return Unauthorized(new { error = "Invalid or missing API key." });
+
+        lock (_probeLock)
+            return _probe == null ? NotFound(new { error = "No probe has been run yet. POST api/admin/reload/probe first." }) : Ok(_probe);
     }
 
     // GET /api/admin/reload/status
