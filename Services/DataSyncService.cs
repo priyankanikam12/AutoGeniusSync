@@ -1,3 +1,4 @@
+using System.Globalization;
 using AutoGeniusSync.Data;
 using AutoGeniusSync.DTOs;
 using AutoGeniusSync.Models;
@@ -6,7 +7,7 @@ using Microsoft.EntityFrameworkCore;
 
 namespace AutoGeniusSync.Services;
 
-public class DataSyncService
+public partial class DataSyncService
 {
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ErpApiService _erpApi;
@@ -283,218 +284,19 @@ public class DataSyncService
     // SERVICE HISTORY (single date) — INSERT ONLY
     // ─────────────────────────────────────────────────────────
 
+    // Dealer-wise (one ERP call per dealer per month) + UPSERT. The former single all-dealer ERP call made the
+    // ERP throw OutOfMemoryException and the Valid=false answer was stored as "0 rows" — data silently missing.
     public async Task<SyncResult> SyncServiceHistoryForDateAsync(DateTime date)
-    {
-        using var scope = _scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-        var log = new DmsSyncLog
-        {
-            SyncType  = "ServiceHistory",
-            SyncDate  = DateOnly.FromDateTime(date),
-            StartedAt = DateTime.UtcNow,
-            Status    = "Running"
-        };
-        db.DmsSyncLogs.Add(log);
-        await db.SaveChangesAsync();
-
-        var result = new SyncResult { SyncType = "ServiceHistory", Date = date };
-
-        try
-        {
-            var token = await _erpApi.GetValidTokenAsync();
-            var jobs  = await _erpApi.FetchDjrAsync(date, token, "");
-            result.RecordsFetched = jobs.Count;
-
-            var afterTotalFilter = jobs.Where(j => j.JobNo != "Total").ToList();
-            var afterBlankFilter = afterTotalFilter
-                .Where(j => !string.IsNullOrEmpty(j.DealerCode) && !string.IsNullOrEmpty(j.JobNo))
-                .ToList();
-
-            var parsedRecords = afterBlankFilter
-                .Select(j =>
-                {
-                    var parsed = ParseServiceHistory(j);
-                    if (parsed.JobDate == null)
-                        parsed.JobDate = DateOnly.FromDateTime(date);
-                    parsed.UniqueKey = BuildUniqueKey(parsed.DealerCode, parsed.JobNo, parsed.JobDate, parsed.ChassisNo);
-                    return parsed;
-                })
-                .ToList();
-
-            var dedupedRecords = parsedRecords
-                .GroupBy(p => p.UniqueKey)
-                .Select(g => g.Last())
-                .ToList();
-
-            var candidateKeys = dedupedRecords.Select(p => p.UniqueKey).ToHashSet();
-            var existingKeySet = (await db.DmsServiceHistories
-                .Where(x => x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
-                .Select(x => x.UniqueKey!)
-                .ToListAsync()).ToHashSet();
-
-            int skippedAsExisting = 0;
-            int skippedOnError = 0;
-
-            foreach (var parsed in dedupedRecords)
-            {
-                try
-                {
-                    // FIX: INSERT ONLY — skip if already exists.
-                    if (existingKeySet.Contains(parsed.UniqueKey!))
-                    {
-                        skippedAsExisting++;
-                        continue;
-                    }
-
-                    db.DmsServiceHistories.Add(parsed);
-                    result.RecordsInserted++;
-                    existingKeySet.Add(parsed.UniqueKey!);
-                }
-                catch (Exception ex)
-                {
-                    skippedOnError++;
-                    _logger.LogWarning("Skipping job {no} for {dc}: {msg}",
-                        parsed.JobNo, parsed.DealerCode, ex.Message);
-                }
-            }
-
-            log.ErrorMessage = $"{skippedAsExisting} skipped (already exist), {skippedOnError} per-record error(s). INSERT-ONLY mode.";
-
-            await db.SaveChangesAsync();
-            log.Status = "Success";
-        }
-        catch (Exception ex)
-        {
-            log.Status       = "Failed";
-            log.ErrorMessage = ex.InnerException?.Message ?? ex.Message;
-            result.Error     = log.ErrorMessage;
-            _logger.LogError(ex, "Service history sync failed for {date}", date.ToShortDateString());
-        }
-
-        log.CompletedAt     = DateTime.UtcNow;
-        log.RecordsFetched  = result.RecordsFetched;
-        log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated  = 0;
-        await db.SaveChangesAsync();
-
-        return result;
-    }
+        => await UpsertRangeViaEngineAsync(SyncApi.ServiceHistory, "ServiceHistory", date.Date, date.Date, await DealersForManualRangeAsync(), null);
 
     // ─────────────────────────────────────────────────────────
     // SERVICE HISTORY (range) — INSERT ONLY
     // ─────────────────────────────────────────────────────────
 
+    // Dealer-wise (one ERP call per dealer per month) + UPSERT. The former single all-dealer ERP call made the
+    // ERP throw OutOfMemoryException and the Valid=false answer was stored as "0 rows" — data silently missing.
     public async Task<SyncResult> SyncServiceHistoryForRangeAsync(DateTime startDate, DateTime endDate)
-    {
-        using var scope = _scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-        var log = new DmsSyncLog
-        {
-            SyncType  = "ServiceHistory",
-            SyncDate  = DateOnly.FromDateTime(endDate),
-            StartedAt = DateTime.UtcNow,
-            Status    = "Running"
-        };
-        db.DmsSyncLogs.Add(log);
-        await db.SaveChangesAsync();
-
-        var result = new SyncResult { SyncType = "ServiceHistory", Date = endDate };
-
-        try
-        {
-            var token = await _erpApi.GetValidTokenAsync();
-            var jobs = await _erpApi.FetchDjrRangeAsync(startDate, endDate, token);
-            result.RecordsFetched = jobs.Count;
-
-            var droppedAsTotal = jobs.Count(j => j.JobNo == "Total");
-            var afterTotalFilter = jobs.Where(j => j.JobNo != "Total").ToList();
-
-            var droppedAsBlankKey = afterTotalFilter.Count(j =>
-                string.IsNullOrEmpty(j.DealerCode) || string.IsNullOrEmpty(j.JobNo));
-            var afterBlankFilter = afterTotalFilter
-                .Where(j => !string.IsNullOrEmpty(j.DealerCode) && !string.IsNullOrEmpty(j.JobNo))
-                .ToList();
-
-            var parsedRecords = afterBlankFilter
-                .Select(j =>
-                {
-                    var parsed = ParseServiceHistory(j);
-                    if (parsed.JobDate == null)
-                        parsed.JobDate = DateOnly.FromDateTime(endDate);
-                    parsed.UniqueKey = BuildUniqueKey(parsed.DealerCode, parsed.JobNo, parsed.JobDate, parsed.ChassisNo);
-                    return parsed;
-                })
-                .ToList();
-
-            var dedupedRecords = parsedRecords
-                .GroupBy(p => p.UniqueKey)
-                .Select(g => g.Last())
-                .ToList();
-            var droppedAsDuplicateInBatch = parsedRecords.Count - dedupedRecords.Count;
-
-            var candidateKeys = dedupedRecords.Select(p => p.UniqueKey).ToHashSet();
-            var existingKeys = await db.DmsServiceHistories
-                .Where(x => x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
-                .Select(x => x.UniqueKey!)
-                .ToListAsync();
-            var existingKeySet = existingKeys.ToHashSet();
-
-            int skippedAsExisting = 0;
-            int skippedOnError = 0;
-            int saveCounter = 0;
-
-            foreach (var parsed in dedupedRecords)
-            {
-                try
-                {
-                    if (existingKeySet.Contains(parsed.UniqueKey!))
-                    {
-                        skippedAsExisting++;
-                        continue;
-                    }
-
-                    db.DmsServiceHistories.Add(parsed);
-                    result.RecordsInserted++;
-                    existingKeySet.Add(parsed.UniqueKey!);
-
-                    saveCounter++;
-                    if (saveCounter % SaveBatchSize == 0)
-                        await db.SaveChangesAsync();
-                }
-                catch (Exception ex)
-                {
-                    skippedOnError++;
-                    _logger.LogWarning("Skipping job {no} for {dc}: {msg}", parsed.JobNo, parsed.DealerCode, ex.Message);
-                }
-            }
-
-            log.ErrorMessage =
-                $"Dropped: {droppedAsTotal} Total-row, {droppedAsBlankKey} blank-key, " +
-                $"{droppedAsDuplicateInBatch} in-batch duplicate, {skippedAsExisting} skipped (already exist), " +
-                $"{skippedOnError} per-record error(s). INSERT-ONLY mode.";
-
-            await db.SaveChangesAsync();
-            log.Status = "Success";
-        }
-        catch (Exception ex)
-        {
-            log.Status       = "Failed";
-            log.ErrorMessage = ex.InnerException?.Message ?? ex.Message;
-            result.Error     = log.ErrorMessage;
-            _logger.LogError(ex, "DJR range sync failed for {from} → {to}",
-                startDate.ToShortDateString(), endDate.ToShortDateString());
-        }
-
-        log.CompletedAt     = DateTime.UtcNow;
-        log.RecordsFetched  = result.RecordsFetched;
-        log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated  = 0;
-        await db.SaveChangesAsync();
-
-        return result;
-    }
+        => await UpsertRangeViaEngineAsync(SyncApi.ServiceHistory, "ServiceHistory", startDate.Date, endDate.Date, await DealersForManualRangeAsync(), null);
 
     // DJR window with fallback. The ERP's DJR call is slow and getting slower (13–36 s per month in
     // the production log, and some months time out 3 x 180 s). Order of attempts for a window:
@@ -511,126 +313,15 @@ public class DataSyncService
                         || err.Contains("Unterminated string", StringComparison.OrdinalIgnoreCase)
                         || err.Contains("Path '", StringComparison.Ordinal));
 
-    private async Task SyncDjrAdaptiveAsync(DateTime from, DateTime to, SyncResult total,
-                                            List<string> failedChunks, CancellationToken ct)
-    {
-        var minDays = Math.Clamp(_config.GetValue("Sync:DjrMinWindowDays", 1), 1, 31);
-
-        async Task<string?> Attempt(DateTime a, DateTime b)
-        {
-            var r = await SyncServiceHistoryForRangeAsync(a, b);
-            total.RecordsFetched  += r.RecordsFetched;
-            total.RecordsInserted += r.RecordsInserted;
-            return string.IsNullOrEmpty(r.Error) ? null : r.Error;
-        }
-
-        async Task Solve(DateTime a, DateTime b)
-        {
-            ct.ThrowIfCancellationRequested();
-            var err = await Attempt(a, b);
-            if (err == null) return;
-
-            if (IsErpAuthError(err))
-            {
-                failedChunks.Add($"{a:yyyy-MM-dd}..{b:yyyy-MM-dd}: {err} — load STOPPED, remaining windows not attempted");
-                return;
-            }
-
-            if (!IsDeterministicParseError(err))
-            {
-                _logger.LogWarning("ServiceHistory window {a:yyyy-MM-dd}..{b:yyyy-MM-dd} failed, retrying once: {err}", a, b, err);
-                err = await Attempt(a, b);
-                if (err == null) return;
-            }
-
-            var days = (b - a).Days + 1;
-            if (days <= minDays)
-            {
-                failedChunks.Add($"{a:yyyy-MM-dd}..{b:yyyy-MM-dd}: {err}");
-                return;
-            }
-
-            var mid = a.AddDays(days / 2 - 1);                // first half a..mid, second half mid+1..b
-            _logger.LogWarning("ServiceHistory window {a:yyyy-MM-dd}..{b:yyyy-MM-dd} still failing — splitting at {m:yyyy-MM-dd}", a, b, mid);
-            await Solve(a, mid);
-            await Solve(mid.AddDays(1), b);
-        }
-
-        await Solve(from, to);
-    }
-
-    public async Task<SyncResult> BackfillHistoricalDataAsync(
+    // Historical ServiceHistory (DJR) load. Now month-wise + dealer-wise through the checkpoint engine
+    // (DataSyncService.Checkpoint.cs): resumes where it stopped, upserts, never duplicates.
+    // No from/to = HistoricalStartDate → today, completed months are skipped.
+    // Explicit from/to = that range is fetched again even if completed (repair / re-check).
+    public Task<SyncResult> BackfillHistoricalDataAsync(
         DateTime? fromDate = null, DateTime? toDate = null,
         CancellationToken ct = default,
         bool forceResync = false)
-    {
-        using var scope = _scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-        var topLog = new DmsSyncLog { SyncType = "BackfillHistorical", StartedAt = DateTime.UtcNow, Status = "Running" };
-        db.DmsSyncLogs.Add(topLog);
-        await db.SaveChangesAsync();
-
-        var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2020-01-01";
-        var start = fromDate ?? DateTime.Parse(startDateStr);
-        var end   = toDate   ?? DateTime.UtcNow.Date;
-
-        var totalResult = new SyncResult { SyncType = "BackfillHistorical" };
-        var failedChunks = new List<string>();
-
-        try
-        {
-            var chunkStart = start.Date;
-            end = end.Date;
-            while (chunkStart <= end && !ct.IsCancellationRequested)
-            {
-                // Month-aligned window: chunkStart .. last day of that same month (never longer than
-                // one calendar month, never beyond 'end', never end < start).
-                var chunkEnd = new DateTime(chunkStart.Year, chunkStart.Month, 1).AddMonths(1).AddDays(-1);
-                if (chunkEnd > end) chunkEnd = end;
-                if (chunkEnd < chunkStart) chunkEnd = chunkStart;   // defensive; cannot normally happen
-
-                // FIX: a failed month used to be dropped silently (the loop never looked at
-                // r.Error), leaving a permanent gap in ServiceHistory after the nightly
-                // truncate while the run still reported "Success". Each window is retried,
-                // and a month that keeps timing out is split into smaller pieces (see
-                // SyncDjrAdaptiveAsync) instead of being given up on.
-                await SyncDjrAdaptiveAsync(chunkStart, chunkEnd, totalResult, failedChunks, ct);
-                if (failedChunks.Any(IsErpAuthError)) break;   // ERP refuses access: stop, do not call it for every month
-
-                chunkStart = chunkEnd.AddDays(1);
-            }
-
-            if (failedChunks.Any())
-            {
-                topLog.Status = "PartialFailure";
-                topLog.ErrorMessage = $"{failedChunks.Count} window(s) failed after retry — ServiceHistory data is INCOMPLETE for: "
-                    + string.Join(" | ", failedChunks);
-                totalResult.Error = topLog.ErrorMessage;
-                _logger.LogError("DJR backfill finished with {n} unrecoverable window(s): {details}",
-                    failedChunks.Count, topLog.ErrorMessage);
-            }
-            else
-            {
-                topLog.Status = "Success";
-            }
-        }
-        catch (Exception ex)
-        {
-            topLog.Status = "Failed";
-            topLog.ErrorMessage = ex.InnerException?.Message ?? ex.Message;
-            totalResult.Error = topLog.ErrorMessage;
-            _logger.LogError(ex, "Historical service history backfill failed");
-        }
-
-        topLog.CompletedAt = DateTime.UtcNow;
-        topLog.RecordsFetched  = totalResult.RecordsFetched;
-        topLog.RecordsInserted = totalResult.RecordsInserted;
-        topLog.RecordsUpdated  = 0;
-        await db.SaveChangesAsync();
-
-        return totalResult;
-    }
+        => BackfillViaCheckpointsAsync(SyncApi.ServiceHistory, "BackfillHistorical", fromDate, toDate, forceResync, ct);
 
     // ─────────────────────────────────────────────────────────
     // VEHICLE SALES (single date) — INSERT ONLY
@@ -747,193 +438,16 @@ public class DataSyncService
     // VEHICLE SALES (range) — INSERT ONLY
     // ─────────────────────────────────────────────────────────
 
+    // Dealer-wise (one ERP call per dealer per month) + UPSERT. The former single all-dealer ERP call made the
+    // ERP throw OutOfMemoryException and the Valid=false answer was stored as "0 rows" — data silently missing.
     public async Task<SyncResult> SyncVehicleSalesForRangeAsync(DateTime startDate, DateTime endDate)
-    {
-        using var scope = _scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        => await UpsertRangeViaEngineAsync(SyncApi.VehicleSales, "VehicleSales", startDate.Date, endDate.Date, await DealersForManualRangeAsync(), null);
 
-        var log = new DmsSyncLog
-        {
-            SyncType  = "VehicleSales",
-            SyncDate  = DateOnly.FromDateTime(endDate),
-            StartedAt = DateTime.UtcNow,
-            Status    = "Running"
-        };
-        db.DmsSyncLogs.Add(log);
-        await db.SaveChangesAsync();
-
-        var result = new SyncResult { SyncType = "VehicleSales", Date = endDate };
-
-        try
-        {
-            var token = await _erpApi.GetValidTokenAsync();
-            var sales = await _erpApi.FetchVsrAsync("", startDate, endDate, token);
-            result.RecordsFetched = sales.Count;
-            _logger.LogInformation("VSR {from:yyyy-MM-dd}..{to:yyyy-MM-dd}: ERP returned {n} row(s).", startDate, endDate, sales.Count);
-
-            var droppedAsBlank = sales.Count(s => string.IsNullOrEmpty(s.ChassisNo));
-            var afterBlankFilter = sales
-                .Where(s => !string.IsNullOrEmpty(s.ChassisNo))
-                .ToList();
-
-            var dedupedRecords = afterBlankFilter
-                .GroupBy(s => s.ChassisNo!.Trim().ToUpperInvariant())
-                .Select(g => g.Last())
-                .ToList();
-            var droppedAsDuplicate = afterBlankFilter.Count - dedupedRecords.Count;
-
-            var chassisKeys = dedupedRecords.Select(s => s.ChassisNo!.Trim().ToUpperInvariant()).ToHashSet();
-            var existingKeys = new HashSet<string>();
-            foreach (var chunk in chassisKeys.Chunk(500))
-            {
-                var chunkSet = chunk.ToHashSet();
-                var rows = await db.DmsVehicleSales
-                    .Where(x => x.ChassisNo != null && chunkSet.Contains(x.ChassisNo!.Trim().ToUpper()))
-                    .Select(x => x.ChassisNo!)
-                    .ToListAsync();
-                foreach (var r in rows) existingKeys.Add(r.Trim().ToUpperInvariant());
-            }
-
-            int skippedAsExisting = 0;
-            int skippedOnError = 0;
-            int saveCounter = 0;
-
-            foreach (var sale in dedupedRecords)
-            {
-                try
-                {
-                    var parsed = ParseVehicleSale(sale);
-                    var key = parsed.ChassisNo!.Trim().ToUpperInvariant();
-
-                    if (existingKeys.Contains(key))
-                    {
-                        skippedAsExisting++;
-                        continue;
-                    }
-
-                    db.DmsVehicleSales.Add(parsed);
-                    result.RecordsInserted++;
-                    existingKeys.Add(key);
-
-                    saveCounter++;
-                    if (saveCounter % SaveBatchSize == 0)
-                        await db.SaveChangesAsync();
-                }
-                catch (Exception ex)
-                {
-                    skippedOnError++;
-                    _logger.LogWarning("Skipping sale (chassis {ch}): {msg}", sale.ChassisNo, ex.Message);
-                }
-            }
-
-            log.ErrorMessage =
-                $"Dropped: {droppedAsBlank} blank-chassis, {droppedAsDuplicate} in-batch duplicate, " +
-                $"{skippedAsExisting} skipped (already exist), {skippedOnError} per-record error(s). INSERT-ONLY mode.";
-
-            await db.SaveChangesAsync();
-            log.Status = "Success";
-        }
-        catch (Exception ex)
-        {
-            log.Status       = "Failed";
-            log.ErrorMessage = ex.InnerException?.Message ?? ex.Message;
-            result.Error     = log.ErrorMessage;
-            _logger.LogError(ex, "VSR range sync failed for {from} → {to}",
-                startDate.ToShortDateString(), endDate.ToShortDateString());
-        }
-
-        log.CompletedAt     = DateTime.UtcNow;
-        log.RecordsFetched  = result.RecordsFetched;
-        log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated  = 0;
-        await db.SaveChangesAsync();
-
-        return result;
-    }
-
-    public async Task<SyncResult> BackfillVehicleSalesAsync(
+    public Task<SyncResult> BackfillVehicleSalesAsync(
         DateTime? fromDate = null, DateTime? toDate = null,
         CancellationToken ct = default,
         bool forceResync = false)
-    {
-        using var scope = _scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-        var topLog = new DmsSyncLog { SyncType = "BackfillVehicleSales", StartedAt = DateTime.UtcNow, Status = "Running" };
-        db.DmsSyncLogs.Add(topLog);
-        await db.SaveChangesAsync();
-
-        var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2020-01-01";
-        var start = fromDate ?? DateTime.Parse(startDateStr);
-        var end   = toDate   ?? DateTime.UtcNow.Date;
-
-        var totalResult = new SyncResult { SyncType = "BackfillVehicleSales" };
-        var failedChunks = new List<string>();
-
-        try
-        {
-            var chunkStart = start;
-            while (chunkStart <= end && !ct.IsCancellationRequested)
-            {
-                var chunkEnd = chunkStart.AddDays(6);
-                if (chunkEnd > end) chunkEnd = end;
-
-                var r = await SyncVehicleSalesForRangeAsync(chunkStart, chunkEnd);
-                totalResult.RecordsFetched  += r.RecordsFetched;
-                totalResult.RecordsInserted += r.RecordsInserted;
-
-                if (IsErpAuthError(r.Error))
-                {
-                    failedChunks.Add($"{chunkStart:yyyy-MM-dd}..: {r.Error} — load STOPPED, remaining windows not attempted");
-                    break;
-                }
-
-                if (!string.IsNullOrEmpty(r.Error))
-                {
-                    _logger.LogWarning("VehicleSales window {from}-{to} failed, retrying once: {err}",
-                        chunkStart.ToShortDateString(), chunkEnd.ToShortDateString(), r.Error);
-
-                    var retry = await SyncVehicleSalesForRangeAsync(chunkStart, chunkEnd);
-                    totalResult.RecordsFetched  += retry.RecordsFetched;
-                    totalResult.RecordsInserted += retry.RecordsInserted;
-
-                    if (!string.IsNullOrEmpty(retry.Error))
-                        failedChunks.Add($"{chunkStart:yyyy-MM-dd}..{chunkEnd:yyyy-MM-dd}: {retry.Error}");
-                }
-
-                chunkStart = chunkEnd.AddDays(1);
-            }
-
-            if (failedChunks.Any())
-            {
-                topLog.Status = "PartialFailure";
-                topLog.ErrorMessage = $"{failedChunks.Count} window(s) failed after retry — VehicleSales data is INCOMPLETE for: "
-                    + string.Join(" | ", failedChunks);
-                totalResult.Error = topLog.ErrorMessage;
-                _logger.LogError("VSR backfill finished with {n} unrecoverable window(s): {details}",
-                    failedChunks.Count, topLog.ErrorMessage);
-            }
-            else
-            {
-                topLog.Status = "Success";
-            }
-        }
-        catch (Exception ex)
-        {
-            topLog.Status = "Failed";
-            topLog.ErrorMessage = ex.InnerException?.Message ?? ex.Message;
-            totalResult.Error = topLog.ErrorMessage;
-            _logger.LogError(ex, "VSR historical backfill failed");
-        }
-
-        topLog.CompletedAt = DateTime.UtcNow;
-        topLog.RecordsFetched  = totalResult.RecordsFetched;
-        topLog.RecordsInserted = totalResult.RecordsInserted;
-        topLog.RecordsUpdated  = 0;
-        await db.SaveChangesAsync();
-
-        return totalResult;
-    }
+        => BackfillViaCheckpointsAsync(SyncApi.VehicleSales, "BackfillVehicleSales", fromDate, toDate, forceResync, ct);
 
     // ─────────────────────────────────────────────────────────
     // CALL CENTRE DEALERS — INSERT ONLY
@@ -1040,286 +554,25 @@ public class DataSyncService
     // VEHICLE DISPATCHES (range) — INSERT ONLY
     // ─────────────────────────────────────────────────────────
 
+    // Dealer-wise (one ERP call per dealer per month) + UPSERT. The former single all-dealer ERP call made the
+    // ERP throw OutOfMemoryException and the Valid=false answer was stored as "0 rows" — data silently missing.
     public async Task<SyncResult> SyncVehicleDispatchesForRangeAsync(DateTime startDate, DateTime endDate)
-    {
-        using var scope = _scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-        var log = new DmsSyncLog
-        {
-            SyncType  = "VehicleDispatches",
-            SyncDate  = DateOnly.FromDateTime(endDate),
-            StartedAt = DateTime.UtcNow,
-            Status    = "Running"
-        };
-        db.DmsSyncLogs.Add(log);
-        await db.SaveChangesAsync();
-
-        var result = new SyncResult { SyncType = "VehicleDispatches", Date = endDate };
-
-        try
-        {
-            var token = await _erpApi.GetValidTokenAsync();
-            var dispatches = await _erpApi.FetchVdrAsync(startDate, endDate, token);
-            result.RecordsFetched = dispatches.Count;
-            _logger.LogInformation("VDR {from:yyyy-MM-dd}..{to:yyyy-MM-dd}: ERP returned {n} row(s).", startDate, endDate, dispatches.Count);
-
-            var droppedAsBlank = dispatches.Count(d => string.IsNullOrEmpty(d.ChassisNo));
-            var afterBlankFilter = dispatches
-                .Where(d => !string.IsNullOrEmpty(d.ChassisNo))
-                .ToList();
-
-            var dedupedRecords = afterBlankFilter
-                .GroupBy(d => d.ChassisNo!.Trim().ToUpperInvariant())
-                .Select(g => g.Last())
-                .ToList();
-            var droppedAsDuplicate = afterBlankFilter.Count - dedupedRecords.Count;
-
-            var chassisKeys = dedupedRecords.Select(d => d.ChassisNo!.Trim().ToUpperInvariant()).ToHashSet();
-            var existingKeys = new HashSet<string>();
-            foreach (var chunk in chassisKeys.Chunk(500))
-            {
-                var chunkSet = chunk.ToHashSet();
-                var rows = await db.DmsVehicleDispatches
-                    .Where(x => x.ChassisNo != null && chunkSet.Contains(x.ChassisNo!.Trim().ToUpper()))
-                    .Select(x => x.ChassisNo!)
-                    .ToListAsync();
-                foreach (var r in rows) existingKeys.Add(r.Trim().ToUpperInvariant());
-            }
-
-            int skippedAsExisting = 0;
-            int skippedOnError = 0;
-            int saveCounter = 0;
-
-            foreach (var d in dedupedRecords)
-            {
-                try
-                {
-                    var parsed = MapVehicleDispatch(d);
-                    var key = parsed.ChassisNo!.Trim().ToUpperInvariant();
-
-                    if (existingKeys.Contains(key))
-                    {
-                        skippedAsExisting++;
-                        continue;
-                    }
-
-                    db.DmsVehicleDispatches.Add(parsed);
-                    result.RecordsInserted++;
-                    existingKeys.Add(key);
-
-                    saveCounter++;
-                    if (saveCounter % SaveBatchSize == 0)
-                        await db.SaveChangesAsync();
-                }
-                catch (Exception ex)
-                {
-                    skippedOnError++;
-                    _logger.LogWarning("Skipping dispatch (chassis {ch}): {msg}", d.ChassisNo, ex.Message);
-                }
-            }
-
-            log.ErrorMessage =
-                $"Dropped: {droppedAsBlank} blank-chassis, {droppedAsDuplicate} in-batch duplicate, " +
-                $"{skippedAsExisting} skipped (already exist), {skippedOnError} per-record error(s). INSERT-ONLY mode.";
-
-            await db.SaveChangesAsync();
-            log.Status = "Success";
-        }
-        catch (Exception ex)
-        {
-            log.Status       = "Failed";
-            log.ErrorMessage = ex.InnerException?.Message ?? ex.Message;
-            result.Error     = log.ErrorMessage;
-            _logger.LogError(ex, "VDR range sync failed");
-        }
-
-        log.CompletedAt     = DateTime.UtcNow;
-        log.RecordsFetched  = result.RecordsFetched;
-        log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated  = 0;
-        await db.SaveChangesAsync();
-
-        return result;
-    }
+        => await UpsertRangeViaEngineAsync(SyncApi.VehicleDispatches, "VehicleDispatches", startDate.Date, endDate.Date, await DealersForManualRangeAsync(), null);
 
     // ─────────────────────────────────────────────────────────
     // VEHICLE DISPATCHES (single date) — INSERT ONLY
     // ─────────────────────────────────────────────────────────
 
+    // Dealer-wise (one ERP call per dealer per month) + UPSERT. The former single all-dealer ERP call made the
+    // ERP throw OutOfMemoryException and the Valid=false answer was stored as "0 rows" — data silently missing.
     public async Task<SyncResult> SyncVehicleDispatchesForDateAsync(DateTime date)
-    {
-        using var scope = _scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        => await UpsertRangeViaEngineAsync(SyncApi.VehicleDispatches, "VehicleDispatches", date.Date, date.Date, await DealersForManualRangeAsync(), null);
 
-        var log = new DmsSyncLog
-        {
-            SyncType  = "VehicleDispatches",
-            SyncDate  = DateOnly.FromDateTime(date),
-            StartedAt = DateTime.UtcNow,
-            Status    = "Running"
-        };
-        db.DmsSyncLogs.Add(log);
-        await db.SaveChangesAsync();
-
-        var result = new SyncResult { SyncType = "VehicleDispatches", Date = date };
-
-        try
-        {
-            var token = await _erpApi.GetValidTokenAsync();
-            var dispatches = await _erpApi.FetchVdrAsync(date, date, token);
-            result.RecordsFetched = dispatches.Count;
-
-            var afterBlankFilter = dispatches
-                .Where(d => !string.IsNullOrEmpty(d.ChassisNo))
-                .ToList();
-
-            var dedupedRecords = afterBlankFilter
-                .GroupBy(d => d.ChassisNo!.Trim().ToUpperInvariant())
-                .Select(g => g.Last())
-                .ToList();
-
-            var chassisKeys = dedupedRecords.Select(d => d.ChassisNo!.Trim().ToUpperInvariant()).ToHashSet();
-            var existingKeySet = (await db.DmsVehicleDispatches
-                .Where(x => x.ChassisNo != null && chassisKeys.Contains(x.ChassisNo!.Trim().ToUpper()))
-                .Select(x => x.ChassisNo!)
-                .ToListAsync())
-                .Select(c => c.Trim().ToUpperInvariant())
-                .ToHashSet();
-
-            int skippedAsExisting = 0;
-            int skippedOnError = 0;
-
-            foreach (var d in dedupedRecords)
-            {
-                try
-                {
-                    var parsed = MapVehicleDispatch(d);
-                    var key = parsed.ChassisNo!.Trim().ToUpperInvariant();
-
-                    if (existingKeySet.Contains(key))
-                    {
-                        skippedAsExisting++;
-                        continue;
-                    }
-
-                    db.DmsVehicleDispatches.Add(parsed);
-                    result.RecordsInserted++;
-                    existingKeySet.Add(key);
-                }
-                catch (Exception ex)
-                {
-                    skippedOnError++;
-                    _logger.LogWarning("Skipping dispatch (chassis {ch}): {msg}",
-                        d.ChassisNo, ex.Message);
-                }
-            }
-
-            log.ErrorMessage = $"{skippedAsExisting} skipped (already exist), {skippedOnError} per-record error(s). INSERT-ONLY mode.";
-
-            await db.SaveChangesAsync();
-            log.Status = "Success";
-        }
-        catch (Exception ex)
-        {
-            log.Status       = "Failed";
-            log.ErrorMessage = ex.InnerException?.Message ?? ex.Message;
-            result.Error     = log.ErrorMessage;
-            _logger.LogError(ex, "Vehicle dispatches sync failed for {date}", date.ToShortDateString());
-        }
-
-        log.CompletedAt     = DateTime.UtcNow;
-        log.RecordsFetched  = result.RecordsFetched;
-        log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated  = 0;
-        await db.SaveChangesAsync();
-
-        return result;
-    }
-
-    public async Task<SyncResult> BackfillVehicleDispatchesAsync(
+    public Task<SyncResult> BackfillVehicleDispatchesAsync(
         DateTime? fromDate = null, DateTime? toDate = null,
         CancellationToken ct = default,
         bool forceResync = false)
-    {
-        using var scope = _scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-        var topLog = new DmsSyncLog { SyncType = "BackfillVehicleDispatches", StartedAt = DateTime.UtcNow, Status = "Running" };
-        db.DmsSyncLogs.Add(topLog);
-        await db.SaveChangesAsync();
-
-        var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2020-01-01";
-        var start = fromDate ?? DateTime.Parse(startDateStr);
-        var end   = toDate   ?? DateTime.UtcNow.Date;
-
-        var totalResult = new SyncResult { SyncType = "BackfillVehicleDispatches" };
-        var failedChunks = new List<string>();
-
-        try
-        {
-            var chunkStart = start;
-            while (chunkStart <= end && !ct.IsCancellationRequested)
-            {
-                var chunkEnd = chunkStart.AddDays(6);
-                if (chunkEnd > end) chunkEnd = end;
-
-                var r = await SyncVehicleDispatchesForRangeAsync(chunkStart, chunkEnd);
-                totalResult.RecordsFetched  += r.RecordsFetched;
-                totalResult.RecordsInserted += r.RecordsInserted;
-
-                if (IsErpAuthError(r.Error))
-                {
-                    failedChunks.Add($"{chunkStart:yyyy-MM-dd}..: {r.Error} — load STOPPED, remaining windows not attempted");
-                    break;
-                }
-
-                if (!string.IsNullOrEmpty(r.Error))
-                {
-                    _logger.LogWarning("VehicleDispatches window {from}-{to} failed, retrying once: {err}",
-                        chunkStart.ToShortDateString(), chunkEnd.ToShortDateString(), r.Error);
-
-                    var retry = await SyncVehicleDispatchesForRangeAsync(chunkStart, chunkEnd);
-                    totalResult.RecordsFetched  += retry.RecordsFetched;
-                    totalResult.RecordsInserted += retry.RecordsInserted;
-
-                    if (!string.IsNullOrEmpty(retry.Error))
-                        failedChunks.Add($"{chunkStart:yyyy-MM-dd}..{chunkEnd:yyyy-MM-dd}: {retry.Error}");
-                }
-
-                chunkStart = chunkEnd.AddDays(1);
-            }
-
-            if (failedChunks.Any())
-            {
-                topLog.Status = "PartialFailure";
-                topLog.ErrorMessage = $"{failedChunks.Count} window(s) failed after retry — VehicleDispatches data is INCOMPLETE for: "
-                    + string.Join(" | ", failedChunks);
-                totalResult.Error = topLog.ErrorMessage;
-                _logger.LogError("VDR backfill finished with {n} unrecoverable window(s): {details}",
-                    failedChunks.Count, topLog.ErrorMessage);
-            }
-            else
-            {
-                topLog.Status = "Success";
-            }
-        }
-        catch (Exception ex)
-        {
-            topLog.Status = "Failed";
-            topLog.ErrorMessage = ex.InnerException?.Message ?? ex.Message;
-            totalResult.Error = topLog.ErrorMessage;
-            _logger.LogError(ex, "VDR historical backfill failed");
-        }
-
-        topLog.CompletedAt = DateTime.UtcNow;
-        topLog.RecordsFetched  = totalResult.RecordsFetched;
-        topLog.RecordsInserted = totalResult.RecordsInserted;
-        topLog.RecordsUpdated  = 0;
-        await db.SaveChangesAsync();
-
-        return totalResult;
-    }
+        => BackfillViaCheckpointsAsync(SyncApi.VehicleDispatches, "BackfillVehicleDispatches", fromDate, toDate, forceResync, ct);
 
     // ─────────────────────────────────────────────────────────
     // LINE ORDER REPORT — INSERT ONLY (unchanged from your version)
@@ -1333,6 +586,10 @@ public class DataSyncService
         List<string>? dealerCodesOverride = null,
         List<string>? failedDealers = null)
     {
+        // Never ask the ERP for more than one month in a single call (memory / ERP load) — split by month.
+        if ((endDate.Date - startDate.Date).TotalDays > 31)
+            return await SplitByMonthAsync(startDate, endDate, (a, b) => SyncLineOrderReportAsync(a, b, ct, dealerCodesOverride, failedDealers));
+
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
@@ -1496,6 +753,28 @@ public class DataSyncService
         return result;
     }
 
+    private static async Task<SyncResult> SplitByMonthAsync(DateTime startDate, DateTime endDate, Func<DateTime, DateTime, Task<SyncResult>> run)
+    {
+        var total  = new SyncResult { Date = endDate };
+        var errors = new List<string>();
+        for (var ms = new DateTime(startDate.Year, startDate.Month, 1); ms <= endDate.Date; ms = ms.AddMonths(1))
+        {
+            var a = ms < startDate.Date ? startDate.Date : ms;
+            var b = ms.AddMonths(1).AddDays(-1);
+            if (b > endDate.Date) b = endDate.Date;
+            var r = await run(a, b);
+            total.SyncType = r.SyncType;
+            total.RecordsFetched  += r.RecordsFetched;
+            total.RecordsInserted += r.RecordsInserted;
+            total.RecordsUpdated  += r.RecordsUpdated;
+            if (!string.IsNullOrEmpty(r.Error) && !r.Error.StartsWith("Dropped:", StringComparison.Ordinal))
+                errors.Add($"{a:yyyy-MM-dd}..{b:yyyy-MM-dd}: {r.Error}");
+            if (IsErpAuthError(r.Error)) break;
+        }
+        if (errors.Count > 0) total.Error = Trunc(string.Join(" | ", errors), 1800);
+        return total;
+    }
+
     public Task<SyncResult> SyncLineOrderReportForDateAsync(DateTime date)
         => SyncLineOrderReportAsync(date, date);
 
@@ -1527,96 +806,124 @@ public class DataSyncService
     // silently). Pass 2 re-fetches only those dealers in yearly slices. Anything still failing is
     // returned in .Error so the nightly reload is marked PartialFailure, not "Success".
     // .Error is only set on real failure here (never the statistics string).
-    public async Task<SyncResult> BackfillLineOrderReportAsync(
+    public Task<SyncResult> BackfillLineOrderReportAsync(
         DateTime? fromDate = null, DateTime? toDate = null,
         CancellationToken ct = default)
+        => BackfillViaCheckpointsAsync(SyncApi.LineOrderReport, "BackfillLineOrderReport", fromDate, toDate, false, ct);
+
+    // Shared by the four Backfill* methods above. Writes one DmsSyncLog row (same SyncType names as before).
+    private async Task<SyncResult> BackfillViaCheckpointsAsync(
+        string api, string logType, DateTime? fromDate, DateTime? toDate, bool forceResync, CancellationToken ct)
     {
-        var startDateStr = _config["SyncSettings:HistoricalStartDate"] ?? "2020-01-01";
-        var start = fromDate ?? DateTime.Parse(startDateStr);
-        var end   = toDate   ?? DateTime.UtcNow.Date;
+        var start = (fromDate ?? HistoricalStartDate()).Date;
+        var end   = (toDate ?? TodayIst()).Date;
+        var refresh = forceResync || fromDate.HasValue || toDate.HasValue ? DateTime.UtcNow : (DateTime?)null;
 
-        var failedDealers = new List<string>();
-        var pass1 = await SyncLineOrderReportAsync(start, end, ct, failedDealers: failedDealers);
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var log = new DmsSyncLog { SyncType = logType, SyncDate = DateOnly.FromDateTime(end), StartedAt = DateTime.UtcNow, Status = "Running" };
+        db.DmsSyncLogs.Add(log);
+        await db.SaveChangesAsync(CancellationToken.None);
 
-        var total = new SyncResult
+        SyncResult r;
+        try
         {
-            SyncType        = "BackfillLineOrderReport",
-            Date            = end,
-            RecordsFetched  = pass1.RecordsFetched,
-            RecordsInserted = pass1.RecordsInserted
-        };
-
-        if (IsLorFailure(pass1))
+            r = await RunCheckpointSyncAsync(new CheckpointRunOptions(
+                    new[] { api }, start, end, HistoricalPerDealer(), refresh, null, api), ct);
+            log.Status = string.IsNullOrEmpty(r.Error) ? "Success" : "PartialFailure";
+            log.ErrorMessage = r.Error;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            total.Error = pass1.Error;
-            return total;
+            log.Status = "Interrupted";
+            log.ErrorMessage = "Stopped (app shutting down) — resumes from the checkpoint on the next run.";
+            r = new SyncResult { SyncType = logType, Error = log.ErrorMessage };
+        }
+        catch (Exception ex)
+        {
+            log.Status = "Failed";
+            log.ErrorMessage = Trunc(ex.InnerException?.Message ?? ex.Message, 1800);
+            r = new SyncResult { SyncType = logType, Error = log.ErrorMessage };
+            _logger.LogError(ex, "{type} failed", logType);
         }
 
-        // ZERO-ROW CHECK: every dealer answered (HTTP 200, no error) but not one row came back for the
-        // whole 2020→today range. The ERP may refuse or silently empty very long ranges, so re-fetch every
-        // dealer in yearly slices before accepting "no data".
-        var zeroProbe = false;
-        if (pass1.RecordsFetched == 0 && failedDealers.Count == 0)
+        r.SyncType = logType;
+        log.CompletedAt     = DateTime.UtcNow;
+        log.RecordsFetched  = r.RecordsFetched;
+        log.RecordsInserted = r.RecordsInserted;
+        log.RecordsUpdated  = r.RecordsUpdated;
+        try { await db.SaveChangesAsync(CancellationToken.None); }
+        catch (Exception ex) { _logger.LogWarning("Could not write {type} sync-log row: {msg}", logType, ex.Message); }
+        return r;
+    }
+
+    private DateTime HistoricalStartDate()
+        => DateTime.TryParse(_config["SyncSettings:HistoricalStartDate"], CultureInfo.InvariantCulture, DateTimeStyles.None, out var d)
+            ? d.Date : new DateTime(2020, 1, 1);
+
+    private static DateTime TodayIst() => DateTime.UtcNow.AddMinutes(330).Date;
+
+    // ALWAYS dealer-wise. Fetching all dealers in one call makes the ERP itself throw OutOfMemoryException
+    // (verified 14.11.2026: DJR 01-10-2026..31-10-2026, dealercode "" → 45 s, Valid=false, OutOfMemory;
+    // dealercode CUS0379 → 3 s, 67 KB, OK). The all-dealer form is only possible with the explicit
+    // escape hatch HistoricalSync:AllowAllDealerCalls = true (not recommended).
+    private bool HistoricalPerDealer()
+        => !_config.GetValue("HistoricalSync:AllowAllDealerCalls", false) || _config.GetValue("HistoricalSync:PerDealer", true);
+
+    private async Task<List<string>> DealersForManualRangeAsync()
+    {
+        var d = HistoricalPerDealer() ? await GetSyncDealerCodesAsync(CancellationToken.None) : new List<string>();
+        return d.Count > 0 ? d : new List<string> { "" };
+    }
+
+    // Historical sync from HistoricalStartDate → today, resuming from the checkpoints (used by the hosted
+    // service after every start, and by POST api/admin/reload/start?mode=historical). deadlineUtc lets the
+    // nightly sync take over at its scheduled time; the historical sync then continues on the next slice.
+    public async Task<SyncResult> RunHistoricalCheckpointSyncAsync(DateTime? deadlineUtc, CancellationToken ct,
+                                                                   IReadOnlyCollection<string>? apis = null)
+    {
+        var order = _config.GetSection("HistoricalSync:ApiOrder").Get<string[]>()?
+            .Select(SyncApi.Normalize).Where(a => a != null).Select(a => a!).Distinct().ToArray();
+        var list = (apis is { Count: > 0 } ? apis.ToArray() : (order is { Length: > 0 } ? order : SyncApi.All));
+
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var log = new DmsSyncLog { SyncType = "HistoricalCheckpointSync", SyncDate = DateOnly.FromDateTime(TodayIst()), StartedAt = DateTime.UtcNow, Status = "Running" };
+        db.DmsSyncLogs.Add(log);
+        await db.SaveChangesAsync(CancellationToken.None);
+
+        SyncResult r;
+        try
         {
-            using var probeScope = _scopeFactory.CreateScope();
-            var probeDb = probeScope.ServiceProvider.GetRequiredService<AppDbContext>();
-            failedDealers = await probeDb.DmsDealers
-                .Where(d => d.DealerCode != null)
-                .Select(d => d.DealerCode!)
-                .Distinct()
-                .ToListAsync(CancellationToken.None);
-            zeroProbe = failedDealers.Count > 0;
-            if (zeroProbe)
-                _logger.LogWarning("LOR: full-range fetch returned 0 rows for all {n} dealers — retrying every dealer in yearly slices.", failedDealers.Count);
+            r = await RunCheckpointSyncAsync(new CheckpointRunOptions(
+                    list, HistoricalStartDate(), TodayIst(), HistoricalPerDealer(), null, deadlineUtc, "Historical"), ct);
+            log.Status = string.IsNullOrEmpty(r.Error) ? "Success" : "PartialFailure";
+            log.ErrorMessage = r.Error;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            log.Status = "Interrupted";
+            log.ErrorMessage = "Stopped (app shutting down / recycle) — resumes from the checkpoint on the next start.";
+            r = new SyncResult { SyncType = "HistoricalCheckpointSync", Error = log.ErrorMessage };
+            log.CompletedAt = DateTime.UtcNow;
+            try { await db.SaveChangesAsync(CancellationToken.None); } catch { /* best effort during shutdown */ }
+            throw;
+        }
+        catch (Exception ex)
+        {
+            log.Status = "Failed";
+            log.ErrorMessage = Trunc(ex.InnerException?.Message ?? ex.Message, 1800);
+            r = new SyncResult { SyncType = "HistoricalCheckpointSync", Error = log.ErrorMessage };
+            _logger.LogError(ex, "Historical checkpoint sync failed");
         }
 
-        var stillFailed = new List<string>();
-
-        foreach (var dealer in failedDealers.Distinct(StringComparer.OrdinalIgnoreCase).ToList())
-        {
-            ct.ThrowIfCancellationRequested();
-            _logger.LogWarning("LOR: retrying dealer {dc} in yearly slices after a failed full-range fetch.", dealer);
-
-            var dealerFailed = false;
-            var sliceStart = start;
-            while (sliceStart <= end)
-            {
-                var sliceEnd = sliceStart.AddYears(1).AddDays(-1);
-                if (sliceEnd > end) sliceEnd = end;
-
-                var sliceFailed = new List<string>();
-                var r = await SyncLineOrderReportAsync(
-                    sliceStart, sliceEnd, ct, new List<string> { dealer }, sliceFailed);
-
-                total.RecordsFetched  += r.RecordsFetched;
-                total.RecordsInserted += r.RecordsInserted;
-
-                if (sliceFailed.Count > 0 || IsLorFailure(r))
-                    dealerFailed = true;
-
-                sliceStart = sliceEnd.AddDays(1);
-            }
-
-            if (dealerFailed) stillFailed.Add(dealer);
-        }
-
-        if (zeroProbe && total.RecordsFetched == 0 && stillFailed.Count == 0)
-        {
-            total.Error = "LineOrderReport: the ERP returned 0 rows for every dealer, for the full range AND for yearly slices " +
-                          "(HTTP 200, no error) — the ERP LOR API returned no data; this is not a database problem.";
-            _logger.LogError("{msg}", total.Error);
-        }
-
-        if (stillFailed.Count > 0)
-        {
-            total.Error = $"LineOrderReport INCOMPLETE for {stillFailed.Count} dealer(s) after retry: "
-                + string.Join(", ", stillFailed.Take(30))
-                + (stillFailed.Count > 30 ? ", …" : "");
-            _logger.LogError("LOR backfill finished with {n} dealer(s) still failing: {dealers}",
-                stillFailed.Count, string.Join(", ", stillFailed));
-        }
-
-        return total;
+        log.CompletedAt     = DateTime.UtcNow;
+        log.RecordsFetched  = r.RecordsFetched;
+        log.RecordsInserted = r.RecordsInserted;
+        log.RecordsUpdated  = r.RecordsUpdated;
+        try { await db.SaveChangesAsync(CancellationToken.None); }
+        catch (Exception ex) { _logger.LogWarning("Could not write HistoricalCheckpointSync sync-log row: {msg}", ex.Message); }
+        return r;
     }
 
     // ─────────────────────────────────────────────────────────
@@ -1662,6 +969,9 @@ public class DataSyncService
                 throw;
             }
         }
+    
+        // The data is gone, so the checkpoints must not claim "Completed" any more.
+        await ResetCheckpointsAsync(null, null, null, null, failedOnly: false, CancellationToken.None);
     }
 
     // ─────────────────────────────────────────────────────────
@@ -1687,7 +997,6 @@ public class DataSyncService
     {
         var overall   = new SyncResult { SyncType = "NightlyFullReload" };
         var problems  = new List<string>();
-        var truncated = false;
 
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -1720,6 +1029,7 @@ public class DataSyncService
         {
             overall.RecordsFetched  += r.RecordsFetched;
             overall.RecordsInserted += r.RecordsInserted;
+            overall.RecordsUpdated  += r.RecordsUpdated;
             fetchedBy[name] = fetchedBy.GetValueOrDefault(name) + r.RecordsFetched;
             if (!string.IsNullOrEmpty(r.Error)) problems.Add($"{name}: {r.Error}");
         }
@@ -1743,12 +1053,12 @@ public class DataSyncService
             if (dealersEmpty || _config.GetValue("Sync:RefreshDealers", false))
             {
                 await Step(dealersEmpty
-                    ? "dealers (pincode sync) — DMS_Dealers is empty, required for LOR — data tables NOT truncated yet"
-                    : "dealers (pincode sync) — Sync:RefreshDealers=true — data tables NOT truncated yet");
+                    ? "dealers (pincode sync) — DMS_Dealers is empty, required for dealer-wise sync"
+                    : "dealers (pincode sync) — Sync:RefreshDealers=true");
                 Collect("Dealers", await SyncAllDealersAsync());
                 ct.ThrowIfCancellationRequested();
 
-                await Step("call-centre dealers — data tables NOT truncated yet");
+                await Step("call-centre dealers");
                 Collect("CallCentreDealers", await SyncCallCentreDealersAsync());
                 ct.ThrowIfCancellationRequested();
             }
@@ -1757,27 +1067,18 @@ public class DataSyncService
                 _logger.LogInformation("Nightly full reload — dealer pincode sync skipped (Sync:RefreshDealers=false, DMS_Dealers has rows).");
             }
 
-            // 3 ── TRUNCATE, then immediately re-fetch the reports
-            await Step("truncating ServiceHistory, VehicleSales, VehicleDispatches, LineOrderReport");
-            truncated = true;   // set BEFORE the call: a failure part-way leaves the tables in an unknown state
-            await TruncateAllDataTablesAsync();
-
-            // ORDER: the three faster reports first, the slow ServiceHistory (DJR, hours) LAST. Before this
-            // change DJR ran first and a stop or ERP slowness during it left VSR/VDR/LOR at 0 rows.
-            await Step($"VehicleSales {start:yyyy-MM-dd} → {end:yyyy-MM-dd}");
-            Collect("VehicleSales", await BackfillVehicleSalesAsync(start, end, ct));
-            ct.ThrowIfCancellationRequested();
-
-            await Step($"VehicleDispatches {start:yyyy-MM-dd} → {end:yyyy-MM-dd}");
-            Collect("VehicleDispatches", await BackfillVehicleDispatchesAsync(start, end, ct));
-            ct.ThrowIfCancellationRequested();
-
-            await Step($"LineOrderReport {start:yyyy-MM-dd} → {end:yyyy-MM-dd}");
-            Collect("LineOrderReport", await BackfillLineOrderReportAsync(start, end, ct));
-            ct.ThrowIfCancellationRequested();
-
-            await Step($"ServiceHistory {start:yyyy-MM-dd} → {end:yyyy-MM-dd}");
-            Collect("ServiceHistory", await BackfillHistoricalDataAsync(start, end, ct));
+            // 3 ── NO TRUNCATE any more. The old TRUNCATE + reload-everything-in-one-go left the tables empty
+            //      for hours, was killed half-way by IIS recycles (tables left empty) and loaded years of ERP data
+            //      into memory (OutOfMemoryException, HTTP 503 from the overloaded ERP). "Full" now means:
+            //      put every month back to Pending and re-check all of them month-wise / dealer-wise with UPSERT.
+            //      Data stays visible the whole time and the run resumes from the checkpoint after a stop.
+            await Step("re-checking every month from HistoricalStartDate (checkpoints reset, UPSERT, no truncate)");
+            await ResetCheckpointsAsync(null, start, end, null, failedOnly: false, CancellationToken.None);
+            var full = await RunCheckpointSyncAsync(new CheckpointRunOptions(
+                SyncApi.All, start, end, HistoricalPerDealer(), null, null, "FullRecheck"), ct);
+            Collect("AllReports", full);
+            foreach (var name in new[] { "ServiceHistory", "VehicleSales", "VehicleDispatches", "LineOrderReport" })
+                fetchedBy[name] = full.RecordsFetched;   // EmptyWhy() below: "fetched=0" vs "fetched but not saved"
             ct.ThrowIfCancellationRequested();
 
             // 4 ── VALIDATE
@@ -1813,9 +1114,7 @@ public class DataSyncService
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             log.Status = "Interrupted";
-            log.ErrorMessage = truncated
-                ? "INTERRUPTED (app shutting down) AFTER truncate — tables are only partly loaded. Run the reload again."
-                : "Interrupted before truncate — no data was changed.";
+            log.ErrorMessage = "INTERRUPTED (app shutting down / IIS recycle). Nothing was deleted; the sync resumes from the checkpoint on the next run.";
             overall.Error = log.ErrorMessage;
             _logger.LogWarning("Nightly full reload interrupted: {msg}", log.ErrorMessage);
             throw;
@@ -1825,18 +1124,16 @@ public class DataSyncService
             var reason = ex.InnerException?.Message ?? ex.Message;
             log.Status = "Failed";
             log.ErrorMessage = Trunc(
-                (truncated
-                    ? "FAILED AFTER truncate — tables may be empty or partial. "
-                    : "FAILED BEFORE truncate — existing data untouched. ") + reason, 1800);
+                "FAILED (nothing deleted — no truncate) — " + reason, 1800);
             overall.Error = log.ErrorMessage;
-            _logger.LogError(ex, "Nightly full reload failed ({where} truncate)", truncated ? "after" : "before");
+            _logger.LogError(ex, "Nightly full re-check failed (no data deleted)");
         }
         finally
         {
             log.CompletedAt     = DateTime.UtcNow;
             log.RecordsFetched  = overall.RecordsFetched;
             log.RecordsInserted = overall.RecordsInserted;
-            log.RecordsUpdated  = 0;
+            log.RecordsUpdated  = overall.RecordsUpdated;
             try { await db.SaveChangesAsync(CancellationToken.None); }
             catch (Exception saveEx) { _logger.LogError(saveEx, "Could not write the NightlyFullReload sync-log row"); }
         }
@@ -2127,7 +1424,7 @@ public class DataSyncService
 
         var months = Math.Clamp(_config.GetValue("Sync:RollingMonths", 6), 1, 36);
         var end    = DateTime.UtcNow.AddMinutes(330).Date;   // today in IST (UTC+5:30)
-        var start  = end.AddMonths(-months);
+        var start  = new DateTime(end.Year, end.Month, 1).AddMonths(-(months - 1));   // whole months
 
         async Task Step(string text)
         {
@@ -2142,39 +1439,6 @@ public class DataSyncService
             overall.RecordsFetched  += r.RecordsFetched;
             overall.RecordsInserted += r.RecordsInserted;
             overall.RecordsUpdated  += r.RecordsUpdated;
-        }
-
-        // One report, split into date windows. Each window is retried once if it fails.
-        async Task Windows(string name, Func<DateTime, DateTime> windowEnd, Func<DateTime, DateTime, Task<SyncResult>> run)
-        {
-            var failed = new List<string>();
-            var ws = start;
-            while (ws <= end)
-            {
-                ct.ThrowIfCancellationRequested();
-                var we = windowEnd(ws);
-                if (we > end) we = end;
-
-                await Step($"{name} {ws:yyyy-MM-dd}..{we:yyyy-MM-dd}");
-                var r = await run(ws, we);
-                Add(r);
-                if (IsErpAuthError(r.Error))
-                {
-                    failed.Add($"{ws:yyyy-MM-dd}..: {r.Error} — {name} STOPPED, remaining windows not attempted");
-                    break;
-                }
-                if (!string.IsNullOrEmpty(r.Error))
-                {
-                    _logger.LogWarning("{name} window {a}..{b} failed, retrying once: {err}", name, ws, we, r.Error);
-                    r = await run(ws, we);
-                    Add(r);
-                    if (!string.IsNullOrEmpty(r.Error))
-                        failed.Add($"{ws:yyyy-MM-dd}..{we:yyyy-MM-dd}: {r.Error}");
-                }
-                ws = we.AddDays(1);
-            }
-            if (failed.Count > 0)
-                problems.Add($"{name}: {failed.Count} window(s) failed after retry — INCOMPLETE for " + string.Join(" | ", failed));
         }
 
         try
@@ -2192,27 +1456,18 @@ public class DataSyncService
                 ct.ThrowIfCancellationRequested();
             }
 
-            await Windows("ServiceHistory",    s => new DateTime(s.Year, s.Month, 1).AddMonths(1).AddDays(-1), (a, b) => UpsertDjrAdaptiveAsync(a, b));
-            await Windows("VehicleSales",      s => s.AddDays(6),               (a, b) => UpsertVehicleSalesForRangeAsync(a, b));
-            await Windows("VehicleDispatches", s => s.AddDays(6),               (a, b) => UpsertVehicleDispatchesForRangeAsync(a, b));
-
-            // LOR: one ERP call per dealer for the whole window; failed dealers are retried once.
-            await Step($"LineOrderReport {start:yyyy-MM-dd}..{end:yyyy-MM-dd} (all dealers)");
-            var failedDealers = new List<string>();
-            var lor = await UpsertLineOrderReportAsync(start, end, failedDealers);
-            Add(lor);
-            if (!string.IsNullOrEmpty(lor.Error)) problems.Add("LineOrderReport: " + lor.Error);
+            // Month-wise, dealer-wise UPSERT through the checkpoint engine. Months already refreshed by
+            // tonight's run (completed after 00:00 IST today) are skipped, so a run that was stopped by an
+            // IIS recycle / restart resumes where it stopped instead of starting again.
+            //   Dealer-wise for every API (all-dealer month calls crash the ERP with OutOfMemoryException).
+            var refreshCutoffUtc = end.AddMinutes(-330);   // 00:00 IST today, in UTC
+            var nightly = await RunCheckpointSyncAsync(new CheckpointRunOptions(
+                NightlyApiOrder, start, end,
+                HistoricalPerDealer(),
+                refreshCutoffUtc, null, "Nightly"), ct);
+            Add(nightly);
+            if (!string.IsNullOrEmpty(nightly.Error)) problems.Add(nightly.Error);
             ct.ThrowIfCancellationRequested();
-
-            if (failedDealers.Count > 0)
-            {
-                await Step($"LineOrderReport retry for {failedDealers.Count} failed dealer(s)");
-                var stillFailed = new List<string>();
-                Add(await UpsertLineOrderReportAsync(start, end, stillFailed, failedDealers.ToList()));
-                if (stillFailed.Count > 0)
-                    problems.Add($"LineOrderReport: {stillFailed.Count} dealer(s) failed after retry: "
-                                 + string.Join(", ", stillFailed.Take(20)));
-            }
 
             // Dealer refresh (GET /V1/callcenter/pin, ~900 calls) only when explicitly enabled.
             // OFF by default: the four reports are what the business needs every morning.
@@ -2298,41 +1553,14 @@ public class DataSyncService
         return overall;
     }
 
+    // Faster reports first, the slow ServiceHistory (DJR) last — a stop during DJR then cannot leave the
+    // other three un-refreshed.
+    private static readonly string[] NightlyApiOrder =
+        { SyncApi.VehicleSales, SyncApi.VehicleDispatches, SyncApi.LineOrderReport, SyncApi.ServiceHistory };
+
     // Upsert variant of the DJR fallback: if a window fails, split it into halves (down to
     // Sync:DjrMinWindowDays) and upsert each piece. Returns a combined result; Error is set only if a
     // piece still fails at the minimum size. Upsert is idempotent, so repeating a window is safe.
-    private async Task<SyncResult> UpsertDjrAdaptiveAsync(DateTime from, DateTime to)
-    {
-        var minDays = Math.Clamp(_config.GetValue("Sync:DjrMinWindowDays", 1), 1, 31);
-        var total   = new SyncResult { SyncType = "ServiceHistoryUpsert" };
-        var errors  = new List<string>();
-
-        async Task Solve(DateTime a, DateTime b, bool retried)
-        {
-            var r = await UpsertServiceHistoryForRangeAsync(a, b);
-            total.RecordsFetched  += r.RecordsFetched;
-            total.RecordsInserted += r.RecordsInserted;
-            total.RecordsUpdated  += r.RecordsUpdated;
-            if (string.IsNullOrEmpty(r.Error)) return;
-
-            if (IsErpAuthError(r.Error)) { errors.Add($"{a:yyyy-MM-dd}..{b:yyyy-MM-dd}: {r.Error}"); return; }
-
-            if (!retried && !IsDeterministicParseError(r.Error)) { await Solve(a, b, true); return; }
-
-            var days = (b - a).Days + 1;
-            if (days <= minDays) { errors.Add($"{a:yyyy-MM-dd}..{b:yyyy-MM-dd}: {r.Error}"); return; }
-
-            var mid = a.AddDays(days / 2 - 1);
-            _logger.LogWarning("DJR upsert window {a:yyyy-MM-dd}..{b:yyyy-MM-dd} still failing — splitting at {m:yyyy-MM-dd}", a, b, mid);
-            await Solve(a, mid, false);
-            await Solve(mid.AddDays(1), b, false);
-        }
-
-        await Solve(from, to, false);
-        if (errors.Count > 0) total.Error = string.Join(" | ", errors);
-        return total;
-    }
-
     // Do not truncate until the ERP can actually serve data: login must work and one real DJR
     // call (the latest day) must come back without error. Re-checks every 10 minutes, 6 times.
     private async Task WaitForErpHealthyAsync(DateTime probeDate, CancellationToken ct)
@@ -2347,7 +1575,9 @@ public class DataSyncService
             try
             {
                 var token = await _erpApi.GetValidTokenAsync();
-                await _erpApi.FetchDjrAsync(probeDate, token, "");   // throws if the call fails after its own retries
+                // One dealer, one day — an all-dealer call can itself crash the ERP (OutOfMemory).
+                var probeDealer = (await GetSyncDealerCodesAsync(ct)).FirstOrDefault() ?? "";
+                await _erpApi.FetchDjrAsync(probeDate, token, probeDealer);   // throws if the call fails after its own retries
                 _logger.LogInformation("ERP preflight OK (attempt {a}/{max}).", attempt, maxAttempts);
                 return;
             }
@@ -2373,296 +1603,13 @@ public class DataSyncService
     // ─────────────────────────────────────────────────────────
 
     public async Task<SyncResult> UpsertServiceHistoryForRangeAsync(DateTime startDate, DateTime endDate)
-    {
-        using var scope = _scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-        var log = new DmsSyncLog
-        {
-            SyncType  = "ServiceHistoryUpsert",
-            SyncDate  = DateOnly.FromDateTime(endDate),
-            StartedAt = DateTime.UtcNow,
-            Status    = "Running"
-        };
-        db.DmsSyncLogs.Add(log);
-        await db.SaveChangesAsync();
-
-        var result = new SyncResult { SyncType = "ServiceHistoryUpsert", Date = endDate };
-
-        try
-        {
-            var token = await _erpApi.GetValidTokenAsync();
-            var jobs = await _erpApi.FetchDjrRangeAsync(startDate, endDate, token);
-            result.RecordsFetched = jobs.Count;
-
-            var afterFilter = jobs
-                .Where(j => j.JobNo != "Total"
-                        && !string.IsNullOrEmpty(j.DealerCode)
-                        && !string.IsNullOrEmpty(j.JobNo))
-                .ToList();
-
-            var parsedRecords = afterFilter
-                .Select(j =>
-                {
-                    var parsed = ParseServiceHistory(j);
-                    if (parsed.JobDate == null)
-                        parsed.JobDate = DateOnly.FromDateTime(endDate);
-                    parsed.UniqueKey = BuildUniqueKey(parsed.DealerCode, parsed.JobNo, parsed.JobDate, parsed.ChassisNo);
-                    return parsed;
-                })
-                .ToList();
-
-            var dedupedRecords = parsedRecords
-                .GroupBy(p => p.UniqueKey)
-                .Select(g => g.Last())
-                .ToList();
-
-            var candidateKeys = dedupedRecords.Select(p => p.UniqueKey).ToHashSet();
-            var existingRaw = await db.DmsServiceHistories
-                .Where(x => x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
-                .ToListAsync();
-            var existingLookup = existingRaw
-                .Where(x => x.UniqueKey != null)
-                .GroupBy(x => x.UniqueKey!)
-                .ToDictionary(g => g.Key, g => g.First());
-
-            int saveCounter = 0;
-            int skippedOnError = 0;
-
-            foreach (var parsed in dedupedRecords)
-            {
-                try
-                {
-                    if (existingLookup.TryGetValue(parsed.UniqueKey!, out var existing))
-                    {
-                        existing.JobDate = parsed.JobDate; existing.DocNo = parsed.DocNo;
-                        existing.DocType = parsed.DocType; existing.DocDate = parsed.DocDate;
-                        existing.InvoiceDate = parsed.InvoiceDate; existing.NetTotal = parsed.NetTotal;
-                        existing.EstimatedJobExpenses = parsed.EstimatedJobExpenses;
-                        existing.Parts = parsed.Parts; existing.Labour = parsed.Labour;
-                        existing.Gstamount = parsed.Gstamount; existing.Igstamount = parsed.Igstamount;
-                        existing.TotalWotax = parsed.TotalWotax; existing.UpdatedAt = DateTime.UtcNow;
-                        result.RecordsUpdated++;
-                    }
-                    else
-                    {
-                        db.DmsServiceHistories.Add(parsed);
-                        result.RecordsInserted++;
-                    }
-
-                    saveCounter++;
-                    if (saveCounter % SaveBatchSize == 0)
-                        await db.SaveChangesAsync();
-                }
-                catch (Exception ex)
-                {
-                    skippedOnError++;
-                    _logger.LogWarning("Upsert skip job {no} for {dc}: {msg}", parsed.JobNo, parsed.DealerCode, ex.Message);
-                }
-            }
-
-            log.ErrorMessage = $"{skippedOnError} per-record error(s). UPSERT mode.";
-            await db.SaveChangesAsync();
-            log.Status = "Success";
-        }
-        catch (Exception ex)
-        {
-            log.Status = "Failed";
-            log.ErrorMessage = ex.InnerException?.Message ?? ex.Message;
-            result.Error = log.ErrorMessage;
-            _logger.LogError(ex, "ServiceHistory upsert failed");
-        }
-
-        log.CompletedAt = DateTime.UtcNow;
-        log.RecordsFetched = result.RecordsFetched;
-        log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated = result.RecordsUpdated;
-        await db.SaveChangesAsync();
-        return result;
-    }
+        => await UpsertRangeViaEngineAsync(SyncApi.ServiceHistory, "ServiceHistoryUpsert", startDate, endDate, await DealersForManualRangeAsync(), null);
 
     public async Task<SyncResult> UpsertVehicleSalesForRangeAsync(DateTime startDate, DateTime endDate)
-    {
-        using var scope = _scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-        var log = new DmsSyncLog
-        {
-            SyncType = "VehicleSalesUpsert", SyncDate = DateOnly.FromDateTime(endDate),
-            StartedAt = DateTime.UtcNow, Status = "Running"
-        };
-        db.DmsSyncLogs.Add(log);
-        await db.SaveChangesAsync();
-
-        var result = new SyncResult { SyncType = "VehicleSalesUpsert", Date = endDate };
-
-        try
-        {
-            var token = await _erpApi.GetValidTokenAsync();
-            var sales = await _erpApi.FetchVsrAsync("", startDate, endDate, token);
-            result.RecordsFetched = sales.Count;
-
-            var dedupedRecords = sales
-                .Where(s => !string.IsNullOrEmpty(s.ChassisNo))
-                .GroupBy(s => s.ChassisNo!.Trim().ToUpperInvariant())
-                .Select(g => g.Last())
-                .ToList();
-
-            var chassisKeys = dedupedRecords.Select(s => s.ChassisNo!.Trim().ToUpperInvariant()).ToHashSet();
-            var existingRaw = await db.DmsVehicleSales
-                .Where(x => x.ChassisNo != null && chassisKeys.Contains(x.ChassisNo!.Trim().ToUpper()))
-                .ToListAsync();
-            var existingLookup = existingRaw
-                .Where(x => x.ChassisNo != null)
-                .GroupBy(x => x.ChassisNo!.Trim().ToUpperInvariant())
-                .ToDictionary(g => g.Key, g => g.First());
-
-            int saveCounter = 0;
-            int skippedOnError = 0;
-
-            foreach (var sale in dedupedRecords)
-            {
-                try
-                {
-                    var parsed = ParseVehicleSale(sale);
-                    var key = parsed.ChassisNo!.Trim().ToUpperInvariant();
-
-                    if (existingLookup.TryGetValue(key, out var existing))
-                    {
-                        existing.InvoiceNo = parsed.InvoiceNo; existing.InvoiceDate = parsed.InvoiceDate;
-                        existing.NetAmount = parsed.NetAmount; existing.ItemRate = parsed.ItemRate;
-                        existing.FinancedBy = parsed.FinancedBy; existing.FinAmount = parsed.FinAmount;
-                        existing.SoldTo = parsed.SoldTo; existing.CusMob = parsed.CusMob;
-                        existing.UpdatedAt = DateTime.UtcNow;
-                        result.RecordsUpdated++;
-                    }
-                    else
-                    {
-                        db.DmsVehicleSales.Add(parsed);
-                        result.RecordsInserted++;
-                    }
-
-                    saveCounter++;
-                    if (saveCounter % SaveBatchSize == 0)
-                        await db.SaveChangesAsync();
-                }
-                catch (Exception ex)
-                {
-                    skippedOnError++;
-                    _logger.LogWarning("Upsert skip sale (chassis {ch}): {msg}", sale.ChassisNo, ex.Message);
-                }
-            }
-
-            log.ErrorMessage = $"{skippedOnError} per-record error(s). UPSERT mode.";
-            await db.SaveChangesAsync();
-            log.Status = "Success";
-        }
-        catch (Exception ex)
-        {
-            log.Status = "Failed";
-            log.ErrorMessage = ex.InnerException?.Message ?? ex.Message;
-            result.Error = log.ErrorMessage;
-            _logger.LogError(ex, "VehicleSales upsert failed");
-        }
-
-        log.CompletedAt = DateTime.UtcNow;
-        log.RecordsFetched = result.RecordsFetched;
-        log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated = result.RecordsUpdated;
-        await db.SaveChangesAsync();
-        return result;
-    }
+        => await UpsertRangeViaEngineAsync(SyncApi.VehicleSales, "VehicleSalesUpsert", startDate, endDate, await DealersForManualRangeAsync(), null);
 
     public async Task<SyncResult> UpsertVehicleDispatchesForRangeAsync(DateTime startDate, DateTime endDate)
-    {
-        using var scope = _scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-        var log = new DmsSyncLog
-        {
-            SyncType = "VehicleDispatchesUpsert", SyncDate = DateOnly.FromDateTime(endDate),
-            StartedAt = DateTime.UtcNow, Status = "Running"
-        };
-        db.DmsSyncLogs.Add(log);
-        await db.SaveChangesAsync();
-
-        var result = new SyncResult { SyncType = "VehicleDispatchesUpsert", Date = endDate };
-
-        try
-        {
-            var token = await _erpApi.GetValidTokenAsync();
-            var dispatches = await _erpApi.FetchVdrAsync(startDate, endDate, token);
-            result.RecordsFetched = dispatches.Count;
-
-            var dedupedRecords = dispatches
-                .Where(d => !string.IsNullOrEmpty(d.ChassisNo))
-                .GroupBy(d => d.ChassisNo!.Trim().ToUpperInvariant())
-                .Select(g => g.Last())
-                .ToList();
-
-            var chassisKeys = dedupedRecords.Select(d => d.ChassisNo!.Trim().ToUpperInvariant()).ToHashSet();
-            var existingRaw = await db.DmsVehicleDispatches
-                .Where(x => x.ChassisNo != null && chassisKeys.Contains(x.ChassisNo!.Trim().ToUpper()))
-                .ToListAsync();
-            var existingLookup = existingRaw
-                .Where(x => x.ChassisNo != null)
-                .GroupBy(x => x.ChassisNo!.Trim().ToUpperInvariant())
-                .ToDictionary(g => g.Key, g => g.First());
-
-            int saveCounter = 0;
-            int skippedOnError = 0;
-
-            foreach (var d in dedupedRecords)
-            {
-                try
-                {
-                    var parsed = MapVehicleDispatch(d);
-                    var key = parsed.ChassisNo!.Trim().ToUpperInvariant();
-
-                    if (existingLookup.TryGetValue(key, out var existing))
-                    {
-                        existing.VehicleStatus = parsed.VehicleStatus; existing.InvoiceNo = parsed.InvoiceNo;
-                        existing.InvoiceDate = parsed.InvoiceDate; existing.NameOfParty = parsed.NameOfParty;
-                        existing.MobileNo = parsed.MobileNo; existing.FinancerName = parsed.FinancerName;
-                        existing.FinAmount = parsed.FinAmount; existing.UpdatedAt = DateTime.UtcNow;
-                        result.RecordsUpdated++;
-                    }
-                    else
-                    {
-                        db.DmsVehicleDispatches.Add(parsed);
-                        result.RecordsInserted++;
-                    }
-
-                    saveCounter++;
-                    if (saveCounter % SaveBatchSize == 0)
-                        await db.SaveChangesAsync();
-                }
-                catch (Exception ex)
-                {
-                    skippedOnError++;
-                    _logger.LogWarning("Upsert skip dispatch (chassis {ch}): {msg}", d.ChassisNo, ex.Message);
-                }
-            }
-
-            log.ErrorMessage = $"{skippedOnError} per-record error(s). UPSERT mode.";
-            await db.SaveChangesAsync();
-            log.Status = "Success";
-        }
-        catch (Exception ex)
-        {
-            log.Status = "Failed";
-            log.ErrorMessage = ex.InnerException?.Message ?? ex.Message;
-            result.Error = log.ErrorMessage;
-            _logger.LogError(ex, "VehicleDispatches upsert failed");
-        }
-
-        log.CompletedAt = DateTime.UtcNow;
-        log.RecordsFetched = result.RecordsFetched;
-        log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated = result.RecordsUpdated;
-        await db.SaveChangesAsync();
-        return result;
-    }
+        => await UpsertRangeViaEngineAsync(SyncApi.VehicleDispatches, "VehicleDispatchesUpsert", startDate, endDate, await DealersForManualRangeAsync(), null);
 
     // failedDealers (optional): receives the dealer codes whose ERP fetch failed, so a caller can retry
     // just those. onlyDealers (optional): restrict the run to these dealer codes. Both default to null,
@@ -2672,137 +1619,71 @@ public class DataSyncService
         List<string>? failedDealers = null,
         IReadOnlyCollection<string>? onlyDealers = null)
     {
+        var dealers = await GetSyncDealerCodesAsync(CancellationToken.None);
+        if (onlyDealers != null)
+            dealers = dealers.Where(c => onlyDealers.Contains(c, StringComparer.OrdinalIgnoreCase)).ToList();
+        if (dealers.Count == 0)
+            return new SyncResult { SyncType = "LineOrderReportUpsert", Date = endDate,
+                                    Error = "No dealers in DMS_Dealers. Run dealer sync first." };
+        return await UpsertRangeViaEngineAsync(SyncApi.LineOrderReport, "LineOrderReportUpsert", startDate, endDate, dealers, failedDealers);
+    }
+
+    // On-demand UPSERT for a date range (PUT api/data/...). Same code path as the checkpoint sync, but
+    // without checkpoints: the range is fetched month by month (never one huge ERP call), each month is
+    // upserted in batches of 500 — new rows inserted, changed rows updated, unchanged rows left alone.
+    private async Task<SyncResult> UpsertRangeViaEngineAsync(string api, string logType, DateTime startDate, DateTime endDate,
+                                                             List<string> dealers, List<string>? failedDealers)
+    {
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-        var log = new DmsSyncLog
-        {
-            SyncType = "LineOrderReportUpsert", SyncDate = DateOnly.FromDateTime(endDate),
-            StartedAt = DateTime.UtcNow, Status = "Running"
-        };
+        var log = new DmsSyncLog { SyncType = logType, SyncDate = DateOnly.FromDateTime(endDate), StartedAt = DateTime.UtcNow, Status = "Running" };
         db.DmsSyncLogs.Add(log);
         await db.SaveChangesAsync();
 
-        var result = new SyncResult { SyncType = "LineOrderReportUpsert", Date = endDate };
-
+        var result = new SyncResult { SyncType = logType, Date = endDate };
+        var counts = new UpsertCounts();
+        var errors = new List<string>();
         try
         {
             var token = await _erpApi.GetValidTokenAsync();
-
-            var dealerCodes = await db.DmsDealers
-                .Where(d => d.DealerCode != null)
-                .Select(d => d.DealerCode!)
-                .Distinct()
-                .ToListAsync();
-
-            if (onlyDealers != null)
-                dealerCodes = dealerCodes.Where(c => onlyDealers.Contains(c)).ToList();
-
-            if (!dealerCodes.Any())
+            foreach (var dealer in dealers)
             {
-                log.Status = "Failed";
-                log.ErrorMessage = "No dealers in DMS_Dealers. Run dealer sync first.";
-                result.Error = log.ErrorMessage;
-                log.CompletedAt = DateTime.UtcNow;
-                await db.SaveChangesAsync();
-                return result;
-            }
-
-            int skippedOnError = 0;
-            int saveCounter = 0;
-
-            foreach (var dealerCode in dealerCodes)
-            {
-                await Task.Delay(200);
-                try
+                for (var ms = new DateTime(startDate.Year, startDate.Month, 1); ms <= endDate.Date; ms = ms.AddMonths(1))
                 {
-                    var records = await _erpApi.FetchLorAsync(dealerCode, startDate, endDate, token);
-                    result.RecordsFetched += records.Count;
-
-                    var parsedRecords = records
-                        .Select(r =>
-                        {
-                            var parsed = MapLineOrderReport(r);
-                            parsed.UniqueKey = BuildLorUniqueKey(
-                                parsed.DealerCode, parsed.JobNo, parsed.JobDate,
-                                parsed.ChassisNo, parsed.ItemName, parsed.ItemDescription);
-                            return parsed;
-                        })
-                        .ToList();
-
-                    var dedupedRecords = parsedRecords
-                        .GroupBy(p => p.UniqueKey)
-                        .Select(g => g.Last())
-                        .ToList();
-
-                    if (!dedupedRecords.Any()) continue;
-
-                    var candidateKeys = dedupedRecords.Select(p => p.UniqueKey).ToHashSet();
-                    var existingRaw = await db.DmsLineOrderReports
-                        .Where(x => x.DealerCode == dealerCode && x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
-                        .ToListAsync();
-                    var existingLookup = existingRaw
-                        .Where(x => x.UniqueKey != null)
-                        .GroupBy(x => x.UniqueKey!)
-                        .ToDictionary(g => g.Key, g => g.First());
-
-                    foreach (var parsed in dedupedRecords)
+                    var a = ms < startDate.Date ? startDate.Date : ms;
+                    var b = ms.AddMonths(1).AddDays(-1);
+                    if (b > endDate.Date) b = endDate.Date;
+                    try
                     {
-                        try
-                        {
-                            if (existingLookup.TryGetValue(parsed.UniqueKey!, out var existing))
-                            {
-                                existing.Rate = parsed.Rate; existing.Total = parsed.Total;
-                                existing.TotalAmount = parsed.TotalAmount; existing.Discount = parsed.Discount;
-                                existing.SgstAmount = parsed.SgstAmount; existing.CgstAmount = parsed.CgstAmount;
-                                existing.IgstAmount = parsed.IgstAmount; existing.DocNo = parsed.DocNo;
-                                existing.DocDate = parsed.DocDate; existing.UpdatedAt = DateTime.UtcNow;
-                                result.RecordsUpdated++;
-                            }
-                            else
-                            {
-                                db.DmsLineOrderReports.Add(parsed);
-                                result.RecordsInserted++;
-                            }
-
-                            saveCounter++;
-                            if (saveCounter % SaveBatchSize == 0)
-                                await db.SaveChangesAsync();
-                        }
-                        catch (Exception ex)
-                        {
-                            skippedOnError++;
-                            _logger.LogWarning("Upsert skip LOR (dealer {dc}, job {jn}): {msg}",
-                                dealerCode, parsed.JobNo, ex.Message);
-                        }
+                        await FetchAndUpsertWindowAsync(api, dealer, a, b, DateOnly.FromDateTime(b), dealer.Length > 0, token, counts, CancellationToken.None);
                     }
-
-                    await db.SaveChangesAsync();
-                }
-                catch (Exception ex)
-                {
-                    if (IsErpAuthError(ex.Message)) throw;   // access refused: stop, do not try every dealer
-                    _logger.LogWarning("LOR upsert fetch failed for dealer {dc}: {msg}", dealerCode, ex.Message);
-                    failedDealers?.Add(dealerCode);
+                    catch (Exception ex) when (ex is not ErpAuthorizationException && !IsErpAuthError(ex.Message))
+                    {
+                        errors.Add($"{(dealer.Length == 0 ? "all dealers" : dealer)} {a:yyyy-MM-dd}..{b:yyyy-MM-dd}: {Trunc(ex.Message, 300)}");
+                        if (dealer.Length > 0 && failedDealers != null && !failedDealers.Contains(dealer)) failedDealers.Add(dealer);
+                    }
                 }
             }
-
-            log.ErrorMessage = $"{skippedOnError} per-record error(s). UPSERT mode."
-                + (failedDealers is { Count: > 0 } ? $" {failedDealers.Count} dealer fetch(es) failed." : "");
-            log.Status = "Success";
+            log.Status = errors.Count == 0 ? "Success" : "PartialFailure";
+            log.ErrorMessage = Trunc($"UPSERT: {counts.Unchanged} unchanged, {counts.Skipped} skipped"
+                                     + (errors.Count > 0 ? $"; {errors.Count} window(s) failed: " + string.Join(" | ", errors) : ""), 1800);
+            if (errors.Count > 0) result.Error = log.ErrorMessage;
         }
         catch (Exception ex)
         {
             log.Status = "Failed";
-            log.ErrorMessage = ex.InnerException?.Message ?? ex.Message;
+            log.ErrorMessage = Trunc(ex.InnerException?.Message ?? ex.Message, 1800);
             result.Error = log.ErrorMessage;
-            _logger.LogError(ex, "LOR upsert failed");
+            _logger.LogError(ex, "{type} failed", logType);
         }
 
-        log.CompletedAt = DateTime.UtcNow;
-        log.RecordsFetched = result.RecordsFetched;
+        result.RecordsFetched  = counts.Fetched;
+        result.RecordsInserted = counts.Inserted;
+        result.RecordsUpdated  = counts.Updated;
+        log.CompletedAt     = DateTime.UtcNow;
+        log.RecordsFetched  = result.RecordsFetched;
         log.RecordsInserted = result.RecordsInserted;
-        log.RecordsUpdated = result.RecordsUpdated;
+        log.RecordsUpdated  = result.RecordsUpdated;
         await db.SaveChangesAsync();
         return result;
     }

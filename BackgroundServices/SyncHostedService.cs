@@ -13,6 +13,13 @@ namespace AutoGeniusSync.BackgroundServices;
 // The reload itself lives in DataSyncService.RunNightlyFullReloadAsync and is started through
 // NightlyReloadRunner so the timer and the manual endpoint can never overlap.
 //
+// HISTORICAL RESUME (new): when no nightly run is due, the remaining historical work
+// (DMS_SyncCheckpoint rows that are Pending / InProgress / Failed-but-retryable) is processed
+// month-wise and dealer-wise from SyncSettings:HistoricalStartDate. It starts ~20 s after every
+// process start — so after an IIS stop / app-pool recycle / server reboot the load continues from the
+// month where it stopped — and it stops by itself at the next scheduled nightly time so the two never
+// overlap (both also share one database lock, see SyncCoordinator). Disable with HistoricalSync:Enabled=false.
+//
 // IIS NOTE: this timer only fires while the process is alive. In IIS set the app pool to
 // Start Mode = AlwaysRunning, Idle Time-out = 0, Regular Time Interval = 0 (and enable
 // Preload on the site) — or let a Task Scheduler job call POST api/admin/reload/start at 00:00.
@@ -40,15 +47,55 @@ public class SyncHostedService : BackgroundService
 
     private DateTime _lastHeartbeatUtc = DateTime.MinValue;
     private DateTime _nextCheckUtc     = DateTime.MinValue;
+    private readonly IServiceScopeFactory _scopeFactory;
 
     public SyncHostedService(
         NightlyReloadRunner runner,
         IConfiguration config,
-        ILogger<SyncHostedService> logger)
+        ILogger<SyncHostedService> logger,
+        IServiceScopeFactory scopeFactory)
     {
         _runner = runner;
         _config = config;
         _logger = logger;
+        _scopeFactory = scopeFactory;
+    }
+
+    // Next scheduled nightly start (UTC), strictly after now.
+    private static DateTime NextNightlyUtc(DateTime nowIst, TimeSpan dailyTimeIst)
+    {
+        var nextIst = nowIst.Date + dailyTimeIst;
+        if (nextIst <= nowIst) nextIst = nextIst.AddDays(1);
+        return nextIst - IstOffset;
+    }
+
+    // Runs the pending historical checkpoint work until the next nightly time (or the configured slice).
+    private async Task RunHistoricalSliceIfPendingAsync(DateTime nowIst, TimeSpan dailyTimeIst, CancellationToken ct)
+    {
+        if (!_config.GetValue("HistoricalSync:Enabled", true) || _runner.IsRunning)
+            return;
+
+        bool pending;
+        using (var scope = _scopeFactory.CreateScope())
+        {
+            var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
+            pending = await svc.HasPendingHistoricalWorkAsync(ct);
+        }
+        if (!pending) return;
+
+        // Stop 5 minutes before the nightly start so the nightly sync gets the ERP and the lock on time.
+        var deadline = NextNightlyUtc(nowIst, dailyTimeIst).AddMinutes(-5);
+        var sliceHours = _config.GetValue("HistoricalSync:MaxSliceHours", 0.0);
+        if (sliceHours > 0 && DateTime.UtcNow.AddHours(sliceHours) < deadline)
+            deadline = DateTime.UtcNow.AddHours(sliceHours);
+        if (deadline <= DateTime.UtcNow.AddMinutes(1))
+            return;
+
+        _logger.LogInformation("Historical checkpoint sync: pending periods found — resuming until {until} IST.",
+            deadline.Add(IstOffset).ToString("dd.MM.yyyy HH:mm"));
+        var started = await _runner.RunHistoricalAsync("auto-resume", ct, deadline);
+        if (!started)
+            _logger.LogInformation("Historical checkpoint sync not started — another sync holds the lock.");
     }
 
     protected override async Task ExecuteAsync(CancellationToken ct)
@@ -116,12 +163,19 @@ public class SyncHostedService : BackgroundService
                             if (nowIst.TimeOfDay >= dailyTimeIst && nowIst.TimeOfDay < dailyTimeIst + TriggerWindow)
                                 await TriggerAsync("scheduled", nowIst, ct, decision.Reason, decision.Full, decision.Missing);
                         }
-                        else if (DateTime.UtcNow - _lastHeartbeatUtc >= HeartbeatEvery)
+                        else
                         {
-                            _lastHeartbeatUtc = DateTime.UtcNow;
-                            _logger.LogInformation(
-                                "SyncHostedService alive — now {now} IST. No reload needed: {reason}.",
-                                nowIst.ToString("dd.MM.yyyy HH:mm"), decision.Reason);
+                            if (DateTime.UtcNow - _lastHeartbeatUtc >= HeartbeatEvery)
+                            {
+                                _lastHeartbeatUtc = DateTime.UtcNow;
+                                _logger.LogInformation(
+                                    "SyncHostedService alive — now {now} IST. No reload needed: {reason}.",
+                                    nowIst.ToString("dd.MM.yyyy HH:mm"), decision.Reason);
+                            }
+
+                            // Nothing nightly to do → continue the historical load from its checkpoint.
+                            await RunHistoricalSliceIfPendingAsync(nowIst, dailyTimeIst, ct);
+                            _nextCheckUtc = DateTime.UtcNow + CheckEvery;
                         }
                     }
                 }

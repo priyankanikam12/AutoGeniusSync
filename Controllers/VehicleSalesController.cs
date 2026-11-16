@@ -190,9 +190,15 @@ public class VehicleSalesController : ControllerBase
     }
 
     [HttpPost("backfill")]
-    public IActionResult StartBackfill([FromQuery] bool forceResync = false)
+    public IActionResult StartBackfill([FromQuery] bool forceResync = false,
+        [FromServices] NightlyReloadRunner runner = null!, [FromServices] IHostApplicationLifetime lifetime = null!)
     {
-        _ = Task.Run(() => _sync.BackfillVehicleSalesAsync(forceResync: forceResync));
+        // Runs through the single-sync lock (never in parallel with the nightly / historical sync) and
+        // month-wise / dealer-wise with checkpoints — it resumes where it stopped after an IIS recycle.
+        if (runner.IsRunning)
+            return Conflict(new { message = "A sync is already running — this backfill was not started.", status = runner.GetStatus() });
+        _ = Task.Run(() => runner.RunCustomAsync("manual-backfill", "BackfillVehicleSales", lifetime.ApplicationStopping,
+            svc => svc.BackfillVehicleSalesAsync(ct: lifetime.ApplicationStopping, forceResync: forceResync)));
         return Accepted(new { message = $"Full VSR backfill started (range-based, forceResync={forceResync}). Check /api/sync/status." });
     }
 

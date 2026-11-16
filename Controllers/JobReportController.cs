@@ -96,7 +96,53 @@ public class JobReportController : ControllerBase
     // overwrites history: the first insert starts the array, every later
     // update/patch/upsert grows it. Clients never send or see this field on
     // input — it's populated automatically here.
-    private static string AppendActionLog(string? existingLog, string actionType, object? payload)
+    // Rows per database round-trip / transaction for the bulk and CSV endpoints. Keeps memory flat no
+    // matter how large the pushed payload is (the old code loaded and tracked every row at once).
+    private const int BatchSize = 500;
+
+    // The Action audit column used to grow by one full payload on EVERY push, without limit — a job card
+    // pushed daily carried hundreds of KB of JSON that was loaded again on every upsert (memory + IO).
+    // Only the newest JobReport:MaxActionLogEntries entries (default 50) are kept now.
+    private int MaxActionLogEntries => Math.Max(1, _config.GetValue("JobReport:MaxActionLogEntries", 50));
+
+    private string AppendActionLog(string? existingLog, string actionType, object? payload)
+    {
+        var json = AppendActionLogCore(existingLog, actionType, payload);
+        var max = MaxActionLogEntries;
+        if (System.Text.Json.Nodes.JsonNode.Parse(json) is System.Text.Json.Nodes.JsonArray arr && arr.Count > max)
+        {
+            while (arr.Count > max) arr.RemoveAt(0);
+            json = arr.ToJsonString();
+        }
+        return json;
+    }
+
+    // True when the incoming record carries exactly what is stored already (header fields + complaints) —
+    // then the row is NOT updated and no audit entry is added.
+    private static bool SameContent(DmsJobReport row, DmsJobReport incoming)
+    {
+        static bool Eq(string? a, string? b) => string.Equals(a?.Trim() ?? "", b?.Trim() ?? "", StringComparison.Ordinal);
+        if (!(Eq(row.DealerName, incoming.DealerName) && Eq(row.DealerCode, incoming.DealerCode) && Eq(row.DealerLocation, incoming.DealerLocation)
+              && Eq(row.City, incoming.City) && Eq(row.State, incoming.State) && Eq(row.JobNo, incoming.JobNo) && row.JobDate == incoming.JobDate
+              && Eq(row.JobType, incoming.JobType) && Eq(row.ServiceHead, incoming.ServiceHead) && Eq(row.ServiceType, incoming.ServiceType)
+              && Eq(row.Kms, incoming.Kms) && Eq(row.CustomerName, incoming.CustomerName) && Eq(row.MobileNo, incoming.MobileNo)
+              && Eq(row.ChassisNo, incoming.ChassisNo) && Eq(row.RegNo, incoming.RegNo) && Eq(row.EngineNo, incoming.EngineNo)
+              && Eq(row.ItemName, incoming.ItemName) && Eq(row.CustomerVoice, incoming.CustomerVoice) && Eq(row.ComplaintCode, incoming.ComplaintCode)
+              && Eq(row.Observation, incoming.Observation) && Eq(row.SupervisorComment, incoming.SupervisorComment) && Eq(row.JobStatus, incoming.JobStatus)
+              && Eq(row.BatteryNo, incoming.BatteryNo) && Eq(row.BrandName, incoming.BrandName) && Eq(row.ChargerNo, incoming.ChargerNo)
+              && row.SaleDate == incoming.SaleDate && Eq(row.Supervisor, incoming.Supervisor) && Eq(row.Technician, incoming.Technician)
+              && row.JobEndDate == incoming.JobEndDate && Eq(row.CreatedThrough, incoming.CreatedThrough)))
+            return false;
+
+        if (row.Complaints.Count != incoming.Complaints.Count) return false;
+        var a = row.Complaints.OrderBy(c => c.Id).ToList();
+        for (int i = 0; i < a.Count; i++)
+            if (!Eq(a[i].CustomerVoice, incoming.Complaints[i].CustomerVoice) || !Eq(a[i].ComplaintCode, incoming.Complaints[i].ComplaintCode))
+                return false;
+        return true;
+    }
+
+    private static string AppendActionLogCore(string? existingLog, string actionType, object? payload)
     {
         System.Text.Json.Nodes.JsonArray array;
 
@@ -247,28 +293,34 @@ public class JobReportController : ControllerBase
             .Select(g => g.Last())
             .ToList();
 
-        var candidateKeys = dedupedRows.Select(r => r.UniqueKey).ToHashSet();
-        var existingKeys = (await _db.DmsJobReports
-            .Where(x => x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
-            .Select(x => x.UniqueKey!)
-            .ToListAsync()).ToHashSet();
+        rows.Clear();
 
-        foreach (var row in dedupedRows)
+        foreach (var chunk in dedupedRows.Chunk(BatchSize))
         {
-            if (existingKeys.Contains(row.UniqueKey!))
+            var chunkKeys = chunk.Select(r => r.UniqueKey!).ToList();
+            var existingKeys = (await _db.DmsJobReports.AsNoTracking()
+                .Where(x => x.UniqueKey != null && chunkKeys.Contains(x.UniqueKey))
+                .Select(x => x.UniqueKey!)
+                .ToListAsync()).ToHashSet();
+
+            foreach (var row in chunk)
             {
-                skippedAsExisting++;
-                continue;
+                if (existingKeys.Contains(row.UniqueKey!))
+                {
+                    skippedAsExisting++;
+                    continue;
+                }
+
+                row.Action = AppendActionLog(null, "CSV_INSERT", CsvPayloadSnapshot(row));
+
+                _db.DmsJobReports.Add(row);
+                inserted++;
+                existingKeys.Add(row.UniqueKey!);
             }
 
-            row.Action = AppendActionLog(null, "CSV_INSERT", CsvPayloadSnapshot(row));
-
-            _db.DmsJobReports.Add(row);
-            inserted++;
-            existingKeys.Add(row.UniqueKey!);
+            await _db.SaveChangesAsync();
+            _db.ChangeTracker.Clear();
         }
-
-        await _db.SaveChangesAsync();
 
         _logger.LogInformation(
             "JobReport upload (insert-only): {ins} inserted, {skip} skipped (already exist), {err} error(s)",
@@ -331,82 +383,93 @@ public class JobReportController : ControllerBase
             .Select(g => g.Last())
             .ToList();
 
-        var candidateKeys = dedupedRows.Select(r => r.UniqueKey).ToHashSet();
-        var existingRows = await _db.DmsJobReports
-            .Include(x => x.Complaints)
-            .Where(x => x.UniqueKey != null && candidateKeys.Contains(x.UniqueKey))
-            .ToListAsync();
-        var existingLookup = existingRows
-            .Where(x => x.UniqueKey != null)
-            .GroupBy(x => x.UniqueKey!)
-            .ToDictionary(g => g.Key, g => g.First());
+        rows.Clear();
+        int unchanged = 0;
 
-        foreach (var row in dedupedRows)
+        foreach (var chunk in dedupedRows.Chunk(BatchSize))
         {
-            try
+            var chunkKeys = chunk.Select(r => r.UniqueKey!).ToList();
+            var existingRows = await _db.DmsJobReports
+                .Include(x => x.Complaints)
+                .AsSplitQuery()
+                .Where(x => x.UniqueKey != null && chunkKeys.Contains(x.UniqueKey))
+                .ToListAsync();
+            var existingLookup = existingRows
+                .Where(x => x.UniqueKey != null)
+                .GroupBy(x => x.UniqueKey!)
+                .ToDictionary(g => g.Key, g => g.First());
+
+            foreach (var row in chunk)
             {
-                if (existingLookup.TryGetValue(row.UniqueKey!, out var existing))
+                try
                 {
-                    existing.DealerName        = row.DealerName;
-                    existing.DealerLocation    = row.DealerLocation;
-                    existing.City              = row.City;
-                    existing.State             = row.State;
-                    existing.JobType           = row.JobType;
-                    existing.ServiceHead       = row.ServiceHead;
-                    existing.ServiceType       = row.ServiceType;
-                    existing.Kms               = row.Kms;
-                    existing.CustomerName      = row.CustomerName;
-                    existing.MobileNo          = row.MobileNo;
-                    existing.RegNo             = row.RegNo;
-                    existing.EngineNo          = row.EngineNo;
-                    existing.ItemName          = row.ItemName;
-                    existing.CustomerVoice     = row.CustomerVoice;
-                    existing.ComplaintCode     = row.ComplaintCode;
-                    existing.Observation       = row.Observation;
-                    existing.SupervisorComment = row.SupervisorComment;
-                    existing.JobStatus         = row.JobStatus;
-                    existing.BatteryNo         = row.BatteryNo;
-                    existing.BrandName         = row.BrandName;
-                    existing.ChargerNo         = row.ChargerNo;
-                    existing.SaleDate          = row.SaleDate;
-                    existing.Supervisor        = row.Supervisor;
-                    existing.Technician        = row.Technician;
-                    existing.JobEndDate        = row.JobEndDate;
-                    existing.CreatedThrough    = row.CreatedThrough;
-                    existing.UpdatedAt         = DateTime.UtcNow;
+                    if (existingLookup.TryGetValue(row.UniqueKey!, out var existing))
+                    {
+                        if (SameContent(existing, row)) { unchanged++; continue; }
 
-                    // Replace complaints wholesale (CSV row still carries only one).
-                    existing.Complaints.Clear();
-                    foreach (var c in row.Complaints) existing.Complaints.Add(c);
+                        existing.DealerName        = row.DealerName;
+                        existing.DealerLocation    = row.DealerLocation;
+                        existing.City              = row.City;
+                        existing.State             = row.State;
+                        existing.JobType           = row.JobType;
+                        existing.ServiceHead       = row.ServiceHead;
+                        existing.ServiceType       = row.ServiceType;
+                        existing.Kms               = row.Kms;
+                        existing.CustomerName      = row.CustomerName;
+                        existing.MobileNo          = row.MobileNo;
+                        existing.RegNo             = row.RegNo;
+                        existing.EngineNo          = row.EngineNo;
+                        existing.ItemName          = row.ItemName;
+                        existing.CustomerVoice     = row.CustomerVoice;
+                        existing.ComplaintCode     = row.ComplaintCode;
+                        existing.Observation       = row.Observation;
+                        existing.SupervisorComment = row.SupervisorComment;
+                        existing.JobStatus         = row.JobStatus;
+                        existing.BatteryNo         = row.BatteryNo;
+                        existing.BrandName         = row.BrandName;
+                        existing.ChargerNo         = row.ChargerNo;
+                        existing.SaleDate          = row.SaleDate;
+                        existing.Supervisor        = row.Supervisor;
+                        existing.Technician        = row.Technician;
+                        existing.JobEndDate        = row.JobEndDate;
+                        existing.CreatedThrough    = row.CreatedThrough;
+                        existing.UpdatedAt         = DateTime.UtcNow;
 
-                    existing.Action = AppendActionLog(existing.Action, "CSV_UPDATE", CsvPayloadSnapshot(row));
+                        // Replace complaints wholesale (CSV row still carries only one).
+                        existing.Complaints.Clear();
+                        foreach (var c in row.Complaints) existing.Complaints.Add(c);
 
-                    updated++;
+                        existing.Action = AppendActionLog(existing.Action, "CSV_UPDATE", CsvPayloadSnapshot(row));
+
+                        updated++;
+                    }
+                    else
+                    {
+                        row.Action = AppendActionLog(null, "CSV_INSERT", CsvPayloadSnapshot(row));
+                        _db.DmsJobReports.Add(row);
+                        inserted++;
+                    }
                 }
-                else
+                catch (Exception ex)
                 {
-                    row.Action = AppendActionLog(null, "CSV_INSERT", CsvPayloadSnapshot(row));
-                    _db.DmsJobReports.Add(row);
-                    inserted++;
+                    skippedOnError++;
+                    _logger.LogWarning("Upsert skip job {no}: {msg}", row.JobNo, ex.Message);
                 }
             }
-            catch (Exception ex)
-            {
-                skippedOnError++;
-                _logger.LogWarning("Upsert skip job {no}: {msg}", row.JobNo, ex.Message);
-            }
+
+            await _db.SaveChangesAsync();
+            _db.ChangeTracker.Clear();
         }
 
-        await _db.SaveChangesAsync();
-
         _logger.LogInformation(
-            "JobReport upload (upsert): {ins} inserted, {upd} updated, {err} error(s)",
-            inserted, updated, skippedOnError);
+            "JobReport upload (upsert): {ins} inserted, {upd} updated, {unc} unchanged, {err} error(s)",
+            inserted, updated, unchanged, skippedOnError);
 
         return Ok(new
         {
             Inserted = inserted,
             Updated = updated,
+            Unchanged = unchanged,
             SkippedOnError = skippedOnError,
             Errors = errors.Take(20)
         });
@@ -440,7 +503,7 @@ public class JobReportController : ControllerBase
         if (page < 1) page = 1;
         if (pageSize < 1 || pageSize > 1000) pageSize = 100;
 
-        var q = _db.DmsJobReports.Include(x => x.Complaints).AsQueryable();
+        var q = _db.DmsJobReports.AsNoTracking().Include(x => x.Complaints).AsSplitQuery().AsQueryable();
 
         if (!string.IsNullOrEmpty(dealerCode))
             q = q.Where(x => x.DealerCode == dealerCode);
@@ -470,7 +533,7 @@ public class JobReportController : ControllerBase
         if (!IsValidApiKey(apiKey))
             return Unauthorized(new { error = "Invalid or missing API key." });
 
-        var row = await _db.DmsJobReports.Include(x => x.Complaints).FirstOrDefaultAsync(x => x.Id == id);
+        var row = await _db.DmsJobReports.AsNoTracking().Include(x => x.Complaints).FirstOrDefaultAsync(x => x.Id == id);
         return row == null ? NotFound(new { error = $"JobReport with Id {id} not found." }) : Ok(row);
     }
 
@@ -490,7 +553,8 @@ public class JobReportController : ControllerBase
         if (string.IsNullOrEmpty(uniqueKey) || uniqueKey.Length < 4)
             return BadRequest(new { error = "DealerCode, JobNo, JobDate, and ChassisNo are required to create a record." });
 
-        var existing = await _db.DmsJobReports.FirstOrDefaultAsync(x => x.UniqueKey == uniqueKey);
+        var existing = await _db.DmsJobReports.AsNoTracking().Select(x => new { x.Id, x.UniqueKey })
+                                               .FirstOrDefaultAsync(x => x.UniqueKey == uniqueKey);
         if (existing != null)
             return Conflict(new { error = "A record with this DealerCode+JobNo+JobDate+ChassisNo already exists.", ExistingId = existing.Id });
 
@@ -723,34 +787,35 @@ public class JobReportController : ControllerBase
             r.UniqueKey = UniqueKeyBuilder.JobReport(r.DealerCode, r.JobNo, r.JobDate, r.ChassisNo);
 
         var deduped = records.GroupBy(r => r.UniqueKey).Select(g => g.Last()).ToList();
-        var keys = deduped.Select(r => r.UniqueKey!).ToList();
-
-        var existingKeys = (await _db.DmsJobReports
-            .Where(x => x.UniqueKey != null && keys.Contains(x.UniqueKey))
-            .Select(x => x.UniqueKey!)
-            .ToListAsync()).ToHashSet();
-
-        var toInsert = new List<DmsJobReport>();
         var skipped = new List<string>();
-
-        foreach (var r in deduped)
-        {
-            if (existingKeys.Contains(r.UniqueKey!)) { skipped.Add(r.UniqueKey!); continue; }
-
-            var entity = MapJobReport(r);
-            entity.Action = AppendActionLog(null, "BULK_INSERT", r);
-            toInsert.Add(entity);
-        }
-
         var insertedCount = 0;
 
-        if (toInsert.Count > 0)
+        // Processed in batches of BatchSize: one key lookup + one transaction per batch, tracker cleared after.
+        foreach (var chunk in deduped.Chunk(BatchSize))
         {
-            await _db.DmsJobReports.AddRangeAsync(toInsert);
+            var keys = chunk.Select(r => r.UniqueKey!).ToList();
+            var existingKeys = (await _db.DmsJobReports.AsNoTracking()
+                .Where(x => x.UniqueKey != null && keys.Contains(x.UniqueKey))
+                .Select(x => x.UniqueKey!)
+                .ToListAsync()).ToHashSet();
+
+            var toInsert = new List<DmsJobReport>();
+            foreach (var r in chunk)
+            {
+                if (existingKeys.Contains(r.UniqueKey!)) { skipped.Add(r.UniqueKey!); continue; }
+
+                var entity = MapJobReport(r);
+                entity.Action = AppendActionLog(null, "BULK_INSERT", r);
+                toInsert.Add(entity);
+            }
+
+            if (toInsert.Count == 0) continue;
+
+            _db.DmsJobReports.AddRange(toInsert);
             try
             {
                 await _db.SaveChangesAsync();
-                insertedCount = toInsert.Count;
+                insertedCount += toInsert.Count;
             }
             catch (DbUpdateException)
             {
@@ -763,6 +828,8 @@ public class JobReportController : ControllerBase
 
                 foreach (var entity in toInsert)
                 {
+                    entity.Id = 0;
+                    foreach (var c in entity.Complaints) { c.Id = 0; c.JobReportId = 0; }
                     _db.DmsJobReports.Add(entity);
                     try
                     {
@@ -771,10 +838,17 @@ public class JobReportController : ControllerBase
                     }
                     catch (DbUpdateException)
                     {
-                        _db.ChangeTracker.Clear();
                         skipped.Add(entity.UniqueKey ?? "(no key)");
                     }
+                    finally
+                    {
+                        _db.ChangeTracker.Clear();
+                    }
                 }
+            }
+            finally
+            {
+                _db.ChangeTracker.Clear();
             }
         }
 
@@ -796,90 +870,107 @@ public class JobReportController : ControllerBase
             r.UniqueKey = UniqueKeyBuilder.JobReport(r.DealerCode, r.JobNo, r.JobDate, r.ChassisNo);
 
         var deduped = records.GroupBy(r => r.UniqueKey).Select(g => g.Last()).ToList();
-        var keys = deduped.Select(r => r.UniqueKey!).ToList();
 
-        // Include Complaints so we can replace them below without a second round-trip.
-        var existing = await _db.DmsJobReports
-            .Include(x => x.Complaints)
-            .Where(x => x.UniqueKey != null && keys.Contains(x.UniqueKey))
-            .ToListAsync();
-        var lookup = existing.ToDictionary(x => x.UniqueKey!, x => x);
+        int inserted = 0, updated = 0, unchanged = 0;
+        var conflicted = new List<string>();
 
-        int inserted = 0, updated = 0;
-
-        foreach (var r in deduped)
+        // Batches of BatchSize: existing rows (with complaints) loaded per batch only, change tracker
+        // cleared after each batch. Unchanged records are not updated and get no new audit entry.
+        foreach (var chunk in deduped.Chunk(BatchSize))
         {
-            if (lookup.TryGetValue(r.UniqueKey!, out var row))
-            {
-                ApplyJobReport(row, r);
-                row.Action = AppendActionLog(row.Action, "BULK_UPDATE", r);
-                row.UpdatedAt = DateTime.UtcNow;
-                updated++;
-            }
-            else
-            {
-                var entity = MapJobReport(r);
-                entity.Action = AppendActionLog(null, "BULK_INSERT", r);
-                _db.DmsJobReports.Add(entity);
-                inserted++;
-            }
-        }
+            var keys = chunk.Select(r => r.UniqueKey!).ToList();
+            var existing = await _db.DmsJobReports
+                .Include(x => x.Complaints)
+                .AsSplitQuery()
+                .Where(x => x.UniqueKey != null && keys.Contains(x.UniqueKey))
+                .ToListAsync();
+            var lookup = existing.GroupBy(x => x.UniqueKey!).ToDictionary(g => g.Key, g => g.First());
 
-        try
-        {
-            await _db.SaveChangesAsync();
-        }
-        catch (DbUpdateException)
-        {
-            // The DB-level unique index on UniqueKey rejected the batch — most likely one
-            // of the "new" records here raced with a concurrent insert of the same
-            // DealerCode+JobNo+JobDate+ChassisNo between our lookup above and this save.
-            // Don't let one collision roll back the whole batch: retry row-by-row.
-            _logger.LogWarning("JobReport bulk upsert hit a unique-index conflict, retrying row-by-row");
-            _db.ChangeTracker.Clear();
-
-            inserted = 0;
-            updated = 0;
-            var conflicted = new List<string>();
-
-            foreach (var r in deduped)
+            int chunkInserted = 0, chunkUpdated = 0;
+            foreach (var r in chunk)
             {
-                try
+                if (lookup.TryGetValue(r.UniqueKey!, out var row))
                 {
-                    var row = await _db.DmsJobReports.Include(x => x.Complaints)
-                        .FirstOrDefaultAsync(x => x.UniqueKey == r.UniqueKey);
-
-                    if (row != null)
-                    {
-                        ApplyJobReport(row, r);
-                        row.Action = AppendActionLog(row.Action, "BULK_UPDATE", r);
-                        row.UpdatedAt = DateTime.UtcNow;
-                        await _db.SaveChangesAsync();
-                        updated++;
-                    }
-                    else
-                    {
-                        var entity = MapJobReport(r);
-                        entity.Action = AppendActionLog(null, "BULK_INSERT", r);
-                        _db.DmsJobReports.Add(entity);
-                        await _db.SaveChangesAsync();
-                        inserted++;
-                    }
+                    if (SameContent(row, MapJobReport(r))) { unchanged++; continue; }
+                    ApplyJobReport(row, r);
+                    row.Action = AppendActionLog(row.Action, "BULK_UPDATE", r);
+                    row.UpdatedAt = DateTime.UtcNow;
+                    chunkUpdated++;
                 }
-                catch (DbUpdateException)
+                else
                 {
-                    _db.ChangeTracker.Clear();
-                    conflicted.Add(r.UniqueKey ?? "(no key)");
+                    var entity = MapJobReport(r);
+                    entity.Action = AppendActionLog(null, "BULK_INSERT", r);
+                    _db.DmsJobReports.Add(entity);
+                    chunkInserted++;
                 }
             }
 
-            _logger.LogInformation("JobReport bulk upsert (row-by-row): {ins} inserted, {upd} updated, {conf} conflicted",
-                inserted, updated, conflicted.Count);
-            return Ok(new { Inserted = inserted, Updated = updated, Conflicted = conflicted.Count, ConflictedKeys = conflicted });
+            try
+            {
+                await _db.SaveChangesAsync();
+                inserted += chunkInserted;
+                updated  += chunkUpdated;
+            }
+            catch (DbUpdateException)
+            {
+                // The DB-level unique index on UniqueKey rejected the batch — most likely one
+                // of the "new" records here raced with a concurrent insert of the same
+                // DealerCode+JobNo+JobDate+ChassisNo between our lookup above and this save.
+                // Don't let one collision roll back the whole batch: retry this batch row-by-row.
+                _logger.LogWarning("JobReport bulk upsert hit a unique-index conflict, retrying row-by-row");
+                _db.ChangeTracker.Clear();
+
+                foreach (var r in chunk)
+                {
+                    try
+                    {
+                        var row = await _db.DmsJobReports.Include(x => x.Complaints)
+                            .FirstOrDefaultAsync(x => x.UniqueKey == r.UniqueKey);
+
+                        if (row != null)
+                        {
+                            if (SameContent(row, MapJobReport(r))) { unchanged++; continue; }
+                            ApplyJobReport(row, r);
+                            row.Action = AppendActionLog(row.Action, "BULK_UPDATE", r);
+                            row.UpdatedAt = DateTime.UtcNow;
+                            await _db.SaveChangesAsync();
+                            updated++;
+                        }
+                        else
+                        {
+                            var entity = MapJobReport(r);
+                            entity.Action = AppendActionLog(null, "BULK_INSERT", r);
+                            _db.DmsJobReports.Add(entity);
+                            await _db.SaveChangesAsync();
+                            inserted++;
+                        }
+                    }
+                    catch (DbUpdateException)
+                    {
+                        conflicted.Add(r.UniqueKey ?? "(no key)");
+                    }
+                    finally
+                    {
+                        _db.ChangeTracker.Clear();
+                    }
+                }
+            }
+            finally
+            {
+                _db.ChangeTracker.Clear();
+            }
         }
 
-        _logger.LogInformation("JobReport bulk upsert: {ins} inserted, {upd} updated", inserted, updated);
-        return Ok(new { Inserted = inserted, Updated = updated });
+        if (conflicted.Count > 0)
+        {
+            _logger.LogInformation("JobReport bulk upsert: {ins} inserted, {upd} updated, {unc} unchanged, {conf} conflicted",
+                inserted, updated, unchanged, conflicted.Count);
+            return Ok(new { Inserted = inserted, Updated = updated, Unchanged = unchanged, Conflicted = conflicted.Count, ConflictedKeys = conflicted });
+        }
+
+        _logger.LogInformation("JobReport bulk upsert: {ins} inserted, {upd} updated, {unc} unchanged", inserted, updated, unchanged);
+        return Ok(new { Inserted = inserted, Updated = updated, Unchanged = unchanged });
     }
 
     private static DmsJobReport MapJobReport(JobReportRecordDto r)

@@ -20,6 +20,41 @@ public sealed class ErpAuthorizationException : Exception
     public ErpAuthorizationException(string message) : base(message) { }
 }
 
+// The ERP server (IIS in front of the AutoGenius ERP) answered 5xx or an HTML error page instead of JSON —
+// e.g. "HTTP Error 503. The service is unavailable." (application pool stopped / overloaded / recycling).
+// This is an ERP-side outage, NOT a parse problem and NOT "no data": the period must NOT be marked completed.
+public sealed class ErpUnavailableException : Exception
+{
+    public int HttpStatus { get; }
+    public ErpUnavailableException(int status, string message) : base(message) => HttpStatus = status;
+}
+
+// The ERP answered with a body larger than AutoGeniusERP:MaxResponseMB. The caller must ask for a
+// smaller date window instead of loading it (loading it is what caused the OutOfMemoryException).
+public sealed class ErpResponseTooLargeException : Exception
+{
+    public long Bytes { get; }
+    public ErpResponseTooLargeException(long bytes, string message) : base(message) => Bytes = bytes;
+}
+
+// The ERP application itself crashed while building the report and answered HTTP 200 + Valid=false with
+// the .NET exception text in Description — e.g. "System.OutOfMemoryException ... at ClassERPReport.DailyJobs"
+// when DJR is asked for ALL dealers for a whole month. This is NEVER "no data": it must not be loaded as
+// 0 rows (the old code did exactly that, so those months were silently missing). The caller retries with
+// a smaller window / per dealer.
+public sealed class ErpServerErrorException : Exception
+{
+    public bool OutOfMemory { get; }
+    public ErpServerErrorException(string message, bool outOfMemory) : base(message) => OutOfMemory = outOfMemory;
+}
+
+// Strict mode only (checkpoint sync): ERP answered Valid=false with a description that does not say
+// "no data". The period is not marked completed, so it is retried instead of being recorded as 0 rows.
+public sealed class ErpInvalidResponseException : Exception
+{
+    public ErpInvalidResponseException(string message) : base(message) { }
+}
+
 public class ErpApiService
 {
     private readonly IHttpClientFactory _httpFactory;
@@ -57,6 +92,97 @@ public class ErpApiService
         var d = description.ToLowerInvariant();
         return d.Contains("unauthor") || d.Contains("forbidden") || d.Contains("access denied")
             || d.Contains("invalid token") || d.Contains("token expired") || d.Contains("not authori");
+    }
+
+    // Valid=false descriptions that mean "the ERP has no rows for this filter" (not an error).
+    private static readonly string[] DefaultNoDataPhrases =
+        { "no data", "no record", "no result", "not found", "no rows", "data not available", "no details", "record not" };
+    // "No Result Found." is what the AutoGenius DJR API returns for a dealer/month without job cards (seen 14.11.2026).
+
+    private bool LooksLikeNoData(string? description)
+    {
+        if (string.IsNullOrWhiteSpace(description)) return true;   // Valid=false with no text and no rows = nothing to return
+        var phrases = _config.GetSection("AutoGeniusERP:NoDataPhrases").Get<string[]>();
+        if (phrases == null || phrases.Length == 0) phrases = DefaultNoDataPhrases;
+        var d = description.ToLowerInvariant();
+        return phrases.Any(p => d.Contains(p.ToLowerInvariant()));
+    }
+
+    // Description that is a server-side exception / stack trace, not a business message.
+    private static bool LooksLikeServerError(string? description)
+    {
+        if (string.IsNullOrWhiteSpace(description)) return false;
+        var d = description.ToLowerInvariant();
+        return d.Contains("exception") || d.Contains("outofmemory") || d.Contains("stack trace")
+            || d.Contains("\n   at ") || d.Contains("\n at ") || d.Contains(".cs:line");
+    }
+
+    private static bool IsOutOfMemoryText(string? description)
+        => description != null && description.Contains("OutOfMemory", StringComparison.OrdinalIgnoreCase);
+
+    private static bool LooksLikeHtml(string body)
+    {
+        var t = body.AsSpan().TrimStart();
+        return t.Length > 0 && t[0] == '<';
+    }
+
+    // "<TITLE>Service Unavailable</TITLE>" → "ERP server returned HTTP 503 (Service Unavailable)"
+    private static string SummariseNonJson(int status, string body)
+    {
+        var m = System.Text.RegularExpressions.Regex.Match(body, @"<title>(.*?)</title>",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Singleline);
+        var title = m.Success ? m.Groups[1].Value.Trim() : Trunc(body.Trim(), 120);
+        return $"ERP server returned HTTP {status} ({title}) — ERP/IIS side outage, not a data or parsing error";
+    }
+
+    private long MaxResponseBytes =>
+        Math.Max(1, _config.GetValue("AutoGeniusERP:MaxResponseMB", 48)) * 1024L * 1024L;
+
+    // Reads the body with a hard size cap, so one huge ERP answer can never exhaust the process memory.
+    private async Task<byte[]> ReadBodyLimitedAsync(HttpResponseMessage resp, CancellationToken ct)
+    {
+        var max = MaxResponseBytes;
+        var declared = resp.Content.Headers.ContentLength;
+        if (declared.HasValue && declared.Value > max)
+            throw new ErpResponseTooLargeException(declared.Value,
+                $"ERP response is {declared.Value / 1048576.0:0.0} MB (limit {max / 1048576} MB, AutoGeniusERP:MaxResponseMB) — use a smaller date window.");
+
+        await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+        using var ms = new MemoryStream(declared.HasValue ? (int)Math.Min(declared.Value, max) : 64 * 1024);
+        var buffer = new byte[81920];
+        int read;
+        while ((read = await stream.ReadAsync(buffer, ct)) > 0)
+        {
+            if (ms.Length + read > max)
+                throw new ErpResponseTooLargeException(ms.Length + read,
+                    $"ERP response exceeded {max / 1048576} MB (AutoGeniusERP:MaxResponseMB) — use a smaller date window.");
+            ms.Write(buffer, 0, read);
+        }
+        return ms.ToArray();
+    }
+
+    // One raw (un-parsed) POST — used by the debug/raw endpoints. Goes through the same global throttle as
+    // every other ERP call (previously these bypassed it and ran in parallel with the sync), and turns an
+    // IIS 503 / HTML error page into a clear ErpUnavailableException instead of returning HTML as "JSON".
+    private async Task<string> SendRawPostAsync(string url, object req, string token, CancellationToken ct = default)
+    {
+        await _erpCallThrottle.WaitAsync(ct);
+        try
+        {
+            var timeoutSeconds = _config.GetValue<int>("AutoGeniusERP:HttpTimeoutSeconds", 120);
+            using var http    = _httpFactory.CreateClient("ErpApi");
+            using var request = BuildPostRequest(url, req, token);
+            using var cts     = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+
+            using var resp = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+            var body = StripBomAndDecode(await ReadBodyLimitedAsync(resp, cts.Token));
+            var status = (int)resp.StatusCode;
+            if (!resp.IsSuccessStatusCode || LooksLikeHtml(body))
+                throw new ErpUnavailableException(status, SummariseNonJson(status, body));
+            return body;
+        }
+        finally { _erpCallThrottle.Release(); }
     }
 
     private static long _malformedRecordsDropped;
@@ -180,11 +306,7 @@ public class ErpApiService
             VhclStatus = "ALL", SubVendorCode = ""
         };
 
-        using var http    = _httpFactory.CreateClient("ErpApi");
-        using var request = BuildPostRequest(url, req, token);
-        var resp  = await http.SendAsync(request);
-        var bytes = await resp.Content.ReadAsByteArrayAsync();
-        return StripBomAndDecode(bytes);
+        return await SendRawPostAsync(url, req, token);
     }
 
     // Generic debug-parse — works for DJR, VSR, or VDR raw JSON given the type param
@@ -231,11 +353,7 @@ public class ErpApiService
             StartDate = fromDate.ToString("dd-MM-yyyy"), EndDate = toDate.ToString("dd-MM-yyyy"),
             SubVendorCode = "", DealerStatus = "1", AadharPanReq = "0", FameReq = "2"
         };
-        using var http    = _httpFactory.CreateClient("ErpApi");
-        using var request = BuildPostRequest(url, req, token);
-        var resp  = await http.SendAsync(request);
-        var bytes = await resp.Content.ReadAsByteArrayAsync();
-        return StripBomAndDecode(bytes);
+        return await SendRawPostAsync(url, req, token);
     }
 
     // ─────────────────────────────────────────────────────────
@@ -303,11 +421,7 @@ public class ErpApiService
             DealerCode = dealerCode
         };
 
-        using var http    = _httpFactory.CreateClient("ErpApi");
-        using var request = BuildPostRequest(url, req, token);
-        var resp = await http.SendAsync(request);
-        var bytes = await resp.Content.ReadAsByteArrayAsync();
-        return StripBomAndDecode(bytes);
+        return await SendRawPostAsync(url, req, token);
     }
 
     // ─────────────────────────────────────────────────────────
@@ -348,11 +462,7 @@ public class ErpApiService
             DealerCode = ""
         };
 
-        using var http    = _httpFactory.CreateClient("ErpApi");
-        using var request = BuildPostRequest(url, req, token);
-        var resp  = await http.SendAsync(request);
-        var bytes = await resp.Content.ReadAsByteArrayAsync();
-        return StripBomAndDecode(bytes);
+        return await SendRawPostAsync(url, req, token);
     }
 
     // ─────────────────────────────────────────────────────────
@@ -408,11 +518,7 @@ public class ErpApiService
             chassisno  = chassisNo
         };
 
-        using var http    = _httpFactory.CreateClient("ErpApi");
-        using var request = BuildPostRequest(url, bodyObj, token);
-        var resp  = await http.SendAsync(request);
-        var bytes = await resp.Content.ReadAsByteArrayAsync();
-        return StripBomAndDecode(bytes);
+        return await SendRawPostAsync(url, bodyObj, token);
     }
 
     public async Task<List<DjrValue>> FetchDjrnAsync(
@@ -497,10 +603,7 @@ public class ErpApiService
             DealerCode = ""
         };
 
-        using var http    = _httpFactory.CreateClient("ErpApi");
-        using var request = BuildPostRequest(url, req, token);
-        var resp = await http.SendAsync(request);
-        return await resp.Content.ReadAsStringAsync();
+        return await SendRawPostAsync(url, req, token);
     }
 
     // Deactivates every stored token and logs in again with THIS server's own configured ERP credentials.
@@ -570,8 +673,8 @@ public class ErpApiService
             using var request = BuildPostRequest(url, req, token);
             using var cts     = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
 
-            var resp   = await http.SendAsync(request, cts.Token);
-            var bytes  = await resp.Content.ReadAsByteArrayAsync();
+            using var resp = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+            var bytes  = await ReadBodyLimitedAsync(resp, cts.Token);
             var body   = StripBomAndDecode(bytes);
             var status = (int)resp.StatusCode;
 
@@ -624,9 +727,10 @@ public class ErpApiService
     // ─────────────────────────────────────────────────────────
 
     private async Task<List<T>> PostWithRetryAsync<T>(
-        string url, object requestBody, string token, int maxRetries = 3)
+        string url, object requestBody, string token, int maxRetries = 3,
+        CancellationToken ct = default, bool strict = false)
     {
-        await _erpCallThrottle.WaitAsync();
+        await _erpCallThrottle.WaitAsync(ct);
         try
         {
             var timeoutSeconds = _config.GetValue<int>("AutoGeniusERP:HttpTimeoutSeconds", 120);
@@ -635,55 +739,76 @@ public class ErpApiService
 
             for (int attempt = 1; attempt <= maxRetries; attempt++)
             {
+                ct.ThrowIfCancellationRequested();
                 try
                 {
                     using var http    = _httpFactory.CreateClient("ErpApi");
                     using var request = BuildPostRequest(url, requestBody, token);
-                    using var cts     = new CancellationTokenSource(
-                                            TimeSpan.FromSeconds(timeoutSeconds));
+                    using var cts     = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    cts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
 
                     _logger.LogInformation(
                         "Attempt {attempt}/{max} → POST {url} (timeout: {t}s)",
                         attempt, maxRetries, url, timeoutSeconds);
 
-                    var resp = await http.SendAsync(request, cts.Token);
-
-                    var rawBytes = await resp.Content.ReadAsByteArrayAsync();
-                    var body     = StripBomAndDecode(rawBytes);
+                    // ResponseHeadersRead + size-capped read: the body is never buffered beyond
+                    // AutoGeniusERP:MaxResponseMB (root cause of the OutOfMemoryException).
+                    using var resp = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+                    var status     = (int)resp.StatusCode;
 
                     if (!resp.IsSuccessStatusCode)
                     {
+                        // Error bodies are small (IIS error page); read at most the cap.
+                        string errBody;
+                        try { errBody = StripBomAndDecode(await ReadBodyLimitedAsync(resp, cts.Token)); }
+                        catch (ErpResponseTooLargeException) { errBody = "(error body too large)"; }
+
                         _logger.LogWarning(
                             "Attempt {attempt}/{max} got HTTP {code} from {url}",
-                            attempt, maxRetries, (int)resp.StatusCode, url);
+                            attempt, maxRetries, status, url);
 
-                        lastException = new Exception(
-                            $"HTTP {(int)resp.StatusCode}: " +
-                            $"{body[..Math.Min(200, body.Length)]}");
+                        lastException = status >= 500 || LooksLikeHtml(errBody)
+                            ? new ErpUnavailableException(status, SummariseNonJson(status, errBody))
+                            : new Exception($"HTTP {status}: {Trunc(errBody, 200)}");
 
                         if (attempt < maxRetries)
                         {
-                            // FIX: back off harder specifically on 503 —
-                            // the ERP is explicitly telling us it's overloaded.
-                            var delaySeconds = (int)resp.StatusCode == 503
-                                ? attempt * 30
-                                : attempt * 10;
+                            // 503 = the ERP's IIS app pool is stopped/overloaded: back off hard so we do not
+                            // keep it in Rapid-Fail. Honour Retry-After when the server sends one.
+                            var retryAfter = resp.Headers.RetryAfter?.Delta;
+                            var delay = retryAfter ?? TimeSpan.FromSeconds(status == 503 ? attempt * 60 : attempt * 10);
+                            if (delay > TimeSpan.FromMinutes(10)) delay = TimeSpan.FromMinutes(10);
 
                             _logger.LogWarning(
                                 "Backing off {delay}s before retry (status {code})",
-                                delaySeconds, (int)resp.StatusCode);
+                                (int)delay.TotalSeconds, status);
 
-                            await Task.Delay(TimeSpan.FromSeconds(delaySeconds));
+                            await Task.Delay(delay, ct);
                             continue;
                         }
                         break;
                     }
 
-                    return DeserializeTolerant<T>(body, url, attempt, maxRetries);
+                    var body = StripBomAndDecode(await ReadBodyLimitedAsync(resp, cts.Token));
+
+                    // HTTP 200 with an HTML page (proxy / IIS error page) is an outage, not data.
+                    if (LooksLikeHtml(body))
+                    {
+                        lastException = new ErpUnavailableException(status, SummariseNonJson(status, body));
+                        _logger.LogWarning("Attempt {attempt}/{max}: {url} returned HTML instead of JSON.", attempt, maxRetries, url);
+                        if (attempt < maxRetries) { await Task.Delay(TimeSpan.FromSeconds(attempt * 30), ct); continue; }
+                        break;
+                    }
+
+                    return DeserializeTolerant<T>(body, url, attempt, maxRetries, strict);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;   // shutdown / caller cancelled — do not retry
                 }
                 catch (OperationCanceledException)
                 {
-                    lastException = new Exception(
+                    lastException = new TimeoutException(
                         $"Request timed out after {timeoutSeconds}s");
 
                     _logger.LogWarning(
@@ -691,7 +816,7 @@ public class ErpApiService
                         attempt, maxRetries, url, maxRetries - attempt);
 
                     if (attempt < maxRetries)
-                        await Task.Delay(TimeSpan.FromSeconds(attempt * 10));
+                        await Task.Delay(TimeSpan.FromSeconds(attempt * 10), ct);
                 }
                 catch (HttpRequestException ex)
                 {
@@ -701,7 +826,11 @@ public class ErpApiService
                         attempt, maxRetries, url, ex.Message);
 
                     if (attempt < maxRetries)
-                        await Task.Delay(TimeSpan.FromSeconds(attempt * 10));
+                        await Task.Delay(TimeSpan.FromSeconds(attempt * 10), ct);
+                }
+                catch (ErpResponseTooLargeException)
+                {
+                    throw;   // retrying returns the same size — the caller must split the window
                 }
                 catch (JsonException)
                 {
@@ -726,6 +855,19 @@ public class ErpApiService
                     }
                     throw;
                 }
+                catch (ErpInvalidResponseException)
+                {
+                    throw;
+                }
+                catch (ErpServerErrorException serverEx)
+                {
+                    // OutOfMemory inside the ERP for this window: the same request will crash it again —
+                    // do not retry, let the caller use a smaller window. Other ERP exceptions: back off, retry.
+                    lastException = serverEx;
+                    _logger.LogWarning("Attempt {attempt}/{max}: {msg}", attempt, maxRetries, Trunc(serverEx.Message, 300));
+                    if (serverEx.OutOfMemory || attempt >= maxRetries) throw;
+                    await Task.Delay(TimeSpan.FromSeconds(attempt * 30), ct);
+                }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex,
@@ -735,19 +877,60 @@ public class ErpApiService
                 }
             }
 
-            // FIX: throw instead of "return new()". A genuine empty-but-valid
-            // API response (Valid=true, Value=[]) already returns cleanly from
-            // DeserializeTolerant above and never reaches this line — so
-            // reaching here means every attempt genuinely failed.
+            // A genuine empty-but-valid response (Valid=true, Value=[]) returns cleanly from
+            // DeserializeTolerant above — reaching here means every attempt genuinely failed.
+            if (lastException is ErpUnavailableException unavailable)
+                throw new ErpUnavailableException(unavailable.HttpStatus,
+                    $"All {maxRetries} attempts failed for {url}. Last error: {unavailable.Message}");
             throw new Exception(
-                $"All {maxRetries} attempts failed for {url}. Last error: {lastException?.Message}");
+                $"All {maxRetries} attempts failed for {url}. Last error: {lastException?.Message}", lastException);
         }
         finally
         {
-            // FIX: always release, even on exception, so the next queued
+            // Always release, even on exception, so the next queued
             // ERP call (from any other sync method or endpoint) can proceed.
             _erpCallThrottle.Release();
         }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // REPORT WINDOW FETCH — used by the month-wise / dealer-wise checkpoint sync.
+    // report: djr | vsr | vdr | lor. dealerCode "" = all dealers. strict = Valid=false that is not
+    // "no data" throws (so the period is retried, never recorded as an empty month).
+    // ─────────────────────────────────────────────────────────
+    public async Task<List<T>> FetchReportWindowAsync<T>(
+        string report, string dealerCode, DateTime from, DateTime to, string token, CancellationToken ct)
+    {
+        await Task.Delay(_delayMs, ct);
+        var (url, req) = BuildReportRequest(report, dealerCode, from, to);
+        return await PostWithRetryAsync<T>(url, req, token, maxRetries: 3, ct: ct, strict: true);
+    }
+
+    private (string Url, object Request) BuildReportRequest(string report, string dealerCode, DateTime from, DateTime to)
+    {
+        var vendorId = _config.GetValue<int>("AutoGeniusERP:VendorId", 14);
+        var f = from.ToString("dd-MM-yyyy");
+        var t = to.ToString("dd-MM-yyyy");
+        return report.ToLowerInvariant() switch
+        {
+            "djr" => (_baseUrl + _config["AutoGeniusERP:DjrUrl"],
+                      new DjrRequest { VendorId = vendorId, StartDate = f, EndDate = t, DealerCode = dealerCode }),
+            "vsr" => ($"{_baseUrl}/V1/erpreport/vsr?ver=1.0",
+                      new VsrRequest
+                      {
+                          DealerCode = dealerCode, VendorId = vendorId, StartDate = f, EndDate = t,
+                          SubVendorCode = "", DealerStatus = "1", AadharPanReq = "0", FameReq = "2"
+                      }),
+            "vdr" => ($"{_baseUrl}/V1/erpreport/vdr?Ver=1.0",
+                      new VdrRequest
+                      {
+                          VendorId = vendorId, FromDate = f, ToDate = t, DealerCode = dealerCode,
+                          LocationCode = "", ChassisNo = "", MobileNo = "", VhclStatus = "ALL", SubVendorCode = ""
+                      }),
+            "lor" => ($"{_baseUrl}/V1/erpreport/lor?Ver=1.0",
+                      new LorRequest { VendorId = vendorId, StartDate = f, EndDate = t, DealerCode = dealerCode }),
+            _ => throw new ArgumentException($"Unknown report '{report}'. Use djr, vsr, vdr, lor.")
+        };
     }
 
     // ─────────────────────────────────────────────────────────
@@ -1097,7 +1280,7 @@ public class ErpApiService
     // ─────────────────────────────────────────────────────────
 
     private List<T> DeserializeTolerant<T>(
-        string body, string url, int attempt, int maxRetries)
+        string body, string url, int attempt, int maxRetries, bool strict = false)
     {
         body = SanitizeJson(body);
 
@@ -1128,6 +1311,10 @@ public class ErpApiService
                     _logger.LogWarning("ERP replied Valid=false for {url}: {desc}", url, desc);
                     if (LooksLikeAuthRefusal(result?.Description))
                         throw new ErpAuthorizationException($"ERP authorization refused ('{desc}') for {url}");
+                    if (LooksLikeServerError(result?.Description))
+                        throw new ErpServerErrorException($"ERP application error (Valid=false): {desc} — {url}", IsOutOfMemoryText(result?.Description));
+                    if (strict && !LooksLikeNoData(result?.Description))
+                        throw new ErpInvalidResponseException($"ERP replied Valid=false ('{desc}') for {url}");
                     return new();
                 }
 
@@ -1173,6 +1360,11 @@ public class ErpApiService
                 _logger.LogWarning("Tolerant parse: API returned Valid=false for {url}: {desc}", url, tdesc);
                 if (LooksLikeAuthRefusal(tdesc))
                     throw new ErpAuthorizationException($"ERP authorization refused ('{tdesc}') for {url}");
+                var fullDesc = (root["Description"] ?? root["description"])?.ToString();
+                if (LooksLikeServerError(fullDesc))
+                    throw new ErpServerErrorException($"ERP application error (Valid=false): {tdesc} — {url}", IsOutOfMemoryText(fullDesc));
+                if (strict && !LooksLikeNoData((root["Description"] ?? root["description"])?.ToString()))
+                    throw new ErpInvalidResponseException($"ERP replied Valid=false ('{tdesc}') for {url}");
                 return new();
             }
 
@@ -1221,6 +1413,14 @@ public class ErpApiService
         catch (ErpAuthorizationException)
         {
             throw;   // keep the type so PostWithRetryAsync can re-login once
+        }
+        catch (ErpInvalidResponseException)
+        {
+            throw;
+        }
+        catch (ErpServerErrorException)
+        {
+            throw;
         }
         catch (Exception ex)
         {

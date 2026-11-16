@@ -13,7 +13,8 @@ public sealed record ReloadStatus(
     string? Message,          // detail: failed chunks, empty tables, "FAILED BEFORE truncate", ...
     long RecordsFetched,
     long RecordsInserted,
-    string? Mode = null);     // Window (rolling upsert, no truncate) | Full (truncate + reload) | Missing (load empty tables only, no truncate)
+    string? Mode = null,      // Window (rolling upsert) | Full (re-check all months, upsert) | Missing (empty tables only) | Historical (resume checkpoints)
+    long RecordsUpdated = 0);
 
 // Manual / catch-up request for the "load missing tables" mode. Tables: djr, vsr, vdr, lor (null = every empty table).
 public sealed record MissingRequest(string[]? Tables = null, DateTime? From = null, DateTime? To = null);
@@ -21,21 +22,24 @@ public sealed record MissingRequest(string[]? Tables = null, DateTime? From = nu
 // Answer of NightlyReloadRunner.CheckCatchUpAsync: should a reload be started now, and why / why not.
 public sealed record CatchUpDecision(bool Run, string Reason, bool Full = false, bool Missing = false);
 
-// Single place that starts the nightly full reload. Used by BOTH the daily timer
-// (SyncHostedService) and the manual / Task-Scheduler endpoint (NightlyReloadController),
-// so the two can never run a reload at the same time — the second caller is told
-// "already running" instead of truncating tables underneath the first one.
+// Single place that starts ANY ERP data sync: nightly window, full re-check, missing-tables load,
+// historical checkpoint sync and the manual backfill endpoints. Used by the daily timer
+// (SyncHostedService) and every manual endpoint, so two syncs can never run at the same time —
+// not in this process and (through SyncCoordinator's database lock) not in a second IIS worker
+// process during an overlapped recycle. The second caller is told "already running".
 public class NightlyReloadRunner
 {
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IConfiguration _config;
     private readonly ILogger<NightlyReloadRunner> _logger;
-    private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly SyncCoordinator _coordinator;
     private readonly object _stateLock = new();
     private ReloadStatus _status = new(false, null, null, null, null, null, 0, 0);
 
-    public NightlyReloadRunner(IServiceScopeFactory scopeFactory, IConfiguration config, ILogger<NightlyReloadRunner> logger)
+    public NightlyReloadRunner(IServiceScopeFactory scopeFactory, IConfiguration config, ILogger<NightlyReloadRunner> logger,
+                               SyncCoordinator coordinator)
     {
+        _coordinator = coordinator;
         _scopeFactory = scopeFactory;
         _config = config;
         _logger = logger;
@@ -46,7 +50,7 @@ public class NightlyReloadRunner
     public static bool IsFullMode(string? text) => string.Equals(text?.Trim(), "Full", StringComparison.OrdinalIgnoreCase);
     public bool ConfiguredFull => IsFullMode(_config["Sync:Mode"]);
 
-    public bool IsRunning { get { lock (_stateLock) return _status.IsRunning; } }
+    public bool IsRunning { get { lock (_stateLock) return _status.IsRunning || _coordinator.IsHeldLocally; } }
 
     public ReloadStatus GetStatus() { lock (_stateLock) return _status; }
 
@@ -136,14 +140,59 @@ public class NightlyReloadRunner
     // Runs the sync unless one is already running. forceFull: true = Full, false = Window, null = Sync:Mode.
     // missing != null = "load missing tables" mode (no truncate), which wins over forceFull.
     // Returns false (and does nothing) when another run holds the gate. Never throws.
-    public async Task<bool> RunAsync(string trigger, CancellationToken ct, bool? forceFull = null, MissingRequest? missing = null)
+    public Task<bool> RunAsync(string trigger, CancellationToken ct, bool? forceFull = null, MissingRequest? missing = null)
     {
-        if (!await _gate.WaitAsync(0, CancellationToken.None))
-            return false;
-
         var full = missing == null && (forceFull ?? ConfiguredFull);
         var mode = missing != null ? "Missing" : full ? "Full" : "Window";
+        return RunLockedAsync(trigger, mode, ct, async svc => missing != null
+            ? await svc.RunMissingTablesLoadAsync(missing.Tables, missing.From, missing.To, ct)
+            : full
+                ? await svc.RunNightlyFullReloadAsync(ct)
+                : await svc.RunDailyWindowSyncAsync(ct));
+    }
+
+    // Historical month-wise / dealer-wise sync from HistoricalStartDate, resuming from DMS_SyncCheckpoint.
+    // deadlineUtc: stop cleanly at that time (the hosted service passes the next nightly start).
+    public Task<bool> RunHistoricalAsync(string trigger, CancellationToken ct, DateTime? deadlineUtc = null,
+                                         IReadOnlyCollection<string>? apis = null)
+        => RunLockedAsync(trigger, "Historical", ct, svc => svc.RunHistoricalCheckpointSyncAsync(deadlineUtc, ct, apis));
+
+    // Any other sync body (e.g. the per-API backfill endpoints) run under the same single-sync lock.
+    public Task<bool> RunCustomAsync(string trigger, string mode, CancellationToken ct, Func<DataSyncService, Task<DTOs.SyncResult>> body)
+        => RunLockedAsync(trigger, mode, ct, body);
+
+    // Rows a killed process left as "Running" (the lock is held, so nothing else is running now).
+    private static readonly string[] RunnerLogTypes =
+    {
+        "NightlyFullReload", "DailyWindowSync", "MissingTablesLoad", "HistoricalCheckpointSync",
+        "BackfillHistorical", "BackfillVehicleSales", "BackfillVehicleDispatches", "BackfillLineOrderReport"
+    };
+
+    private async Task MarkStaleRunsInterruptedAsync(DateTime beforeUtc)
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var n = await db.DmsSyncLogs
+                .Where(l => l.Status == "Running" && l.StartedAt < beforeUtc && RunnerLogTypes.Contains(l.SyncType!))
+                .ExecuteUpdateAsync(x => x
+                    .SetProperty(l => l.Status, "Interrupted")
+                    .SetProperty(l => l.CompletedAt, DateTime.UtcNow));
+            if (n > 0) _logger.LogWarning("{n} sync-log row(s) left 'Running' by a stopped process were marked Interrupted.", n);
+        }
+        catch (Exception ex) { _logger.LogWarning("Could not mark stale sync-log rows: {msg}", ex.Message); }
+    }
+
+    private async Task<bool> RunLockedAsync(string trigger, string mode, CancellationToken ct,
+                                            Func<DataSyncService, Task<DTOs.SyncResult>> body)
+    {
+        await using var handle = await _coordinator.TryAcquireAsync($"{mode}:{trigger}", CancellationToken.None);
+        if (handle == null)
+            return false;
+
         var startedUtc = DateTime.UtcNow;
+        await MarkStaleRunsInterruptedAsync(startedUtc);
         try
         {
             SetStatus(new ReloadStatus(true, trigger, startedUtc, null, "Running", null, 0, 0, mode));
@@ -151,19 +200,15 @@ public class NightlyReloadRunner
 
             using var scope = _scopeFactory.CreateScope();
             var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
-            var result = missing != null
-                ? await svc.RunMissingTablesLoadAsync(missing.Tables, missing.From, missing.To, ct)
-                : full
-                    ? await svc.RunNightlyFullReloadAsync(ct)
-                    : await svc.RunDailyWindowSyncAsync(ct);
+            var result = await body(svc);
 
             var outcome = string.IsNullOrEmpty(result.Error) ? "Success" : "Problems";
             SetStatus(new ReloadStatus(false, trigger, startedUtc, DateTime.UtcNow, outcome,
-                result.Error, result.RecordsFetched, result.RecordsInserted, mode));
+                result.Error, result.RecordsFetched, result.RecordsInserted, mode, result.RecordsUpdated));
 
             if (outcome == "Success")
-                _logger.LogInformation("{mode} sync END — Success (trigger: {trigger}): {fet} fetched, {ins} inserted.",
-                    mode, trigger, result.RecordsFetched, result.RecordsInserted);
+                _logger.LogInformation("{mode} sync END — Success (trigger: {trigger}): {fet} fetched, {ins} inserted, {upd} updated.",
+                    mode, trigger, result.RecordsFetched, result.RecordsInserted, result.RecordsUpdated);
             else
                 _logger.LogError("{mode} sync END — completed WITH PROBLEMS (trigger: {trigger}): {msg}",
                     mode, trigger, result.Error);
@@ -171,8 +216,7 @@ public class NightlyReloadRunner
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             SetStatus(new ReloadStatus(false, trigger, startedUtc, DateTime.UtcNow, "Interrupted",
-                full ? "App was shutting down. If tables were already truncated they are only partly loaded — run the reload again."
-                     : "App was shutting down. Nothing was deleted; run it again — rows already loaded are skipped / upserted.",
+                "App was shutting down / IIS recycle. Nothing was deleted; the sync resumes from the checkpoint on the next run.",
                 0, 0, mode));
             _logger.LogWarning("{mode} sync interrupted by shutdown (trigger: {trigger}).", mode, trigger);
         }
@@ -180,10 +224,6 @@ public class NightlyReloadRunner
         {
             SetStatus(new ReloadStatus(false, trigger, startedUtc, DateTime.UtcNow, "Failed", ex.Message, 0, 0, mode));
             _logger.LogError(ex, "{mode} sync crashed (trigger: {trigger}).", mode, trigger);
-        }
-        finally
-        {
-            _gate.Release();
         }
 
         return true;

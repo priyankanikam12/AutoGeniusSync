@@ -68,6 +68,7 @@ builder.Services.AddSingleton<ErpApiService>();
 // ─────────────────────────────────────────────────────────────
 // Single entry point for the nightly full reload (daily timer + manual/Task-Scheduler endpoint share it,
 // so two reloads can never run at once). Must be registered BEFORE the hosted service that uses it.
+builder.Services.AddSingleton<SyncCoordinator>();   // one ERP sync at a time (process + database lock)
 builder.Services.AddSingleton<NightlyReloadRunner>();
 builder.Services.AddHostedService<SyncHostedService>();
 
@@ -107,6 +108,9 @@ using (var scope = app.Services.CreateScope())
     {
         await db.Database.EnsureCreatedAsync();
         app.Logger.LogInformation("Database connection verified.");
+
+        // Checkpoint table + UniqueKey unique indexes (EnsureCreated never alters an existing database).
+        await SyncSchema.EnsureAsync(db, app.Logger, app.Configuration);
     }
     catch (Exception ex)
     {

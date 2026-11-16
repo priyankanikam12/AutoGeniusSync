@@ -45,6 +45,7 @@ public partial class AppDbContext : DbContext
     public DbSet<DmsMaterialTransferItem> DmsMaterialTransferItems => Set<DmsMaterialTransferItem>();
     public DbSet<DmsMaterialTransferLabor> DmsMaterialTransferLabors => Set<DmsMaterialTransferLabor>();
     public DbSet<DmsStockSummaryDetail> DmsStockSummaryDetails => Set<DmsStockSummaryDetail>();
+    public DbSet<DmsSyncCheckpoint> DmsSyncCheckpoints => Set<DmsSyncCheckpoint>();
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.Entity<DmsAuthToken>(entity =>
@@ -702,6 +703,22 @@ public partial class AppDbContext : DbContext
             entity.Property(e => e.RowHash).HasMaxLength(100);
             entity.Property(e => e.CreatedAt).HasDefaultValueSql("(getutcdate())");
             entity.Property(e => e.UpdatedAt).HasDefaultValueSql("(getutcdate())");
+        });
+
+        // Month-wise / dealer-wise ERP sync progress (see Models/DmsSyncCheckpoint.cs, Data/SyncSchema.cs).
+        modelBuilder.Entity<DmsSyncCheckpoint>(e =>
+        {
+            e.ToTable("DMS_SyncCheckpoint");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.ApiName).HasMaxLength(50).IsRequired();
+            e.Property(x => x.DealerCode).HasMaxLength(50).IsRequired();
+            e.Property(x => x.Status).HasMaxLength(20).IsRequired();
+            e.Property(x => x.LastError).HasMaxLength(2000);
+            e.HasIndex(x => new { x.ApiName, x.DealerCode, x.PeriodStart })
+                .IsUnique()
+                .HasDatabaseName("UQ_DMS_SyncCheckpoint_Api_Dealer_Period");
+            e.HasIndex(x => new { x.ApiName, x.Status, x.PeriodStart })
+                .HasDatabaseName("IX_DMS_SyncCheckpoint_Api_Status");
         });
 
         OnModelCreatingPartial(modelBuilder);

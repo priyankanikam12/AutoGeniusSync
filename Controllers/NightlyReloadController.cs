@@ -11,9 +11,9 @@ namespace AutoGeniusSync.Controllers;
 // disappear. It also lets you re-run the reload by hand after a deploy (RunOnStartup is false).
 //
 // Both endpoints require header X-API-Key = appsettings "ApiKeys:Internal".
-// /start TRUNCATES DMS_ServiceHistory, DMS_VehicleSales, DMS_VehicleDispatches and
-// DMS_LineOrderReport (after an ERP health check) and re-fetches everything — so it also needs
-// ?confirm=yes.
+// Nothing here truncates any more: mode=full re-checks every month from HistoricalStartDate with
+// UPSERT (checkpoints reset) — still guarded by ?confirm=yes because it is a long, heavy run.
+// mode=historical resumes the month-wise / dealer-wise historical load from DMS_SyncCheckpoint.
 [ApiController]
 [Route("api/admin/reload")]
 public class NightlyReloadController : ControllerBase
@@ -44,7 +44,9 @@ public class NightlyReloadController : ControllerBase
         return !string.IsNullOrEmpty(expected) && string.Equals(apiKey, expected, StringComparison.Ordinal);
     }
 
-    // POST /api/admin/reload/start?mode=window|full|missing&confirm=yes
+    // POST /api/admin/reload/start?mode=window|full|missing|historical&confirm=yes
+    //   mode=historical → resume the checkpoint sync (HistoricalStartDate → today, month-wise, dealer-wise,
+    //                     completed months skipped). Optional &tables=djr,vsr,vdr,lor.
     //   mode omitted → Sync:Mode from appsettings (Window by default).
     //   mode=window  → last Sync:RollingMonths months, upsert, NO truncate (no confirm needed).
     //   mode=full    → TRUNCATE the 4 tables + reload from SyncSettings:HistoricalStartDate (needs confirm=yes).
@@ -60,6 +62,30 @@ public class NightlyReloadController : ControllerBase
     {
         if (!IsValidApiKey(apiKey))
             return Unauthorized(new { error = "Invalid or missing API key." });
+
+        if (string.Equals(mode, "historical", StringComparison.OrdinalIgnoreCase))
+        {
+            string[]? apis = null;
+            if (!string.IsNullOrWhiteSpace(tables))
+            {
+                var parts = tables.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                var bad = parts.Where(t => AutoGeniusSync.Models.SyncApi.Normalize(t) == null).ToArray();
+                if (bad.Length > 0)
+                    return BadRequest(new { error = $"Unknown table(s): {string.Join(", ", bad)}. Use djr, vsr, vdr, lor." });
+                apis = parts.Select(t => AutoGeniusSync.Models.SyncApi.Normalize(t)!).Distinct().ToArray();
+            }
+            if (_runner.IsRunning)
+                return Conflict(new { error = "A sync is already running.", status = _runner.GetStatus() });
+
+            _ = Task.Run(() => _runner.RunHistoricalAsync("manual-api", _lifetime.ApplicationStopping, null, apis));
+            return Accepted(new
+            {
+                mode = "Historical",
+                apis = apis ?? AutoGeniusSync.Models.SyncApi.All,
+                message = "Historical checkpoint sync requested (resumes from the last completed month). " +
+                          "Poll GET api/admin/reload/status and GET api/admin/reload/checkpoints."
+            });
+        }
 
         if (string.Equals(mode, "missing", StringComparison.OrdinalIgnoreCase))
         {
@@ -115,13 +141,13 @@ public class NightlyReloadController : ControllerBase
         else if (string.Equals(mode, "window", StringComparison.OrdinalIgnoreCase))
             full = false;
         else
-            return BadRequest(new { error = "mode must be 'window', 'full' or 'missing'." });
+            return BadRequest(new { error = "mode must be 'window', 'full', 'missing' or 'historical'." });
 
         if (full && !string.Equals(confirm, "yes", StringComparison.OrdinalIgnoreCase))
             return BadRequest(new
             {
-                error = "mode=full TRUNCATES ServiceHistory, VehicleSales, VehicleDispatches and LineOrderReport and re-fetches " +
-                        "everything from SyncSettings:HistoricalStartDate. Add ?confirm=yes to proceed, or use mode=missing / mode=window (no truncate)."
+                error = "mode=full re-checks EVERY month from SyncSettings:HistoricalStartDate (all checkpoints reset, UPSERT, no truncate). " +
+                        "It is a long run. Add ?confirm=yes to proceed, or use mode=historical / mode=window."
             });
 
         if (_runner.IsRunning)
@@ -135,7 +161,7 @@ public class NightlyReloadController : ControllerBase
         {
             mode = full ? "Full" : "Window",
             message = full
-                ? "Full reload requested (ERP check → truncate → re-fetch → validate). Poll GET api/admin/reload/status."
+                ? "Full re-check requested (ERP check → checkpoints reset → month-wise UPSERT → validate; no truncate). Poll GET api/admin/reload/status."
                 : "Window sync requested (rolling months, upsert, no truncate). Poll GET api/admin/reload/status.",
         });
     }
@@ -182,6 +208,61 @@ public class NightlyReloadController : ControllerBase
 
         lock (_probeLock)
             return _probe == null ? NotFound(new { error = "No probe has been run yet. POST api/admin/reload/probe first." }) : Ok(_probe);
+    }
+
+    // GET /api/admin/reload/checkpoints — progress of the month-wise / dealer-wise sync:
+    // periods per API and status, the month each API resumes from, and the latest failures.
+    [HttpGet("checkpoints")]
+    public async Task<IActionResult> Checkpoints([FromHeader(Name = "X-API-Key")] string? apiKey)
+    {
+        if (!IsValidApiKey(apiKey))
+            return Unauthorized(new { error = "Invalid or missing API key." });
+
+        using var scope = _scopeFactory.CreateScope();
+        var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
+        return Ok(await svc.GetCheckpointSummaryAsync(HttpContext.RequestAborted));
+    }
+
+    // POST /api/admin/reload/checkpoints/reset?table=djr&from=2025-01-01&to=2025-03-31&dealerCode=X&failedOnly=true&confirm=yes
+    // Puts the selected months back to Pending so the next historical run fetches them again (UPSERT —
+    // nothing is deleted). Use it after a manual truncate or to force a re-check of a range.
+    [HttpPost("checkpoints/reset")]
+    public async Task<IActionResult> ResetCheckpoints(
+        [FromHeader(Name = "X-API-Key")] string? apiKey,
+        [FromQuery] string? table, [FromQuery] string? from, [FromQuery] string? to,
+        [FromQuery] string? dealerCode, [FromQuery] bool failedOnly = false, [FromQuery] string? confirm = null)
+    {
+        if (!IsValidApiKey(apiKey))
+            return Unauthorized(new { error = "Invalid or missing API key." });
+        if (!string.Equals(confirm, "yes", StringComparison.OrdinalIgnoreCase))
+            return BadRequest(new { error = "Add ?confirm=yes. The selected months will be fetched again (UPSERT, nothing deleted)." });
+
+        string? api = null;
+        if (!string.IsNullOrWhiteSpace(table))
+        {
+            api = AutoGeniusSync.Models.SyncApi.Normalize(table);
+            if (api == null) return BadRequest(new { error = "table must be djr, vsr, vdr or lor." });
+        }
+        DateTime? f = null, t = null;
+        if (!string.IsNullOrWhiteSpace(from))
+        {
+            if (!DateTime.TryParseExact(from, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.None, out var fv))
+                return BadRequest(new { error = "from must be yyyy-MM-dd." });
+            f = fv;
+        }
+        if (!string.IsNullOrWhiteSpace(to))
+        {
+            if (!DateTime.TryParseExact(to, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.None, out var tv))
+                return BadRequest(new { error = "to must be yyyy-MM-dd." });
+            t = tv;
+        }
+
+        using var scope = _scopeFactory.CreateScope();
+        var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
+        var n = await svc.ResetCheckpointsAsync(api, f, t, dealerCode, failedOnly, HttpContext.RequestAborted);
+        return Ok(new { reset = n, message = $"{n} period(s) set to Pending. They are fetched on the next historical run." });
     }
 
     // GET /api/admin/reload/status
