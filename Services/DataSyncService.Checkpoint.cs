@@ -193,10 +193,16 @@ public partial class DataSyncService
         // Only the units the historical run itself processes (per-dealer rows, or the "all dealers" rows
         // when HistoricalSync:PerDealer = false; LOR is always per dealer). Rows of the nightly window
         // that use the other mode are retried by the nightly run, not here.
-        var q = db.DmsSyncCheckpoints.AsNoTracking();
+        var q = db.DmsSyncCheckpoints.AsNoTracking().Where(c => !c.ApiName.StartsWith(FyApiPrefix));
         q = HistoricalPerDealer()
             ? q.Where(c => c.DealerCode != "")
             : q.Where(c => c.DealerCode == "" || c.ApiName == SyncApi.LineOrderReport);
+
+        var (histTo, recheckBefore, _) = HistoricalRange();
+        var toMonth = new DateOnly(histTo.Year, histTo.Month, 1);
+        if (toMonth < new DateOnly(HistoricalStartDate().Year, HistoricalStartDate().Month, 1))
+            return false;                                     // nothing before the current FY to load
+        q = q.Where(c => c.PeriodStart <= toMonth);
 
         // No checkpoint rows yet = never started.
         if (!await q.AnyAsync(ct))
@@ -205,7 +211,8 @@ public partial class DataSyncService
         return await q.AnyAsync(c =>
             c.Status == SyncCheckpointStatus.Pending ||
             c.Status == SyncCheckpointStatus.InProgress ||
-            (c.Status == SyncCheckpointStatus.Failed && (c.Attempts < maxAttempts || c.UpdatedAt < retryAfter)), ct);
+            (c.Status == SyncCheckpointStatus.Failed && (c.Attempts < maxAttempts || c.UpdatedAt < retryAfter)) ||
+            (recheckBefore != null && c.Status == SyncCheckpointStatus.Completed && c.CompletedAt < recheckBefore), ct);
     }
 
     // Summary for GET api/admin/reload/checkpoints.
@@ -467,9 +474,16 @@ public partial class DataSyncService
         || IsDeterministicParseError(ex.Message)
         || ex.Message.Contains("JSON deserialization failed", StringComparison.OrdinalIgnoreCase);
 
+    // Where fetched rows go: the live table (UPSERT, default) or the FY-refresh staging table.
+    private delegate Task RowSink(Type entityType, System.Collections.IList rows, KeyLookup lookup, KeyLookup? legacy,
+                                  UpsertCounts counts, CancellationToken ct);
+
     private async Task FetchAndUpsertWindowAsync(string api, string dealerCode, DateTime from, DateTime to,
-        DateOnly periodEnd, bool perDealer, string token, UpsertCounts counts, CancellationToken ct)
+        DateOnly periodEnd, bool perDealer, string token, UpsertCounts counts, CancellationToken ct, RowSink? sink = null)
     {
+        Task Write<T>(List<T> rows, KeyLookup lookup, KeyLookup? legacy) where T : class, IErpSyncRow
+            => sink == null ? UpsertRowsAsync(rows, lookup, legacy, counts, ct) : sink(typeof(T), rows, lookup, legacy, counts, ct);
+
         try
         {
             switch (api)
@@ -497,7 +511,7 @@ public partial class DataSyncService
                         .ToList();
                     counts.Skipped += rows.Count - entities.Count;
                     rows.Clear();
-                    await UpsertRowsAsync(entities, LookupServiceHistoryAsync, null, counts, ct);
+                    await Write(entities, LookupServiceHistoryAsync, null);
                     break;
                 }
                 case SyncApi.VehicleSales:
@@ -516,7 +530,7 @@ public partial class DataSyncService
                         .ToList();
                     counts.Skipped += rows.Count - entities.Count;
                     rows.Clear();
-                    await UpsertRowsAsync(entities, LookupVehicleSalesAsync, LookupLegacyVehicleSalesAsync, counts, ct);
+                    await Write(entities, LookupVehicleSalesAsync, LookupLegacyVehicleSalesAsync);
                     break;
                 }
                 case SyncApi.VehicleDispatches:
@@ -534,7 +548,7 @@ public partial class DataSyncService
                         .ToList();
                     counts.Skipped += rows.Count - entities.Count;
                     rows.Clear();
-                    await UpsertRowsAsync(entities, LookupVehicleDispatchesAsync, LookupLegacyVehicleDispatchesAsync, counts, ct);
+                    await Write(entities, LookupVehicleDispatchesAsync, LookupLegacyVehicleDispatchesAsync);
                     break;
                 }
                 case SyncApi.LineOrderReport:
@@ -554,7 +568,7 @@ public partial class DataSyncService
                         .ToList();
                     counts.Skipped += rows.Count - entities.Count;
                     rows.Clear();
-                    await UpsertRowsAsync(entities, LookupLineOrderReportAsync, null, counts, ct);
+                    await Write(entities, LookupLineOrderReportAsync, null);
                     break;
                 }
                 default:
@@ -567,8 +581,8 @@ public partial class DataSyncService
             var mid  = from.AddDays(days / 2 - 1);
             _logger.LogWarning("{api} {from:yyyy-MM-dd}..{to:yyyy-MM-dd} dealer '{dc}': {msg} — splitting at {mid:yyyy-MM-dd}.",
                 api, from, to, dealerCode, Trunc(ex.Message, 200), mid);
-            await FetchAndUpsertWindowAsync(api, dealerCode, from, mid, periodEnd, perDealer, token, counts, ct);
-            await FetchAndUpsertWindowAsync(api, dealerCode, mid.AddDays(1), to, periodEnd, perDealer, token, counts, ct);
+            await FetchAndUpsertWindowAsync(api, dealerCode, from, mid, periodEnd, perDealer, token, counts, ct, sink);
+            await FetchAndUpsertWindowAsync(api, dealerCode, mid.AddDays(1), to, periodEnd, perDealer, token, counts, ct, sink);
         }
     }
 

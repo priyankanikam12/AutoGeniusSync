@@ -51,6 +51,23 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_DMS_SyncCheckpoint_Ap
     CREATE INDEX IX_DMS_SyncCheckpoint_Api_Status
         ON dbo.DMS_SyncCheckpoint (ApiName, Status, PeriodStart);";
 
+    // State of the nightly current-financial-year refresh (one row per night). See DataSyncService.FyRefresh.cs.
+    private const string CreateFyStateTable = @"
+IF OBJECT_ID(N'dbo.DMS_FyRefreshState', N'U') IS NULL
+    CREATE TABLE dbo.DMS_FyRefreshState
+    (
+        Id            INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_DMS_FyRefreshState PRIMARY KEY,
+        RunDate       DATE           NOT NULL,
+        FyStart       DATE           NOT NULL,
+        ToDate        DATE           NOT NULL,
+        Status        NVARCHAR(20)   NOT NULL,
+        SwappedTables NVARCHAR(200)  NULL,
+        Notes         NVARCHAR(4000) NULL,
+        StartedAt     DATETIME2      NOT NULL,
+        CompletedAt   DATETIME2      NULL,
+        UpdatedAt     DATETIME2      NOT NULL
+    );";
+
     // (table, index name) — unique filtered index on UniqueKey. Same names as in AppDbContext.
     private static readonly (string Table, string Index)[] UniqueKeyIndexes =
     {
@@ -64,6 +81,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_DMS_SyncCheckpoint_Ap
     public static async Task EnsureAsync(AppDbContext db, ILogger logger, IConfiguration config, CancellationToken ct = default)
     {
         await db.Database.ExecuteSqlRawAsync(CreateCheckpointTable, ct);
+        await db.Database.ExecuteSqlRawAsync(CreateFyStateTable, ct);
         logger.LogInformation("DMS_SyncCheckpoint table verified.");
 
         // Sync is dealer-wise only now; "all dealers" checkpoint rows (DealerCode = '') are progress records of
@@ -71,7 +89,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_DMS_SyncCheckpoint_Ap
         // the per-dealer rows, which are fetched in full.
         if (!config.GetValue("HistoricalSync:AllowAllDealerCalls", false))
         {
-            var n = await db.Database.ExecuteSqlRawAsync("DELETE FROM dbo.DMS_SyncCheckpoint WHERE DealerCode = N''", ct);
+            var n = await db.Database.ExecuteSqlRawAsync("DELETE FROM dbo.DMS_SyncCheckpoint WHERE DealerCode = N'' AND ApiName NOT LIKE N'FY[_]%'", ct);
             if (n > 0) logger.LogInformation("{n} obsolete all-dealer checkpoint row(s) removed (sync is dealer-wise).", n);
         }
 

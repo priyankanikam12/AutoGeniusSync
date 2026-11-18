@@ -63,6 +63,19 @@ public class NightlyReloadController : ControllerBase
         if (!IsValidApiKey(apiKey))
             return Unauthorized(new { error = "Invalid or missing API key." });
 
+        if (string.Equals(mode, "fyrefresh", StringComparison.OrdinalIgnoreCase))
+        {
+            if (_runner.IsRunning)
+                return Conflict(new { error = "A sync is already running.", status = _runner.GetStatus() });
+            _ = Task.Run(() => _runner.RunFyRefreshAsync("manual-api", _lifetime.ApplicationStopping));
+            return Accepted(new
+            {
+                mode = "FyRefresh",
+                message = "Current-FY refresh requested (1 April → yesterday into staging; each table replaced in one transaction only if " +
+                          "its fetch is complete). Poll GET api/admin/reload/fy."
+            });
+        }
+
         if (string.Equals(mode, "historical", StringComparison.OrdinalIgnoreCase))
         {
             string[]? apis = null;
@@ -141,7 +154,7 @@ public class NightlyReloadController : ControllerBase
         else if (string.Equals(mode, "window", StringComparison.OrdinalIgnoreCase))
             full = false;
         else
-            return BadRequest(new { error = "mode must be 'window', 'full', 'missing' or 'historical'." });
+            return BadRequest(new { error = "mode must be 'window', 'full', 'missing', 'historical' or 'fyrefresh'." });
 
         if (full && !string.Equals(confirm, "yes", StringComparison.OrdinalIgnoreCase))
             return BadRequest(new
@@ -263,6 +276,17 @@ public class NightlyReloadController : ControllerBase
         var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
         var n = await svc.ResetCheckpointsAsync(api, f, t, dealerCode, failedOnly, HttpContext.RequestAborted);
         return Ok(new { reset = n, message = $"{n} period(s) set to Pending. They are fetched on the next historical run." });
+    }
+
+    // GET /api/admin/reload/fy — last current-FY refresh runs and unit progress per table.
+    [HttpGet("fy")]
+    public async Task<IActionResult> FyStatus([FromHeader(Name = "X-API-Key")] string? apiKey)
+    {
+        if (!IsValidApiKey(apiKey))
+            return Unauthorized(new { error = "Invalid or missing API key." });
+        using var scope = _scopeFactory.CreateScope();
+        var svc = scope.ServiceProvider.GetRequiredService<DataSyncService>();
+        return Ok(await svc.GetFyRefreshStatusAsync(HttpContext.RequestAborted));
     }
 
     // GET /api/admin/reload/status

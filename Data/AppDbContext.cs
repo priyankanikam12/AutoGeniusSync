@@ -46,6 +46,7 @@ public partial class AppDbContext : DbContext
     public DbSet<DmsMaterialTransferLabor> DmsMaterialTransferLabors => Set<DmsMaterialTransferLabor>();
     public DbSet<DmsStockSummaryDetail> DmsStockSummaryDetails => Set<DmsStockSummaryDetail>();
     public DbSet<DmsSyncCheckpoint> DmsSyncCheckpoints => Set<DmsSyncCheckpoint>();
+    public DbSet<DmsFyRefreshState> DmsFyRefreshStates => Set<DmsFyRefreshState>();
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.Entity<DmsAuthToken>(entity =>
@@ -719,6 +720,15 @@ public partial class AppDbContext : DbContext
                 .HasDatabaseName("UQ_DMS_SyncCheckpoint_Api_Dealer_Period");
             e.HasIndex(x => new { x.ApiName, x.Status, x.PeriodStart })
                 .HasDatabaseName("IX_DMS_SyncCheckpoint_Api_Status");
+        });
+
+        modelBuilder.Entity<DmsFyRefreshState>(e =>
+        {
+            e.ToTable("DMS_FyRefreshState");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Status).HasMaxLength(20).IsRequired();
+            e.Property(x => x.SwappedTables).HasMaxLength(200);
+            e.Property(x => x.Notes).HasMaxLength(4000);
         });
 
         OnModelCreatingPartial(modelBuilder);

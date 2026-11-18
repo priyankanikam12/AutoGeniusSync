@@ -20,7 +20,7 @@ public sealed record ReloadStatus(
 public sealed record MissingRequest(string[]? Tables = null, DateTime? From = null, DateTime? To = null);
 
 // Answer of NightlyReloadRunner.CheckCatchUpAsync: should a reload be started now, and why / why not.
-public sealed record CatchUpDecision(bool Run, string Reason, bool Full = false, bool Missing = false);
+public sealed record CatchUpDecision(bool Run, string Reason, bool Full = false, bool Missing = false, bool Fy = false);
 
 // Single place that starts ANY ERP data sync: nightly window, full re-check, missing-tables load,
 // historical checkpoint sync and the manual backfill endpoints. Used by the daily timer
@@ -50,6 +50,54 @@ public class NightlyReloadRunner
     public static bool IsFullMode(string? text) => string.Equals(text?.Trim(), "Full", StringComparison.OrdinalIgnoreCase);
     public bool ConfiguredFull => IsFullMode(_config["Sync:Mode"]);
 
+    // "Sync:Mode": "FyRefresh" = every night replace the CURRENT FINANCIAL YEAR's rows of the 4 ERP tables with
+    // freshly fetched data (staging + transactional swap; older FYs untouched). See DataSyncService.FyRefresh.cs.
+    public static bool IsFyMode(string? text) => string.Equals(text?.Trim(), "FyRefresh", StringComparison.OrdinalIgnoreCase);
+    public bool ConfiguredFy => IsFyMode(_config["Sync:Mode"]);
+
+    public async Task<bool> IsTodaysFyRefreshCompletedAsync(DateTime nowIst, CancellationToken ct)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var today = DateOnly.FromDateTime(nowIst);
+        return await db.DmsFyRefreshStates.AsNoTracking()
+            .AnyAsync(x => x.RunDate == today && x.Status == "Completed", ct);
+    }
+
+    public Task<bool> RunFyRefreshAsync(string trigger, CancellationToken ct)
+        => RunLockedAsync(trigger, "FyRefresh", ct, svc => svc.RunFyRefreshAsync(ct));
+
+    // FY mode: run when today's refresh is not completed and the scheduled time has passed, or when an
+    // unfinished run exists (stopped by an IIS recycle / still running from last night) — at any hour.
+    private async Task<CatchUpDecision> CheckFyCatchUpAsync(DateTime nowIst, TimeSpan dailyTimeIst, int maxAttemptsPerDay, CancellationToken ct)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var nowUtc = DateTime.UtcNow;
+        var today = DateOnly.FromDateTime(nowIst);
+        var todayStartUtc = nowIst.Date - new TimeSpan(5, 30, 0);
+
+        var last = await db.DmsFyRefreshStates.AsNoTracking().OrderByDescending(x => x.Id).FirstOrDefaultAsync(ct);
+        if (last != null && last.RunDate == today && last.Status == "Completed")
+            return new CatchUpDecision(false, "today's current-FY refresh is completed");
+
+        var logs = await db.DmsSyncLogs.AsNoTracking()
+            .Where(l => l.SyncType == "FyRefresh" && l.StartedAt >= todayStartUtc)
+            .Select(l => new { l.Status, l.StartedAt }).ToListAsync(ct);
+        if (logs.Any(l => l.Status == "Running" && l.StartedAt > nowUtc.AddMinutes(-30)))
+            return new CatchUpDecision(false, "an FY refresh started in the last 30 min (maybe another process)");
+
+        var unfinished = last != null && last.Status == "Fetching";
+        if (!unfinished && nowIst.TimeOfDay < dailyTimeIst)
+            return new CatchUpDecision(false, "scheduled time not reached yet");
+        if (logs.Count >= maxAttemptsPerDay)
+            return new CatchUpDecision(false, $"daily attempt cap reached ({logs.Count}/{maxAttemptsPerDay})");
+        if (logs.Count > 0 && logs.Max(l => l.StartedAt) > nowUtc.AddMinutes(-15))
+            return new CatchUpDecision(false, "last attempt started less than 15 min ago");
+
+        return new CatchUpDecision(true, unfinished ? "an unfinished FY refresh exists — resuming" : "today's FY refresh not done yet", Fy: true);
+    }
+
     public bool IsRunning { get { lock (_stateLock) return _status.IsRunning || _coordinator.IsHeldLocally; } }
 
     public ReloadStatus GetStatus() { lock (_stateLock) return _status; }
@@ -73,6 +121,8 @@ public class NightlyReloadRunner
     {
         if (IsRunning)
             return new CatchUpDecision(false, "a reload is running in this process");
+        if (ConfiguredFy)
+            return await CheckFyCatchUpAsync(nowIst, dailyTimeIst, maxAttemptsPerDay, ct);
 
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -164,7 +214,7 @@ public class NightlyReloadRunner
     // Rows a killed process left as "Running" (the lock is held, so nothing else is running now).
     private static readonly string[] RunnerLogTypes =
     {
-        "NightlyFullReload", "DailyWindowSync", "MissingTablesLoad", "HistoricalCheckpointSync",
+        "NightlyFullReload", "DailyWindowSync", "MissingTablesLoad", "HistoricalCheckpointSync", "FyRefresh",
         "BackfillHistorical", "BackfillVehicleSales", "BackfillVehicleDispatches", "BackfillLineOrderReport"
     };
 

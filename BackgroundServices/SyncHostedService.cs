@@ -75,6 +75,10 @@ public class SyncHostedService : BackgroundService
         if (!_config.GetValue("HistoricalSync:Enabled", true) || _runner.IsRunning)
             return;
 
+        // FY mode: previous-year update starts only AFTER today's current-FY delete + reload has completed.
+        if (_runner.ConfiguredFy && !await _runner.IsTodaysFyRefreshCompletedAsync(nowIst, ct))
+            return;
+
         bool pending;
         using (var scope = _scopeFactory.CreateScope())
         {
@@ -93,7 +97,7 @@ public class SyncHostedService : BackgroundService
 
         _logger.LogInformation("Historical checkpoint sync: pending periods found — resuming until {until} IST.",
             deadline.Add(IstOffset).ToString("dd.MM.yyyy HH:mm"));
-        var started = await _runner.RunHistoricalAsync("auto-resume", ct, deadline);
+        var started = await _runner.RunHistoricalAsync(_runner.ConfiguredFy ? "previous-years-after-fy" : "auto-resume", ct, deadline);
         if (!started)
             _logger.LogInformation("Historical checkpoint sync not started — another sync holds the lock.");
     }
@@ -126,7 +130,7 @@ public class SyncHostedService : BackgroundService
             "RunOnStartup={startup}, CatchUp={catchUp}, MaxAttemptsPerDay={max}.",
             startIst.ToString("dd.MM.yyyy HH:mm:ss"),
             dailyTimeIst.ToString(@"hh\:mm"),
-            NightlyReloadRunner.IsFullMode(_config["Sync:Mode"]) ? "Full" : "Window",
+            NightlyReloadRunner.IsFyMode(_config["Sync:Mode"]) ? "FyRefresh" : NightlyReloadRunner.IsFullMode(_config["Sync:Mode"]) ? "Full" : "Window",
             _config.GetValue("Sync:RollingMonths", 6),
             runOnStartup, catchUp, maxAttempts);
 
@@ -197,13 +201,16 @@ public class SyncHostedService : BackgroundService
 
     private async Task TriggerAsync(string trigger, DateTime nowIst, CancellationToken ct, string? reason = null, bool? full = null, bool missing = false)
     {
-        var mode = missing ? "MISSING-TABLES load (only empty tables, insert-only, NO truncate)"
+        var mode = _runner.ConfiguredFy ? "CURRENT-FY REFRESH (fetch FY start → yesterday into staging, then replace FY rows in one transaction per table)"
+                 : missing ? "MISSING-TABLES load (only empty tables, insert-only, NO truncate)"
                  : (full ?? NightlyReloadRunner.IsFullMode(_config["Sync:Mode"])) ? "FULL reload (ERP check, truncate, re-fetch from HistoricalStartDate)"
                                                                                   : "WINDOW sync (rolling months, upsert, no truncate)";
         _logger.LogInformation("Sync trigger '{trigger}' fired at {time} IST — {mode}. Reason: {reason}",
             trigger, nowIst.ToString("dd.MM.yyyy HH:mm:ss"), mode, reason ?? "n/a");
 
-        var started = await _runner.RunAsync(trigger, ct, full, missing ? new MissingRequest() : null);
+        var started = _runner.ConfiguredFy
+            ? await _runner.RunFyRefreshAsync(trigger, ct)
+            : await _runner.RunAsync(trigger, ct, full, missing ? new MissingRequest() : null);
         if (!started)
             _logger.LogWarning("Sync ({trigger}) skipped — a sync is already running.", trigger);
     }

@@ -863,6 +863,21 @@ public partial class DataSyncService
 
     private static DateTime TodayIst() => DateTime.UtcNow.AddMinutes(330).Date;
 
+    // Sync:Mode = FyRefresh → the historical run covers ONLY previous financial years (HistoricalStartDate →
+    // 31 March before the current FY; the current FY is replaced every night by the FY refresh). It UPSERTS
+    // (no delete): new ERP rows inserted, changed rows updated. A month is fetched again when its last fetch is
+    // older than PreviousYears:RecheckAfterDays (default 30), so ERP changes to old records are picked up
+    // in rolling passes. Other modes: HistoricalStartDate → today, completed months not re-checked.
+    internal (DateTime To, DateTime? RecheckBeforeUtc, string Label) HistoricalRange()
+    {
+        if (!NightlyReloadRunner.IsFyMode(_config["Sync:Mode"]))
+            return (TodayIst(), null, "Historical");
+        var yesterday = DateOnly.FromDateTime(TodayIst()).AddDays(-1);
+        var lastDayPrevFy = FinancialYearStart(yesterday).AddDays(-1).ToDateTime(TimeOnly.MinValue);
+        var days = _config.GetValue("PreviousYears:RecheckAfterDays", 30);
+        return (lastDayPrevFy, days > 0 ? DateTime.UtcNow.AddDays(-days) : null, "PreviousYears");
+    }
+
     // ALWAYS dealer-wise. Fetching all dealers in one call makes the ERP itself throw OutOfMemoryException
     // (verified 14.11.2026: DJR 01-10-2026..31-10-2026, dealercode "" → 45 s, Valid=false, OutOfMemory;
     // dealercode CUS0379 → 3 s, 67 KB, OK). The all-dealer form is only possible with the explicit
@@ -895,8 +910,9 @@ public partial class DataSyncService
         SyncResult r;
         try
         {
+            var (histTo, recheckBefore, label) = HistoricalRange();
             r = await RunCheckpointSyncAsync(new CheckpointRunOptions(
-                    list, HistoricalStartDate(), TodayIst(), HistoricalPerDealer(), null, deadlineUtc, "Historical"), ct);
+                    list, HistoricalStartDate(), histTo, HistoricalPerDealer(), recheckBefore, deadlineUtc, label), ct);
             log.Status = string.IsNullOrEmpty(r.Error) ? "Success" : "PartialFailure";
             log.ErrorMessage = r.Error;
         }
