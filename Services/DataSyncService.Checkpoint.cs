@@ -472,7 +472,26 @@ public partial class DataSyncService
         || (ex.InnerException is TimeoutException)
         || ex.Message.Contains("timed out", StringComparison.OrdinalIgnoreCase)
         || IsDeterministicParseError(ex.Message)
+        // ERP closed the connection while sending a big answer ("An existing connection was forcibly closed by
+        // the remote host") — seen for large dealers / months (e.g. CUS0270). Retrying the same window fails the
+        // same way; a smaller window (half month, down to 1 day) is a smaller answer.
+        || IsConnectionDropped(ex)
         || ex.Message.Contains("JSON deserialization failed", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsConnectionDropped(Exception ex)
+    {
+        for (var e = ex; e != null; e = e.InnerException)
+        {
+            if (e is HttpRequestException or IOException or System.Net.Sockets.SocketException) return true;
+            var m = e.Message;
+            if (m.Contains("forcibly closed", StringComparison.OrdinalIgnoreCase)
+                || m.Contains("transport connection", StringComparison.OrdinalIgnoreCase)
+                || m.Contains("connection was closed", StringComparison.OrdinalIgnoreCase)
+                || m.Contains("response ended prematurely", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
 
     // Where fetched rows go: the live table (UPSERT, default) or the FY-refresh staging table.
     private delegate Task RowSink(Type entityType, System.Collections.IList rows, KeyLookup lookup, KeyLookup? legacy,

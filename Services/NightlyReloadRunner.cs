@@ -90,8 +90,11 @@ public class NightlyReloadRunner
         var unfinished = last != null && last.Status == "Fetching";
         if (!unfinished && nowIst.TimeOfDay < dailyTimeIst)
             return new CatchUpDecision(false, "scheduled time not reached yet");
-        if (logs.Count >= maxAttemptsPerDay)
-            return new CatchUpDecision(false, $"daily attempt cap reached ({logs.Count}/{maxAttemptsPerDay})");
+        // FY runs resume from staging (only missing/failed units are fetched again), so they get their own,
+        // higher cap: FyRefresh:MaxAttemptsPerDay (default 6).
+        var fyCap = Math.Max(1, _config.GetValue("FyRefresh:MaxAttemptsPerDay", 6));
+        if (logs.Count >= fyCap)
+            return new CatchUpDecision(false, $"daily attempt cap reached ({logs.Count}/{fyCap}, FyRefresh:MaxAttemptsPerDay)");
         if (logs.Count > 0 && logs.Max(l => l.StartedAt) > nowUtc.AddMinutes(-15))
             return new CatchUpDecision(false, "last attempt started less than 15 min ago");
 

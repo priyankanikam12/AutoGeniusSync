@@ -65,7 +65,11 @@ public partial class DataSyncService
 
     // Table / column names straight from the EF model (no hard-coded column lists).
     private sealed record FyTableInfo(string Api, string Main, string Stage, string DateColumn,
-                                      List<(System.Reflection.PropertyInfo Prop, string Column, Type ClrType)> Columns);
+                                      List<(System.Reflection.PropertyInfo Prop, string Column, Type ClrType)> Columns)
+    {
+        // every DATE column of the table — used to find the date the ERP really filters on
+        public IEnumerable<string> DateColumns => Columns.Where(c => c.ClrType == typeof(DateOnly)).Select(c => c.Column);
+    }
 
     private FyTableInfo GetFyTable(AppDbContext db, string api)
     {
@@ -213,10 +217,16 @@ public partial class DataSyncService
             return null;
 
         // Unfinished run (e.g. stopped by an IIS recycle, or still busy from last night): continue it with its
-        // own date range — its staging data and completed units are kept.
+        // own date range — its staging data and completed units are kept. Failed units get fresh attempts.
         if (last != null && last.Status == "Fetching" && DateTime.UtcNow - last.StartedAt < abandonAfter)
         {
             await progress($"resuming run of {last.RunDate:dd.MM.yyyy} (FY {last.FyStart:dd.MM.yyyy}–{last.ToDate:dd.MM.yyyy})");
+            foreach (var api in FyApiOrder) await FixStageShapeAsync(db, GetFyTable(db, api), ct);
+            var reset = await db.DmsSyncCheckpoints
+                .Where(c => c.ApiName.StartsWith(FyApiPrefix) && c.Status != SyncCheckpointStatus.Completed)
+                .ExecuteUpdateAsync(x => x.SetProperty(c => c.Status, SyncCheckpointStatus.Pending)
+                                          .SetProperty(c => c.Attempts, 0), ct);
+            if (reset > 0) _logger.LogInformation("FY refresh — {n} unfinished/failed unit(s) queued again.", reset);
             return last;
         }
         if (last != null && last.Status == "Fetching")
@@ -247,6 +257,7 @@ CREATE INDEX [IX_FyStage_Key] ON {t.Stage} ([UniqueKey]);";
 #pragma warning disable EF1002 // names come from the EF model, not from input
             await db.Database.ExecuteSqlRawAsync(sql, ct);
 #pragma warning restore EF1002
+            await FixStageShapeAsync(db, t, ct);
         }
 
         // Units for this run
@@ -291,6 +302,25 @@ CREATE INDEX [IX_FyStage_Key] ON {t.Stage} ([UniqueKey]);";
         _logger.LogInformation("FY refresh {from:dd.MM.yyyy}–{to:dd.MM.yyyy}: {n} ERP unit(s) planned ({d} dealers; all-dealer per-day APIs: {pd}).",
             state.FyStart, state.ToDate, units.Count, dealers.Count, perDayApis.Count == 0 ? "none" : string.Join(",", perDayApis));
         return state;
+    }
+
+    // SELECT INTO copies computed columns as ordinary NOT NULL columns (DMS_ServiceHistory.JobStatus) and keeps
+    // NOT NULL on columns the sync never fills — bulk copy then fails. The staging table only needs the
+    // columns the sync writes: drop every other column (except Id and FyUnitKey). Idempotent.
+    private async Task FixStageShapeAsync(AppDbContext db, FyTableInfo t, CancellationToken ct)
+    {
+        var keep = t.Columns.Select(c => c.Column).Append("Id").Append(FyUnitColumn)
+                    .Select(c => c.Replace("'", "''")).ToList();
+        var list = string.Join(",", keep.Select(c => $"N'{c}'"));
+        var sql = $@"
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql = @sql + N'ALTER TABLE {t.Stage} DROP COLUMN ' + QUOTENAME(c.name) + N';'
+FROM sys.columns c
+WHERE c.object_id = OBJECT_ID(N'{t.Stage}') AND c.name NOT IN ({list});
+IF LEN(@sql) > 0 EXEC sp_executesql @sql;";
+#pragma warning disable EF1002 // names come from the EF model, not from input
+        await db.Database.ExecuteSqlRawAsync(sql, ct);
+#pragma warning restore EF1002
     }
 
     private static DmsSyncCheckpoint NewUnit(string api, string dealer, DateOnly from, DateOnly to, DateTime now) => new()
@@ -479,27 +509,47 @@ CREATE INDEX [IX_FyStage_Key] ON {t.Stage} ([UniqueKey]);";
             return c;
         }
 
-        var dc = $"[{t.DateColumn}]";
-        long staged, existing, outside;
+        // Which date column does the ERP filter on? The configured one is checked first; if too many fetched rows
+        // fall outside the FY range on it, every other DATE column is measured and the one whose values are all
+        // inside the range is used (e.g. VDR: SaleDate is empty for unsold vehicles, InvoiceDate is the filter).
+        var candidates = new[] { t.DateColumn }.Concat(t.DateColumns.Where(d => d != t.DateColumn)).ToList();
+        var outsideSql = string.Join(",\n  ", candidates.Select(d =>
+            $"(SELECT COUNT(*) FROM {t.Stage} WHERE [{d}] IS NULL OR [{d}] < @fy OR [{d}] > @to)"));
+        long staged; var outsideBy = new Dictionary<string, long>();
         await using (var c = Cmd($@"
 SELECT
   (SELECT COUNT(*) FROM (SELECT UniqueKey, ROW_NUMBER() OVER (PARTITION BY UniqueKey ORDER BY Id DESC) rn FROM {t.Stage}) x
      WHERE x.UniqueKey IS NULL OR x.rn = 1),
-  (SELECT COUNT(*) FROM {t.Main} WHERE {dc} >= @fy AND {dc} <= @to),
-  (SELECT COUNT(*) FROM {t.Stage} WHERE {dc} IS NULL OR {dc} < @fy OR {dc} > @to);"))
+  {outsideSql};"))
         await using (var rd = await c.ExecuteReaderAsync(ct))
         {
             await rd.ReadAsync(ct);
-            staged = Convert.ToInt64(rd[0]); existing = Convert.ToInt64(rd[1]); outside = Convert.ToInt64(rd[2]);
+            staged = Convert.ToInt64(rd[0]);
+            for (int i = 0; i < candidates.Count; i++) outsideBy[candidates[i]] = Convert.ToInt64(rd[i + 1]);
         }
+
+        var dateColumn = t.DateColumn;
+        if (staged > 0 && outsideBy[dateColumn] > staged * maxOutside)
+        {
+            var best = candidates.OrderBy(d => outsideBy[d]).ThenBy(d => candidates.IndexOf(d)).First();
+            if (outsideBy[best] > staged * maxOutside)
+                return new FySwapResult(0, 0,
+                    $"no date column matches the ERP range (best: {best}, {outsideBy[best]} of {staged} rows outside " +
+                    $"{fyStart:dd.MM.yyyy}–{toDate:dd.MM.yyyy}). Previous data kept");
+            _logger.LogWarning("FY refresh — {api}: {cfg} has {o} of {n} rows outside the FY range; using {best} " +
+                               "(all rows inside) as the FY date. Set FyRefresh:DateColumns:{api} = \"{bestProp}\" to make it permanent.",
+                t.Api, dateColumn, outsideBy[dateColumn], staged, best, t.Api, best);
+            dateColumn = best;
+        }
+
+        var dc = $"[{dateColumn}]";
+        long existing;
+        await using (var c = Cmd($"SELECT COUNT(*) FROM {t.Main} WHERE {dc} >= @fy AND {dc} <= @to;"))
+            existing = Convert.ToInt64(await c.ExecuteScalarAsync(ct));
 
         if (existing > 0 && staged < existing * minRatio)
             return new FySwapResult(0, 0,
                 $"only {staged} row(s) fetched vs {existing} in the table for this FY (< {minRatio:P0}, FyRefresh:MinRowRatio) — looks like an incomplete ERP answer; previous data kept");
-        if (staged > 0 && outside > staged * maxOutside)
-            return new FySwapResult(0, 0,
-                $"{outside} of {staged} fetched row(s) have {t.DateColumn} outside {fyStart:dd.MM.yyyy}–{toDate:dd.MM.yyyy} — " +
-                $"the ERP filters on a different date; set FyRefresh:DateColumns:{t.Api}. Previous data kept");
 
         var cols = string.Join(", ", t.Columns.Select(c => $"[{c.Column}]"));
         var swapSql = $@"
