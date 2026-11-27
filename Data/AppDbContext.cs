@@ -583,11 +583,15 @@ public partial class AppDbContext : DbContext
             entity.Property(e => e.Technician).HasMaxLength(100);
             entity.Property(e => e.CreatedThrough).HasMaxLength(50);
             entity.Property(e => e.UniqueKey).HasMaxLength(400);
+            entity.Property(e => e.CogximUniqueKey).HasMaxLength(50);
 
             entity.HasIndex(e => e.UniqueKey)
             .IsUnique()
             .HasFilter("[UniqueKey] IS NOT NULL")
             .HasDatabaseName("UX_DMS_JobReport_UniqueKey");
+
+            entity.HasIndex(e => e.CogximUniqueKey)
+            .HasDatabaseName("IX_DMS_JobReport_CogximUniqueKey");
         });
 
         modelBuilder.Entity<DmsProforma>(e =>

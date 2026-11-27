@@ -14,6 +14,11 @@ public class JobReportRecordDto
     // still sends its own external id in this field.
     [JsonConverter(typeof(FlexibleStringConverter))]
     public string? UniqueKey { get; set; }
+
+    // Cogxim's job-card id. Optional: if Cogxim sends it in "uniqueKey" (as today, e.g. 127318) it is copied
+    // here automatically; it may also be sent explicitly as "cogximUniqueKey".
+    [JsonConverter(typeof(FlexibleStringConverter))]
+    public string? CogximUniqueKey { get; set; }
     public string? DealerName { get; set; }
     public string? DealerCode { get; set; }
     public string? DealerLocation { get; set; }

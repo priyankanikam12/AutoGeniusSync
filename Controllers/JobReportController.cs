@@ -35,6 +35,13 @@ public class JobReportController : ControllerBase
         return !string.IsNullOrEmpty(expected) && string.Equals(apiKey, expected, StringComparison.Ordinal);
     }
 
+    // Cogxim's id as sent, trimmed; blank → null. Our own computed key (if a caller echoes it back) is not stored.
+    private static string? CleanCogximKey(string? v)
+    {
+        var t = v?.Trim();
+        return string.IsNullOrEmpty(t) || t.Length > 50 ? null : t;
+    }
+
     private static string BuildKey(string? dealerCode, string? jobNo, DateOnly? jobDate, string? chassisNo)
         => $"{dealerCode?.Trim().ToUpperInvariant()}{jobNo?.Trim().ToUpperInvariant()}{jobDate?.ToString("yyyy-MM-dd")}{chassisNo?.Trim().ToUpperInvariant()}";
 
@@ -131,7 +138,8 @@ public class JobReportController : ControllerBase
               && Eq(row.Observation, incoming.Observation) && Eq(row.SupervisorComment, incoming.SupervisorComment) && Eq(row.JobStatus, incoming.JobStatus)
               && Eq(row.BatteryNo, incoming.BatteryNo) && Eq(row.BrandName, incoming.BrandName) && Eq(row.ChargerNo, incoming.ChargerNo)
               && row.SaleDate == incoming.SaleDate && Eq(row.Supervisor, incoming.Supervisor) && Eq(row.Technician, incoming.Technician)
-              && row.JobEndDate == incoming.JobEndDate && Eq(row.CreatedThrough, incoming.CreatedThrough)))
+              && row.JobEndDate == incoming.JobEndDate && Eq(row.CreatedThrough, incoming.CreatedThrough)
+              && (incoming.CogximUniqueKey == null || Eq(row.CogximUniqueKey, incoming.CogximUniqueKey))))
             return false;
 
         if (row.Complaints.Count != incoming.Complaints.Count) return false;
@@ -479,7 +487,7 @@ public class JobReportController : ControllerBase
     // STANDARD CRUD — single-record JSON API
     // ═══════════════════════════════════════════════════════
 
-    // GET api/jobreport?fromDate=2026-09-01&toDate=2026-09-17&dealerCode=...&chassisNo=...&page=1&pageSize=100
+    // GET api/jobreport?fromDate=2026-09-01&toDate=2026-09-17&dealerCode=...&chassisNo=...&cogximUniqueKey=127318&page=1&pageSize=100
     //
     // fromDate/toDate filter on JobDate (inclusive on both ends) — this is what
     // "fetch it live with a date range" means once Cogzim's bulk push has synced
@@ -493,6 +501,7 @@ public class JobReportController : ControllerBase
         [FromQuery] string? dealerCode = null,
         [FromQuery] string? chassisNo = null,
         [FromQuery] DateOnly? fromDate = null,
+        [FromQuery] string? cogximUniqueKey = null,
         [FromQuery] DateOnly? toDate = null,
         [FromQuery] int page = 1,
         [FromQuery] int pageSize = 100)
@@ -510,6 +519,9 @@ public class JobReportController : ControllerBase
 
         if (!string.IsNullOrEmpty(chassisNo))
             q = q.Where(x => x.ChassisNo == chassisNo);
+
+        if (!string.IsNullOrEmpty(cogximUniqueKey))
+            q = q.Where(x => x.CogximUniqueKey == cogximUniqueKey);
 
         if (fromDate.HasValue)
             q = q.Where(x => x.JobDate >= fromDate.Value);
@@ -594,6 +606,7 @@ public class JobReportController : ControllerBase
             JobEndDate        = input.JobEndDate,
             CreatedThrough    = input.CreatedThrough,
             UniqueKey         = uniqueKey,
+            CogximUniqueKey   = CleanCogximKey(input.CogximUniqueKey) ?? CleanCogximKey(input.UniqueKey),
             CreatedAt         = DateTime.UtcNow,
             UpdatedAt         = DateTime.UtcNow,
             Complaints        = complaints
@@ -665,6 +678,8 @@ public class JobReportController : ControllerBase
         existing.JobEndDate        = input.JobEndDate;
         existing.CreatedThrough    = input.CreatedThrough;
         existing.UniqueKey         = BuildKey(input.DealerCode, input.JobNo, input.JobDate, input.ChassisNo);
+        var cogximKey = CleanCogximKey(input.CogximUniqueKey) ?? CleanCogximKey(input.UniqueKey);
+        if (cogximKey != null) existing.CogximUniqueKey = cogximKey;
         existing.UpdatedAt         = DateTime.UtcNow;
 
         // Replace complaints wholesale with whatever this PUT sent.
@@ -734,6 +749,7 @@ public class JobReportController : ControllerBase
                 case "Technician":        existing.Technician = value; break;
                 case "JobEndDate":        existing.JobEndDate = ParseDate(value); break;
                 case "CreatedThrough":    existing.CreatedThrough = value; break;
+                case "CogximUniqueKey":   existing.CogximUniqueKey = CleanCogximKey(value); break;
                 default:
                     _logger.LogWarning("PATCH JobReport {id}: unknown field '{field}' ignored", id, kvp.Key);
                     break;
@@ -784,7 +800,11 @@ public class JobReportController : ControllerBase
         // (The sample payload sends "uniqueKey" as the sender's own numeric job-card
         // id, which is a different concept from our Dealer+JobNo+JobDate+Chassis key.)
         foreach (var r in records)
+        {
+            // Keep Cogxim's own id (sent in "uniqueKey", e.g. 127318) before our key replaces it.
+            r.CogximUniqueKey = CleanCogximKey(r.CogximUniqueKey) ?? CleanCogximKey(r.UniqueKey);
             r.UniqueKey = UniqueKeyBuilder.JobReport(r.DealerCode, r.JobNo, r.JobDate, r.ChassisNo);
+        }
 
         var deduped = records.GroupBy(r => r.UniqueKey).Select(g => g.Last()).ToList();
         var skipped = new List<string>();
@@ -867,7 +887,11 @@ public class JobReportController : ControllerBase
             return BadRequest(new { error = "Payload must be a non-empty array of records." });
 
         foreach (var r in records)
+        {
+            // Keep Cogxim's own id (sent in "uniqueKey", e.g. 127318) before our key replaces it.
+            r.CogximUniqueKey = CleanCogximKey(r.CogximUniqueKey) ?? CleanCogximKey(r.UniqueKey);
             r.UniqueKey = UniqueKeyBuilder.JobReport(r.DealerCode, r.JobNo, r.JobDate, r.ChassisNo);
+        }
 
         var deduped = records.GroupBy(r => r.UniqueKey).Select(g => g.Last()).ToList();
 
@@ -990,7 +1014,7 @@ public class JobReportController : ControllerBase
             Observation = r.Observation, SupervisorComment = r.SupervisorComment, JobStatus = r.JobStatus,
             BatteryNo = r.BatteryNo, BrandName = r.BrandName, ChargerNo = r.ChargerNo, SaleDate = r.SaleDate,
             Supervisor = r.Supervisor, Technician = r.Technician, JobEndDate = r.JobEndDate,
-            CreatedThrough = r.CreatedThrough, UniqueKey = r.UniqueKey,
+            CreatedThrough = r.CreatedThrough, UniqueKey = r.UniqueKey, CogximUniqueKey = r.CogximUniqueKey,
             CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow,
             Complaints = complaints
         };
@@ -1007,6 +1031,7 @@ public class JobReportController : ControllerBase
         row.BatteryNo = r.BatteryNo; row.BrandName = r.BrandName; row.ChargerNo = r.ChargerNo; row.SaleDate = r.SaleDate;
         row.Supervisor = r.Supervisor; row.Technician = r.Technician; row.JobEndDate = r.JobEndDate;
         row.CreatedThrough = r.CreatedThrough;
+        if (r.CogximUniqueKey != null) row.CogximUniqueKey = r.CogximUniqueKey;   // never wipe a stored id with "not sent"
 
         // Replace complaints wholesale — simplest correct semantics for an upsert:
         // whatever the caller sends is now the full set of complaints for this job card.

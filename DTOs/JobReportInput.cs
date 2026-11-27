@@ -8,6 +8,13 @@ namespace AutoGeniusSync.DTOs;
 // and taken from the route parameter on update, never from the body.
 public class JobReportInput
 {
+    // Cogxim's job-card id (optional). "uniqueKey" is accepted as well, for the same value.
+    [JsonConverter(typeof(FlexibleStringConverter))]
+    public string? CogximUniqueKey { get; set; }
+
+    [JsonConverter(typeof(FlexibleStringConverter))]
+    public string? UniqueKey { get; set; }
+
     public string? DealerName { get; set; }
     public string? DealerCode { get; set; }
     public string? DealerLocation { get; set; }
