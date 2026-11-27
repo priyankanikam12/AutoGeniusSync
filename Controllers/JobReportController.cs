@@ -532,6 +532,7 @@ public class JobReportController : ControllerBase
         var total = await q.CountAsync();
         var records = await q
             .OrderByDescending(x => x.JobDate)
+            .ThenByDescending(x => x.Id)
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
             .ToListAsync();
