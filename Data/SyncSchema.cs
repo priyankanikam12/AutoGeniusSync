@@ -75,6 +75,27 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_DMS_SyncCheckpoint_Ap
             if (n > 0) logger.LogInformation("{n} obsolete all-dealer checkpoint row(s) removed (sync is dealer-wise).", n);
         }
 
+        // DMS_JobReport columns used by the Cogxim integration — added only if missing (same as
+        // Data/Sql/02_JobReport_CogximUniqueKey.sql and 04_JobReport_VehicleType.sql), so the API never breaks
+        // when the SQL script was not run before a deploy. Existing data is not touched.
+        try
+        {
+            await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'dbo.DMS_JobReport', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.DMS_JobReport', N'CogximUniqueKey') IS NULL
+    ALTER TABLE dbo.DMS_JobReport ADD CogximUniqueKey NVARCHAR(50) NULL;
+IF OBJECT_ID(N'dbo.DMS_JobReport', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.DMS_JobReport', N'VehicleType') IS NULL
+    ALTER TABLE dbo.DMS_JobReport ADD VehicleType NVARCHAR(100) NULL;", ct);
+            await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'dbo.DMS_JobReport', N'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.DMS_JobReport') AND name = N'IX_DMS_JobReport_CogximUniqueKey')
+    CREATE INDEX IX_DMS_JobReport_CogximUniqueKey ON dbo.DMS_JobReport (CogximUniqueKey);", ct);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError("Could not verify DMS_JobReport columns CogximUniqueKey / VehicleType: {msg}. Run Data/Sql/04_JobReport_VehicleType.sql.",
+                ex.InnerException?.Message ?? ex.Message);
+        }
+
         foreach (var (table, index) in UniqueKeyIndexes)
         {
             // Any unique index on UniqueKey (whatever its name) counts — do not create a second one.

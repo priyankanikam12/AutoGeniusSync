@@ -51,6 +51,7 @@ public class JobReportInput
     public string? BatteryNo { get; set; }
     public string? BrandName { get; set; }
     public string? ChargerNo { get; set; }
+    public string? VehicleType { get; set; }
 
     [JsonConverter(typeof(FlexibleDateOnlyConverter))]
     public DateOnly? SaleDate { get; set; }

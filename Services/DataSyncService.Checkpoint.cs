@@ -777,7 +777,7 @@ public partial class DataSyncService
         private static readonly object CacheLock = new();
 
         // Columns that are NOT part of the ERP payload: never hashed, never overwritten by the sync.
-        private static readonly HashSet<string> NotFromErp = new(StringComparer.Ordinal)
+        internal static readonly HashSet<string> NotFromErp = new(StringComparer.Ordinal)
         {
             "Id", "CreatedAt", "UpdatedAt", "RowHash", "UniqueKey",
             "JobStatus", "RepairType", "CompletionDate",       // DMS_ServiceHistory (JobStatus is computed in SQL)

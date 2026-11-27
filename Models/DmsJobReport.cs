@@ -51,6 +51,9 @@ public partial class DmsJobReport
     // Cogxim's own job-card id (sent by Cogxim as "uniqueKey", e.g. 127318). Stored as-is so records can be
     // matched with Cogxim's system. Not our duplicate key — that stays UniqueKey (Dealer+JobNo+JobDate+Chassis).
     public string? CogximUniqueKey { get; set; }
+
+    // Cogxim "vehicleType" (e.g. Internal / External)
+    public string? VehicleType { get; set; }
     public string? Action { get; set; }
     public DateTime? CreatedAt { get; set; }
     public DateTime? UpdatedAt { get; set; }

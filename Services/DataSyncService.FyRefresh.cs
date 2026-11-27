@@ -141,22 +141,49 @@ public partial class DataSyncService
             foreach (var api in FyApiOrder.Where(a => !swapped.Contains(a)))
             {
                 ct.ThrowIfCancellationRequested();
-                var notDone = await db.DmsSyncCheckpoints.AsNoTracking()
-                    .CountAsync(c => c.ApiName == FyApiPrefix + api && c.Status != SyncCheckpointStatus.Completed, CancellationToken.None);
+                var unitStats = await db.DmsSyncCheckpoints.AsNoTracking()
+                    .Where(c => c.ApiName == FyApiPrefix + api)
+                    .GroupBy(c => c.Status == SyncCheckpointStatus.Completed)
+                    .Select(g => new { Done = g.Key, N = g.Count() })
+                    .ToListAsync(CancellationToken.None);
+                var notDone = unitStats.Where(x => !x.Done).Sum(x => x.N);
+                var totalUnits = unitStats.Sum(x => x.N);
+
+                // PARTIAL replace (fallback): a few dealer-months keep failing (e.g. the ERP cannot answer one
+                // dealer's month at all) — after FyRefresh:PartialSwapAfterHours of trying, the table is replaced
+                // anyway EXCEPT those dealer-months, which keep their previous data. Without this one bad unit
+                // would block the whole table (and the previous-years update) until the run is abandoned.
+                var partial = false;
                 if (notDone > 0)
                 {
-                    problems.Add($"{api}: NOT replaced — {notDone} unit(s) not fetched yet/failed; previous data kept, retried on the next attempt");
-                    continue;
+                    var partialAfterHours = _config.GetValue("FyRefresh:PartialSwapAfterHours", 20.0);
+                    var maxFailedRatio    = _config.GetValue("FyRefresh:MaxFailedUnitRatio", 0.02);
+                    var age = DateTime.UtcNow - state.StartedAt;
+                    if (partialAfterHours > 0 && age >= TimeSpan.FromHours(partialAfterHours)
+                        && notDone <= Math.Max(1, (int)Math.Floor(totalUnits * maxFailedRatio)))
+                    {
+                        partial = true;
+                        _logger.LogWarning("FY refresh — {api}: {n} of {t} unit(s) still failing after {h:0.#} h; replacing the rest, " +
+                                           "those dealer-months keep their previous data.", api, notDone, totalUnits, age.TotalHours);
+                    }
+                    else
+                    {
+                        problems.Add($"{api}: NOT replaced — {notDone} of {totalUnits} unit(s) not fetched yet/failed; previous data kept, retried on the next attempt");
+                        continue;
+                    }
                 }
 
-                await Progress($"checking and replacing {api} FY data");
-                var swap = await SwapFyTableAsync(db, tables[api], state.FyStart, state.ToDate, ct);
+                await Progress($"checking and replacing {api} FY data{(partial ? $" (partial: {notDone} failed unit(s) keep previous data)" : "")}");
+                var newSwapped = string.Join(",", swapped.Append(api));
+                var swap = await SwapFyTableAsync(db, tables[api], state, newSwapped, partial, ct);
                 if (swap.Error != null) { problems.Add($"{api}: NOT replaced — {swap.Error}"); continue; }
 
                 overall.RecordsInserted += swap.Inserted;
-                notes.Add($"{api}: replaced {swap.Deleted} FY row(s) with {swap.Inserted} fresh row(s)");
+                notes.Add($"{api}: replaced {swap.Deleted} FY row(s) with {swap.Inserted} fresh row(s)"
+                          + (partial ? $"; {notDone} failed dealer-month unit(s) kept previous data" : ""));
+                if (partial) problems.Add($"{api}: {notDone} unit(s) could not be fetched — their previous data was kept");
                 swapped.Add(api);
-                state.SwappedTables = string.Join(",", swapped);
+                state.SwappedTables = newSwapped;          // already written inside the swap transaction
                 state.UpdatedAt = DateTime.UtcNow;
                 await db.SaveChangesAsync(CancellationToken.None);
             }
@@ -494,8 +521,10 @@ IF LEN(@sql) > 0 EXEC sp_executesql @sql;";
 
     private sealed record FySwapResult(int Deleted, int Inserted, string? Error);
 
-    private async Task<FySwapResult> SwapFyTableAsync(AppDbContext db, FyTableInfo t, DateOnly fyStart, DateOnly toDate, CancellationToken ct)
+    private async Task<FySwapResult> SwapFyTableAsync(AppDbContext db, FyTableInfo t, DmsFyRefreshState state, string newSwapped,
+                                                      bool partial, CancellationToken ct)
     {
+        var fyStart = state.FyStart; var toDate = state.ToDate;
         var minRatio  = _config.GetValue("FyRefresh:MinRowRatio", 0.5);
         var maxOutside = _config.GetValue("FyRefresh:MaxOutOfRangeRatio", 0.02);
         var conn = (SqlConnection)db.Database.GetDbConnection();
@@ -506,8 +535,39 @@ IF LEN(@sql) > 0 EXEC sp_executesql @sql;";
             var c = new SqlCommand(sql, conn) { CommandTimeout = timeout };
             c.Parameters.Add("@fy", SqlDbType.Date).Value = fyStart.ToDateTime(TimeOnly.MinValue);
             c.Parameters.Add("@to", SqlDbType.Date).Value = toDate.ToDateTime(TimeOnly.MinValue);
+            c.Parameters.Add("@fyApi", SqlDbType.NVarChar, 100).Value = FyApiPrefix + t.Api;
+            c.Parameters.Add("@api", SqlDbType.NVarChar, 100).Value = t.Api;
+            c.Parameters.Add("@done", SqlDbType.NVarChar, 20).Value = SyncCheckpointStatus.Completed;
+            c.Parameters.Add("@stateId", SqlDbType.Int).Value = state.Id;
+            c.Parameters.Add("@swapped", SqlDbType.NVarChar, 200).Value = newSwapped;
             return c;
         }
+
+        // Checkpoint / state tables from the EF model.
+        var cpT = Tbl(db, typeof(DmsSyncCheckpoint)); var stT = Tbl(db, typeof(DmsFyRefreshState));
+        string Col(Type type, string prop) => Tbl(db, type).Col(prop);
+        var cpApi = Col(typeof(DmsSyncCheckpoint), nameof(DmsSyncCheckpoint.ApiName));
+        var cpDealer = Col(typeof(DmsSyncCheckpoint), nameof(DmsSyncCheckpoint.DealerCode));
+        var cpFrom = Col(typeof(DmsSyncCheckpoint), nameof(DmsSyncCheckpoint.PeriodStart));
+        var cpTo = Col(typeof(DmsSyncCheckpoint), nameof(DmsSyncCheckpoint.PeriodEnd));
+        var cpStatus = Col(typeof(DmsSyncCheckpoint), nameof(DmsSyncCheckpoint.Status));
+        // Dealer column of the data table (VehicleDispatches has none → a failed unit keeps the whole period).
+        var mainDealer = db.Model.FindEntityType(FyEntity(t.Api))!.FindProperty("DealerCode") != null
+            ? Col(FyEntity(t.Api), "DealerCode") : null;
+
+        // Partial replace: rows of the units that could not be fetched are kept (not deleted).
+        var dealerMatch = mainDealer == null ? "" : $" AND (u.[{cpDealer}] = N'' OR u.[{cpDealer}] = m.[{mainDealer}])";
+        string Keep(string dc) => !partial ? "" : $@"
+   AND NOT EXISTS (SELECT 1 FROM {cpT.Name} u WHERE u.[{cpApi}] = @fyApi AND u.[{cpStatus}] <> @done{dealerMatch}
+                   AND {dc} >= u.[{cpFrom}] AND {dc} <= u.[{cpTo}])";
+        // …and their partially staged rows (windows fetched before the unit failed) are not used.
+        var dropFailedStage = !partial ? "" : $@"
+DELETE s FROM {t.Stage} s
+ WHERE EXISTS (SELECT 1 FROM {cpT.Name} u WHERE u.[{cpApi}] = @fyApi AND u.[{cpStatus}] <> @done
+               AND s.[{FyUnitColumn}] = @api + N'|' + u.[{cpDealer}] + N'|' + CONVERT(CHAR(8), u.[{cpFrom}], 112));";
+
+        if (partial)
+            await using (var c = Cmd(dropFailedStage)) await c.ExecuteNonQueryAsync(ct);
 
         // Which date column does the ERP filter on? The configured one is checked first; if too many fetched rows
         // fall outside the FY range on it, every other DATE column is measured and the one whose values are all
@@ -542,9 +602,9 @@ SELECT
             dateColumn = best;
         }
 
-        var dc = $"[{dateColumn}]";
+        var dc = $"m.[{dateColumn}]";
         long existing;
-        await using (var c = Cmd($"SELECT COUNT(*) FROM {t.Main} WHERE {dc} >= @fy AND {dc} <= @to;"))
+        await using (var c = Cmd($"SELECT COUNT(*) FROM {t.Main} m WHERE {dc} >= @fy AND {dc} <= @to{Keep(dc)};"))
             existing = Convert.ToInt64(await c.ExecuteScalarAsync(ct));
 
         if (existing > 0 && staged < existing * minRatio)
@@ -552,11 +612,26 @@ SELECT
                 $"only {staged} row(s) fetched vs {existing} in the table for this FY (< {minRatio:P0}, FyRefresh:MinRowRatio) — looks like an incomplete ERP answer; previous data kept");
 
         var cols = string.Join(", ", t.Columns.Select(c => $"[{c.Column}]"));
+
+        // Columns the ERP does not send (ServiceHistory.RepairType/CompletionDate, LOR.MaterialCode/MaterialDate,
+        // filled by uploads / other APIs) and the original CreatedAt are carried over from the row being
+        // replaced (same UniqueKey) — otherwise every nightly replace would wipe them for the whole FY.
+        var keepCols = t.Columns.Where(c => RowMeta.NotFromErp.Contains(c.Prop.Name) && c.Prop.Name != "UniqueKey"
+                                            && c.Prop.Name != "RowHash" && c.Prop.Name != "UpdatedAt" && c.Prop.Name != "Id")
+                                .Select(c => c.Column).ToList();
+        var createdCol = t.Columns.Where(x => x.Prop.Name == "CreatedAt").Select(x => x.Column).FirstOrDefault();
+        var carryOver = keepCols.Count == 0 ? "" : $@"
+UPDATE s SET {string.Join(", ", keepCols.Select(c => c == createdCol
+                                                     ? $"s.[{c}] = COALESCE(m.[{c}], s.[{c}])"
+                                                     : $"s.[{c}] = COALESCE(s.[{c}], m.[{c}])"))}
+FROM {t.Stage} s JOIN {t.Main} m ON m.UniqueKey = s.UniqueKey
+WHERE s.UniqueKey IS NOT NULL;";
+
         var swapSql = $@"
 SET XACT_ABORT ON;
 DECLARE @del1 INT, @del2 INT, @ins INT;
-BEGIN TRANSACTION;
-DELETE FROM {t.Main} WHERE {dc} >= @fy AND {dc} <= @to;
+BEGIN TRANSACTION;{carryOver}
+DELETE m FROM {t.Main} m WHERE {dc} >= @fy AND {dc} <= @to{Keep(dc)};
 SET @del1 = @@ROWCOUNT;
 DELETE m FROM {t.Main} m
  WHERE m.UniqueKey IS NOT NULL AND EXISTS (SELECT 1 FROM {t.Stage} s WHERE s.UniqueKey = m.UniqueKey);
@@ -565,6 +640,10 @@ INSERT INTO {t.Main} ({cols})
 SELECT {cols} FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY UniqueKey ORDER BY Id DESC) AS __rn FROM {t.Stage}) x
  WHERE x.UniqueKey IS NULL OR x.__rn = 1;
 SET @ins = @@ROWCOUNT;
+-- progress is recorded in the SAME transaction: a crash right after COMMIT can never re-run this replace
+UPDATE {stT.Name} SET [{Col(typeof(DmsFyRefreshState), nameof(DmsFyRefreshState.SwappedTables))}] = @swapped,
+       [{Col(typeof(DmsFyRefreshState), nameof(DmsFyRefreshState.UpdatedAt))}] = SYSUTCDATETIME()
+ WHERE [{Col(typeof(DmsFyRefreshState), nameof(DmsFyRefreshState.Id))}] = @stateId;
 COMMIT TRANSACTION;
 SELECT @del1 + @del2, @ins;";
         try
@@ -589,6 +668,15 @@ SELECT @del1 + @del2, @ins;";
             _logger.LogError(ex, "FY refresh — {api}: replacement rolled back, previous data kept.", t.Api);
             return new FySwapResult(0, 0, "database error during replace, rolled back, previous data kept: " + Trunc(ex.Message, 300));
         }
+    }
+
+    private sealed record TblInfo(string Name, Func<string, string> Col);
+    private static TblInfo Tbl(AppDbContext db, Type type)
+    {
+        var et = db.Model.FindEntityType(type)!;
+        var store = StoreObjectIdentifier.Table(et.GetTableName()!, et.GetSchema());
+        return new TblInfo($"[{et.GetSchema() ?? "dbo"}].[{et.GetTableName()}]",
+                           prop => et.FindProperty(prop)!.GetColumnName(store)!);
     }
 
     // GET api/admin/reload/fy — status of the current FY refresh.

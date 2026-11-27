@@ -56,7 +56,7 @@ public class JobReportController : ControllerBase
                 System.Globalization.DateTimeStyles.None, out var d))
                 return DateOnly.FromDateTime(d);
         }
-        if (DateTime.TryParse(val, out var d2))
+        if (DateTime.TryParse(val, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var d2))
             return DateOnly.FromDateTime(d2);
         return null;
     }
@@ -139,6 +139,7 @@ public class JobReportController : ControllerBase
               && Eq(row.BatteryNo, incoming.BatteryNo) && Eq(row.BrandName, incoming.BrandName) && Eq(row.ChargerNo, incoming.ChargerNo)
               && row.SaleDate == incoming.SaleDate && Eq(row.Supervisor, incoming.Supervisor) && Eq(row.Technician, incoming.Technician)
               && row.JobEndDate == incoming.JobEndDate && Eq(row.CreatedThrough, incoming.CreatedThrough)
+              && (incoming.VehicleType == null || Eq(row.VehicleType, incoming.VehicleType))
               && (incoming.CogximUniqueKey == null || Eq(row.CogximUniqueKey, incoming.CogximUniqueKey))))
             return false;
 
@@ -601,6 +602,7 @@ public class JobReportController : ControllerBase
             BatteryNo         = input.BatteryNo,
             BrandName         = input.BrandName,
             ChargerNo         = input.ChargerNo,
+            VehicleType       = input.VehicleType,
             SaleDate          = input.SaleDate,
             Supervisor        = input.Supervisor,
             Technician        = input.Technician,
@@ -673,6 +675,7 @@ public class JobReportController : ControllerBase
         existing.BatteryNo         = input.BatteryNo;
         existing.BrandName         = input.BrandName;
         existing.ChargerNo         = input.ChargerNo;
+        if (input.VehicleType != null) existing.VehicleType = input.VehicleType;
         existing.SaleDate          = input.SaleDate;
         existing.Supervisor        = input.Supervisor;
         existing.Technician        = input.Technician;
@@ -699,6 +702,14 @@ public class JobReportController : ControllerBase
         return Ok(existing);
     }
 
+    private static readonly string[] PatchFields =
+    {
+        "DealerName","DealerCode","DealerLocation","City","State","JobNo","JobDate","JobType","ServiceHead","ServiceType",
+        "Kms","CustomerName","MobileNo","ChassisNo","RegNo","EngineNo","ItemName","CustomerVoice","ComplaintCode","Observation",
+        "SupervisorComment","JobStatus","BatteryNo","BrandName","ChargerNo","VehicleType","SaleDate","Supervisor","Technician",
+        "JobEndDate","CreatedThrough","CogximUniqueKey"
+    };
+
     // PATCH /api/jobreport/{id} — partial update.
     // NOTE: this dictionary-based endpoint still only edits header fields, not
     // the Complaints list. If you need to add/remove a single complaint from an
@@ -717,8 +728,18 @@ public class JobReportController : ControllerBase
 
         foreach (var kvp in updates)
         {
-            var value = kvp.Value?.ToString();
-            switch (kvp.Key)
+            // JSON dates arrive as DateTime (Newtonsoft) — format them invariantly, never by server culture.
+            var value = kvp.Value switch
+            {
+                null => null,
+                DateTime dt => dt.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+                DateTimeOffset dto => dto.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+                Newtonsoft.Json.Linq.JValue jv when jv.Value is DateTime jdt => jdt.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+                _ => Convert.ToString(kvp.Value, System.Globalization.CultureInfo.InvariantCulture)
+            };
+            // Field names are matched case-insensitively ("jobStatus" = "JobStatus").
+            var field = PatchFields.FirstOrDefault(f => string.Equals(f, kvp.Key, StringComparison.OrdinalIgnoreCase)) ?? kvp.Key;
+            switch (field)
             {
                 case "DealerName":        existing.DealerName = value; break;
                 case "DealerCode":        existing.DealerCode = value; break;
@@ -745,6 +766,7 @@ public class JobReportController : ControllerBase
                 case "BatteryNo":         existing.BatteryNo = value; break;
                 case "BrandName":         existing.BrandName = value; break;
                 case "ChargerNo":         existing.ChargerNo = value; break;
+                case "VehicleType":       existing.VehicleType = value; break;
                 case "SaleDate":          existing.SaleDate = ParseDate(value); break;
                 case "Supervisor":        existing.Supervisor = value; break;
                 case "Technician":        existing.Technician = value; break;
@@ -787,7 +809,11 @@ public class JobReportController : ControllerBase
         return NoContent();
     }
 
-    // ── POST /api/jobreport/bulk — insert-only ──
+    // ── POST /api/jobreport/bulk — used by Cogxim's live integration ──
+    // New job cards are inserted. A job card that already exists (same DealerCode+JobNo+JobDate+ChassisNo) is
+    // UPDATED when Cogxim sends changed data (e.g. jobStatus Open → Closed, new complaints, CogximUniqueKey) —
+    // before, it was skipped and later changes from Cogxim never reached the database. Identical re-sends are
+    // skipped (no write, no audit entry) and reported in SkippedDuplicates / SkippedKeys as before.
     [HttpPost("bulk")]
     public async Task<IActionResult> BulkInsert([FromHeader(Name = "X-API-Key")] string? apiKey, [FromBody] List<JobReportRecordDto> records)
     {
@@ -797,84 +823,14 @@ public class JobReportController : ControllerBase
         if (records is null || records.Count == 0)
             return BadRequest(new { error = "Payload must be a non-empty array of records." });
 
-        // UniqueKey is always recomputed here — never trusted from the client.
-        // (The sample payload sends "uniqueKey" as the sender's own numeric job-card
-        // id, which is a different concept from our Dealer+JobNo+JobDate+Chassis key.)
-        foreach (var r in records)
-        {
-            // Keep Cogxim's own id (sent in "uniqueKey", e.g. 127318) before our key replaces it.
-            r.CogximUniqueKey = CleanCogximKey(r.CogximUniqueKey) ?? CleanCogximKey(r.UniqueKey);
-            r.UniqueKey = UniqueKeyBuilder.JobReport(r.DealerCode, r.JobNo, r.JobDate, r.ChassisNo);
-        }
+        var r = await UpsertRecordsAsync(records);
+        _logger.LogInformation("JobReport bulk (POST): {ins} inserted, {upd} updated, {unc} unchanged, {fail} failed",
+            r.Inserted, r.Updated, r.UnchangedKeys.Count, r.Failed.Count);
 
-        var deduped = records.GroupBy(r => r.UniqueKey).Select(g => g.Last()).ToList();
-        var skipped = new List<string>();
-        var insertedCount = 0;
-
-        // Processed in batches of BatchSize: one key lookup + one transaction per batch, tracker cleared after.
-        foreach (var chunk in deduped.Chunk(BatchSize))
-        {
-            var keys = chunk.Select(r => r.UniqueKey!).ToList();
-            var existingKeys = (await _db.DmsJobReports.AsNoTracking()
-                .Where(x => x.UniqueKey != null && keys.Contains(x.UniqueKey))
-                .Select(x => x.UniqueKey!)
-                .ToListAsync()).ToHashSet();
-
-            var toInsert = new List<DmsJobReport>();
-            foreach (var r in chunk)
-            {
-                if (existingKeys.Contains(r.UniqueKey!)) { skipped.Add(r.UniqueKey!); continue; }
-
-                var entity = MapJobReport(r);
-                entity.Action = AppendActionLog(null, "BULK_INSERT", r);
-                toInsert.Add(entity);
-            }
-
-            if (toInsert.Count == 0) continue;
-
-            _db.DmsJobReports.AddRange(toInsert);
-            try
-            {
-                await _db.SaveChangesAsync();
-                insertedCount += toInsert.Count;
-            }
-            catch (DbUpdateException)
-            {
-                // The DB-level unique index on UniqueKey rejected the batch — most likely
-                // one row raced with a concurrent request between our existence check above
-                // and this save. Don't let one collision roll back the whole batch: retry
-                // row-by-row so everything that isn't actually a duplicate still gets saved.
-                _logger.LogWarning("JobReport bulk insert hit a unique-index conflict, retrying row-by-row");
-                _db.ChangeTracker.Clear();
-
-                foreach (var entity in toInsert)
-                {
-                    entity.Id = 0;
-                    foreach (var c in entity.Complaints) { c.Id = 0; c.JobReportId = 0; }
-                    _db.DmsJobReports.Add(entity);
-                    try
-                    {
-                        await _db.SaveChangesAsync();
-                        insertedCount++;
-                    }
-                    catch (DbUpdateException)
-                    {
-                        skipped.Add(entity.UniqueKey ?? "(no key)");
-                    }
-                    finally
-                    {
-                        _db.ChangeTracker.Clear();
-                    }
-                }
-            }
-            finally
-            {
-                _db.ChangeTracker.Clear();
-            }
-        }
-
-        _logger.LogInformation("JobReport bulk insert: {ins} inserted, {skip} skipped", insertedCount, skipped.Count);
-        return Ok(new { Inserted = insertedCount, SkippedDuplicates = skipped.Count, SkippedKeys = skipped });
+        if (r.Failed.Count > 0)
+            return Ok(new { Inserted = r.Inserted, Updated = r.Updated, SkippedDuplicates = r.UnchangedKeys.Count, SkippedKeys = r.UnchangedKeys,
+                            Failed = r.Failed.Count, FailedKeys = r.Failed.Select(f => f.Key), Errors = r.Failed.Select(f => f.Error).Distinct() });
+        return Ok(new { Inserted = r.Inserted, Updated = r.Updated, SkippedDuplicates = r.UnchangedKeys.Count, SkippedKeys = r.UnchangedKeys });
     }
 
     // ── PUT /api/jobreport/bulk — upsert ──
@@ -887,6 +843,21 @@ public class JobReportController : ControllerBase
         if (records is null || records.Count == 0)
             return BadRequest(new { error = "Payload must be a non-empty array of records." });
 
+        var r = await UpsertRecordsAsync(records);
+        _logger.LogInformation("JobReport bulk upsert: {ins} inserted, {upd} updated, {unc} unchanged, {fail} failed",
+            r.Inserted, r.Updated, r.UnchangedKeys.Count, r.Failed.Count);
+
+        if (r.Failed.Count > 0)
+            return Ok(new { Inserted = r.Inserted, Updated = r.Updated, Unchanged = r.UnchangedKeys.Count,
+                            Conflicted = r.Failed.Count, ConflictedKeys = r.Failed.Select(f => f.Key), Errors = r.Failed.Select(f => f.Error).Distinct() });
+        return Ok(new { Inserted = r.Inserted, Updated = r.Updated, Unchanged = r.UnchangedKeys.Count });
+    }
+
+    private sealed record UpsertOutcome(int Inserted, int Updated, List<string> UnchangedKeys, List<(string Key, string Error)> Failed);
+
+    // Shared by POST and PUT /bulk: insert new job cards, update changed ones, skip identical ones.
+    private async Task<UpsertOutcome> UpsertRecordsAsync(List<JobReportRecordDto> records)
+    {
         foreach (var r in records)
         {
             // Keep Cogxim's own id (sent in "uniqueKey", e.g. 127318) before our key replaces it.
@@ -896,8 +867,9 @@ public class JobReportController : ControllerBase
 
         var deduped = records.GroupBy(r => r.UniqueKey).Select(g => g.Last()).ToList();
 
-        int inserted = 0, updated = 0, unchanged = 0;
-        var conflicted = new List<string>();
+        int inserted = 0, updated = 0;
+        var unchangedKeys = new List<string>();
+        var failed = new List<(string Key, string Error)>();
 
         // Batches of BatchSize: existing rows (with complaints) loaded per batch only, change tracker
         // cleared after each batch. Unchanged records are not updated and get no new audit entry.
@@ -912,11 +884,12 @@ public class JobReportController : ControllerBase
             var lookup = existing.GroupBy(x => x.UniqueKey!).ToDictionary(g => g.Key, g => g.First());
 
             int chunkInserted = 0, chunkUpdated = 0;
+            var chunkUnchanged = new List<string>();
             foreach (var r in chunk)
             {
                 if (lookup.TryGetValue(r.UniqueKey!, out var row))
                 {
-                    if (SameContent(row, MapJobReport(r))) { unchanged++; continue; }
+                    if (SameContent(row, MapJobReport(r))) { chunkUnchanged.Add(r.UniqueKey!); continue; }
                     ApplyJobReport(row, r);
                     row.Action = AppendActionLog(row.Action, "BULK_UPDATE", r);
                     row.UpdatedAt = DateTime.UtcNow;
@@ -936,14 +909,15 @@ public class JobReportController : ControllerBase
                 await _db.SaveChangesAsync();
                 inserted += chunkInserted;
                 updated  += chunkUpdated;
+                unchangedKeys.AddRange(chunkUnchanged);
             }
-            catch (DbUpdateException)
+            catch (DbUpdateException ex)
             {
-                // The DB-level unique index on UniqueKey rejected the batch — most likely one
-                // of the "new" records here raced with a concurrent insert of the same
-                // DealerCode+JobNo+JobDate+ChassisNo between our lookup above and this save.
-                // Don't let one collision roll back the whole batch: retry this batch row-by-row.
-                _logger.LogWarning("JobReport bulk upsert hit a unique-index conflict, retrying row-by-row");
+                // Usually a concurrent insert of the same job card (unique index on UniqueKey), sometimes one bad
+                // value (e.g. text longer than its column). Don't let one record roll back the whole batch:
+                // retry row-by-row so every good record is still saved; the bad ones are reported with the reason.
+                _logger.LogWarning("JobReport bulk save failed ({msg}) — retrying row-by-row",
+                    ex.InnerException?.Message ?? ex.Message);
                 _db.ChangeTracker.Clear();
 
                 foreach (var r in chunk)
@@ -955,7 +929,7 @@ public class JobReportController : ControllerBase
 
                         if (row != null)
                         {
-                            if (SameContent(row, MapJobReport(r))) { unchanged++; continue; }
+                            if (SameContent(row, MapJobReport(r))) { unchangedKeys.Add(r.UniqueKey!); continue; }
                             ApplyJobReport(row, r);
                             row.Action = AppendActionLog(row.Action, "BULK_UPDATE", r);
                             row.UpdatedAt = DateTime.UtcNow;
@@ -971,9 +945,11 @@ public class JobReportController : ControllerBase
                             inserted++;
                         }
                     }
-                    catch (DbUpdateException)
+                    catch (DbUpdateException rowEx)
                     {
-                        conflicted.Add(r.UniqueKey ?? "(no key)");
+                        var reason = rowEx.InnerException?.Message ?? rowEx.Message;
+                        _logger.LogError("JobReport record {key} not saved: {msg}", r.UniqueKey, reason);
+                        failed.Add((r.UniqueKey ?? "(no key)", reason.Length > 300 ? reason[..300] : reason));
                     }
                     finally
                     {
@@ -987,15 +963,7 @@ public class JobReportController : ControllerBase
             }
         }
 
-        if (conflicted.Count > 0)
-        {
-            _logger.LogInformation("JobReport bulk upsert: {ins} inserted, {upd} updated, {unc} unchanged, {conf} conflicted",
-                inserted, updated, unchanged, conflicted.Count);
-            return Ok(new { Inserted = inserted, Updated = updated, Unchanged = unchanged, Conflicted = conflicted.Count, ConflictedKeys = conflicted });
-        }
-
-        _logger.LogInformation("JobReport bulk upsert: {ins} inserted, {upd} updated, {unc} unchanged", inserted, updated, unchanged);
-        return Ok(new { Inserted = inserted, Updated = updated, Unchanged = unchanged });
+        return new UpsertOutcome(inserted, updated, unchangedKeys, failed);
     }
 
     private static DmsJobReport MapJobReport(JobReportRecordDto r)
@@ -1016,6 +984,7 @@ public class JobReportController : ControllerBase
             BatteryNo = r.BatteryNo, BrandName = r.BrandName, ChargerNo = r.ChargerNo, SaleDate = r.SaleDate,
             Supervisor = r.Supervisor, Technician = r.Technician, JobEndDate = r.JobEndDate,
             CreatedThrough = r.CreatedThrough, UniqueKey = r.UniqueKey, CogximUniqueKey = r.CogximUniqueKey,
+            VehicleType = r.VehicleType,
             CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow,
             Complaints = complaints
         };
@@ -1033,6 +1002,7 @@ public class JobReportController : ControllerBase
         row.Supervisor = r.Supervisor; row.Technician = r.Technician; row.JobEndDate = r.JobEndDate;
         row.CreatedThrough = r.CreatedThrough;
         if (r.CogximUniqueKey != null) row.CogximUniqueKey = r.CogximUniqueKey;   // never wipe a stored id with "not sent"
+        if (r.VehicleType != null) row.VehicleType = r.VehicleType;
 
         // Replace complaints wholesale — simplest correct semantics for an upsert:
         // whatever the caller sends is now the full set of complaints for this job card.

@@ -584,6 +584,7 @@ public partial class AppDbContext : DbContext
             entity.Property(e => e.CreatedThrough).HasMaxLength(50);
             entity.Property(e => e.UniqueKey).HasMaxLength(400);
             entity.Property(e => e.CogximUniqueKey).HasMaxLength(50);
+            entity.Property(e => e.VehicleType).HasMaxLength(100);
 
             entity.HasIndex(e => e.UniqueKey)
             .IsUnique()
